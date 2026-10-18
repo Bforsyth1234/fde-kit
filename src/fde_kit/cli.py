@@ -1,8 +1,8 @@
 """`fde` command line.
 
-    fde run "What is 17 * 23?"          # one prompt through the agent, prints the trace summary
-    fde eval                              # run the golden set, exit 1 if below threshold
-    fde tools                             # list registered tools and their schemas
+fde run "What is 17 * 23?"          # one prompt through the agent, prints the trace summary
+fde eval                              # run the golden set, exit 1 if below threshold
+fde tools                             # list registered tools and their schemas
 """
 
 from __future__ import annotations
@@ -86,9 +86,68 @@ def cmd_eval(args: argparse.Namespace) -> int:
     return eval_main(argv)
 
 
+def cmd_worker(args: argparse.Namespace) -> int:
+    try:
+        from .durable.worker import main as worker_main
+    except ModuleNotFoundError:
+        console.print("[red]temporalio not installed[/]: pip install 'fde-kit[durable]'")
+        return 2
+    argv = ["--address", args.address, "--task-queue", args.task_queue]
+    if args.provider:
+        argv += ["--provider", args.provider]
+    return worker_main(argv)
+
+
+def cmd_durable_run(args: argparse.Namespace) -> int:
+    try:
+        import asyncio
+
+        from .durable.client import connect, history_summary, start_run
+    except ModuleNotFoundError:
+        console.print("[red]temporalio not installed[/]: pip install 'fde-kit[durable]'")
+        return 2
+
+    async def go() -> int:
+        client = await connect(args.address)
+        handle = await start_run(args.prompt, client=client, task_queue=args.task_queue)
+        console.print(
+            f"workflow id: {handle.id}  (UI: http://localhost:8233/namespaces/default/workflows/{handle.id})"
+        )
+        out = await handle.result()
+        console.rule("[bold]answer")
+        console.print(out.output)
+        hist = await history_summary(handle)
+        table = Table(title="activities")
+        table.add_column("#", justify="right")
+        table.add_column("activity")
+        table.add_column("attempts", justify="right")
+        for i, a in enumerate(hist["activities"], 1):
+            table.add_row(str(i), a["activity"], str(a["attempts"]))
+        console.print(table)
+        console.print(
+            f"stopped: {out.stopped_reason}  "
+            f"tokens: {out.input_tokens} in / {out.output_tokens} out"
+        )
+        return 0
+
+    return asyncio.run(go())
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="fde", description="fde-kit command line")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    w = sub.add_parser("worker", help="run a Temporal worker for durable agent runs")
+    w.add_argument("--address", default="localhost:7233")
+    w.add_argument("--task-queue", default="fde-agent")
+    w.add_argument("--provider", choices=["anthropic", "mock"])
+    w.set_defaults(fn=cmd_worker)
+
+    d = sub.add_parser("durable-run", help="start a durable run and wait for the result")
+    d.add_argument("prompt")
+    d.add_argument("--address", default="localhost:7233")
+    d.add_argument("--task-queue", default="fde-agent")
+    d.set_defaults(fn=cmd_durable_run)
 
     r = sub.add_parser("run", help="run one prompt through the agent")
     r.add_argument("prompt")

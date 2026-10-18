@@ -124,13 +124,16 @@ class MockProvider:
         {"text": "...", "tool_calls": [{"name": "add", "input": {"a": 1, "b": 2}}]}
     Tool-call ids are generated. If the script runs out, the mock returns a fixed final answer so
     a misbehaving loop terminates instead of hanging.
+
+    The script index is the number of assistant turns already in `messages`, not a call counter.
+    That makes the mock stateless: a fresh instance handed turn 3 of an in-flight conversation
+    (a replacement worker after a crash, an activity retry) returns the right entry.
     """
 
     model = "mock"
 
     def __init__(self, script: Iterable[str | dict[str, Any]] = ()):
         self._script = list(script)
-        self._i = 0
         self.calls: list[dict[str, Any]] = []
 
     def complete(
@@ -145,10 +148,10 @@ class MockProvider:
         self.calls.append(
             {"system": system, "messages": copy.deepcopy(messages), "tools": list(tools)}
         )
-        if self._i >= len(self._script):
+        idx = sum(1 for m in messages if m.get("role") == "assistant")
+        if idx >= len(self._script):
             return LLMResponse(text="[mock: script exhausted]", stop_reason="end_turn")
-        entry = self._script[self._i]
-        self._i += 1
+        entry = self._script[idx]
 
         if isinstance(entry, str):
             return LLMResponse(
@@ -161,7 +164,7 @@ class MockProvider:
         if text:
             raw.append({"type": "text", "text": text})
         for n, tc in enumerate(entry.get("tool_calls", [])):
-            call = ToolCall(id=f"toolu_mock_{self._i}_{n}", name=tc["name"], input=tc["input"])
+            call = ToolCall(id=f"toolu_mock_{idx}_{n}", name=tc["name"], input=tc["input"])
             calls.append(call)
             raw.append({"type": "tool_use", "id": call.id, "name": call.name, "input": call.input})
         return LLMResponse(

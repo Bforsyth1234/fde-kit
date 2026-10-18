@@ -9,8 +9,8 @@ in Phoenix reads like the loop itself. The loop stops when the model returns no 
 when `max_turns` is hit (recorded as `stopped_reason="max_turns"` rather than raised, so callers
 and evals can inspect what happened).
 
-This is the piece the durable-runtime project will later replace: every `_step` here becomes a
-workflow activity. Keeping it this plain is the point.
+`fde_kit.durable.workflow.AgentWorkflow` is this same loop with the two side effects moved into
+Temporal activities. Read them side by side; keeping this one plain is what makes that possible.
 """
 
 from __future__ import annotations
