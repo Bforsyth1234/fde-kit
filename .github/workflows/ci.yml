@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: pytest --cov=fde_kit --cov-report=term-missing
+      - name: offline eval (harness self-check)
+        run: python -m evals.run_evals --provider mock --threshold 1.0
+        env:
+          FDE_OTEL_ENABLED: "false"
+
+  eval:
+    # The real gate. Runs only when the repo has an API key secret, so forks and PRs from
+    # outside still get the test job above.
+    needs: test
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: golden eval against the real model
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        run: python -m evals.run_evals --json eval-results.json
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FDE_OTEL_ENABLED: "false"
+      - name: skipped (no ANTHROPIC_API_KEY secret)
+        if: ${{ env.ANTHROPIC_API_KEY == '' }}
+        run: echo "ANTHROPIC_API_KEY secret not set; real-model eval skipped."
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && hashFiles('eval-results.json') != '' }}
+        with:
+          name: eval-results
+          path: eval-results.json

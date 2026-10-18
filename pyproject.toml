@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fde-kit"
+version = "0.1.0"
+description = "A slim, opinionated starter kit for deploying LLM agents: agent loop, tool registry, OpenTelemetry tracing, eval harness with a CI gate."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Brooks Forsyth" }]
+dependencies = [
+    "anthropic>=0.40",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "opentelemetry-api>=1.25",
+    "opentelemetry-sdk>=1.25",
+    "opentelemetry-exporter-otlp-proto-http>=1.25",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+fde = "fde_kit.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fde_kit"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

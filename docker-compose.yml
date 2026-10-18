@@ -1,0 +1,15 @@
+services:
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    container_name: fde-phoenix
+    ports:
+      - "6006:6006"   # UI + OTLP/HTTP collector at /v1/traces
+      - "4317:4317"   # OTLP/gRPC (unused by the kit, handy for other tools)
+    environment:
+      - PHOENIX_WORKING_DIR=/data
+    volumes:
+      - phoenix-data:/data
+    restart: unless-stopped
+
+volumes:
+  phoenix-data:
