@@ -12,7 +12,7 @@ from typing import Any
 from temporalio.api.enums.v1 import EventType
 from temporalio.client import Client, WorkflowHandle
 
-from .models import AgentRunInput, AgentRunOutput, RunStatus
+from .models import AgentRunInput, AgentRunOutput, PendingApproval, RunStatus
 from .worker import DEFAULT_ADDRESS, DEFAULT_TASK_QUEUE
 from .workflow import AgentWorkflow
 
@@ -29,11 +29,18 @@ async def start_run(
     workflow_id: str | None = None,
     max_turns: int = 10,
     system_prompt: str | None = None,
+    approval_timeout_seconds: int | None = None,
+    require_approval_for: list[str] | None = None,
 ) -> WorkflowHandle[Any, AgentRunOutput]:
     client = client or await connect()
+    inp = AgentRunInput(prompt=prompt, max_turns=max_turns, system_prompt=system_prompt)
+    if approval_timeout_seconds is not None:
+        inp.approval_timeout_seconds = approval_timeout_seconds
+    if require_approval_for:
+        inp.require_approval_for = list(require_approval_for)
     return await client.start_workflow(
         AgentWorkflow.run,
-        AgentRunInput(prompt=prompt, max_turns=max_turns, system_prompt=system_prompt),
+        inp,
         id=workflow_id or f"agent-{uuid.uuid4().hex[:12]}",
         task_queue=task_queue,
     )
@@ -46,6 +53,27 @@ async def run(prompt: str, **kw: Any) -> AgentRunOutput:
 
 async def status(handle: WorkflowHandle[Any, AgentRunOutput]) -> RunStatus:
     return await handle.query(AgentWorkflow.status)
+
+
+async def pending(handle: WorkflowHandle[Any, AgentRunOutput]) -> PendingApproval | None:
+    return await handle.query(AgentWorkflow.pending_approval)
+
+
+async def approve(
+    handle: WorkflowHandle[Any, AgentRunOutput], tool_use_id: str, *, by: str = "", note: str = ""
+) -> None:
+    await handle.signal(AgentWorkflow.approve, args=[tool_use_id, by, note])
+
+
+async def reject(
+    handle: WorkflowHandle[Any, AgentRunOutput], tool_use_id: str, *, by: str = "", note: str = ""
+) -> None:
+    await handle.signal(AgentWorkflow.reject, args=[tool_use_id, by, note])
+
+
+def handle_for(client: Client, workflow_id: str) -> WorkflowHandle[Any, AgentRunOutput]:
+    """Reattach to a run by id from any process: a CLI, a web app, a Slack bot."""
+    return client.get_workflow_handle_for(AgentWorkflow.run, workflow_id)
 
 
 async def history_summary(handle: WorkflowHandle[Any, AgentRunOutput]) -> dict[str, Any]:

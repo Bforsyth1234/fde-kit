@@ -32,6 +32,8 @@ class ToolSpec:
     description: str
     input_model: type[BaseModel]
     fn: Callable[..., Any]
+    requires_approval: bool = False
+    """If True, the durable runtime pauses and waits for a human signal before executing."""
 
     def to_api_schema(self) -> dict[str, Any]:
         schema = self.input_model.model_json_schema()
@@ -53,11 +55,22 @@ class ToolResult:
 class ToolRegistry:
     _tools: dict[str, ToolSpec] = field(default_factory=dict)
 
-    def tool(self, fn: Callable[..., Any] | None = None, *, name: str | None = None):
-        """Decorator. Works bare (`@registry.tool`) or with args (`@registry.tool(name=...)`)."""
+    def tool(
+        self,
+        fn: Callable[..., Any] | None = None,
+        *,
+        name: str | None = None,
+        requires_approval: bool = False,
+    ):
+        """Decorator. Works bare (`@registry.tool`) or with args (`@registry.tool(name=...)`).
+
+        `requires_approval=True` marks a tool as gated: the in-process Agent executes it
+        normally, but the durable runtime pauses the run and waits for an approve/reject signal.
+        """
 
         def register(f: Callable[..., Any]) -> Callable[..., Any]:
             spec = _spec_from_function(f, name=name)
+            spec.requires_approval = requires_approval
             if spec.name in self._tools:
                 raise ValueError(f"tool already registered: {spec.name}")
             self._tools[spec.name] = spec
@@ -73,6 +86,10 @@ class ToolRegistry:
 
     def api_schemas(self) -> list[dict[str, Any]]:
         return [t.to_api_schema() for t in self._tools.values()]
+
+    def requires_approval(self, name: str) -> bool:
+        spec = self._tools.get(name)
+        return bool(spec and spec.requires_approval)
 
     def execute(self, name: str, raw_input: dict[str, Any]) -> ToolResult:
         spec = self._tools.get(name)

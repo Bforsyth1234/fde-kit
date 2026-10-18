@@ -242,3 +242,168 @@ def test_sigkill_worker_mid_tool_then_resume(env, tmp_path: Path):
     assert all(a["attempts"] == 1 and a["completed"] for a in acts[2:])
     # And the kill happened before the slow tool completed.
     assert not before["activities"][1]["completed"]
+
+
+# ---------------------------------------------------------------------- approval gates
+
+from fde_kit.durable.client import approve, pending, reject  # noqa: E402
+from fde_kit.durable.demo_tools import registry as demo_registry  # noqa: E402
+
+EMAIL_SCRIPT = [
+    {
+        "tool_calls": [
+            {
+                "name": "send_email",
+                "input": {"to": "ops@example.com", "subject": "Outage", "body": "All clear."},
+            }
+        ]
+    },
+    "Done: the email went out.",
+]
+
+
+async def _wait_for_phase(h, phase: str, timeout: float = 20.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = await status(h)
+        if st.phase == phase:
+            return st
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"never reached phase {phase!r}")
+
+
+def _worker_task(e, queue, script, journal_dir, stop):
+    return asyncio.create_task(
+        run_worker(
+            client=e.client,
+            task_queue=queue,
+            provider=MockProvider(script),
+            registry=demo_registry,
+            journal_dir=journal_dir,
+            stop=stop,
+        )
+    )
+
+
+def test_gated_tool_waits_then_runs_on_approve(env, tmp_path: Path):
+    e, loop = env
+
+    async def go():
+        stop = asyncio.Event()
+        w = _worker_task(e, "t-approve", EMAIL_SCRIPT, str(tmp_path), stop)
+        await asyncio.sleep(0.3)
+        h = await start_run("notify ops", client=e.client, task_queue="t-approve")
+        st = await _wait_for_phase(h, "awaiting_approval")
+        p = await pending(h)
+        hist_before = await history_summary(h)
+        await approve(h, p.tool_use_id, by="reviewer", note="looks right")
+        out = await h.result()
+        stop.set()
+        await w
+        return st, p, hist_before, out
+
+    st, p, hist_before, out = loop.run_until_complete(go())
+    assert st.pending_approval is not None and st.pending_approval.name == "send_email"
+    assert p.input["to"] == "ops@example.com"
+    # While parked: one LLM activity done, no tool activity scheduled yet.
+    assert [a["activity"] for a in hist_before["activities"]] == ["llm_call"]
+    assert out.output == "Done: the email went out."
+    assert out.steps[0].approvals == [
+        {
+            "tool_use_id": p.tool_use_id,
+            "name": "send_email",
+            "outcome": "approved",
+            "by": "reviewer",
+            "note": "looks right",
+        }
+    ]
+    assert out.steps[0].tool_results[0]["content"].startswith("email queued to ops@example.com")
+
+
+def test_rejected_tool_is_not_executed_and_model_is_told(env, tmp_path: Path):
+    e, loop = env
+    script = [EMAIL_SCRIPT[0], "Understood, I won't send it. Here is the draft instead: ..."]
+
+    async def go():
+        stop = asyncio.Event()
+        w = _worker_task(e, "t-reject", script, str(tmp_path), stop)
+        await asyncio.sleep(0.3)
+        h = await start_run("notify ops", client=e.client, task_queue="t-reject")
+        await _wait_for_phase(h, "awaiting_approval")
+        p = await pending(h)
+        await reject(h, p.tool_use_id, by="reviewer", note="wrong recipient")
+        out = await h.result()
+        hist = await history_summary(h)
+        stop.set()
+        await w
+        return out, hist
+
+    out, hist = loop.run_until_complete(go())
+    # No tool_execute activity ever ran.
+    assert [a["activity"] for a in hist["activities"]] == ["llm_call", "llm_call"]
+    res = out.steps[0].tool_results[0]
+    assert res["is_error"] is True and "wrong recipient" in res["content"]
+    assert out.steps[0].approvals[0]["outcome"] == "rejected"
+    assert out.output.startswith("Understood")
+
+
+def test_approval_timeout_counts_as_rejection(env, tmp_path: Path):
+    e, loop = env
+    script = [EMAIL_SCRIPT[0], "Nobody approved in time, so I did not send it."]
+
+    async def go():
+        stop = asyncio.Event()
+        w = _worker_task(e, "t-timeout", script, str(tmp_path), stop)
+        await asyncio.sleep(0.3)
+        h = await start_run(
+            "notify ops", client=e.client, task_queue="t-timeout", approval_timeout_seconds=2
+        )
+        out = await asyncio.wait_for(h.result(), timeout=30)
+        stop.set()
+        await w
+        return out
+
+    out = loop.run_until_complete(go())
+    a = out.steps[0].approvals[0]
+    assert a["outcome"] == "timeout" and a["by"] == "timeout"
+    assert "timed out" in out.steps[0].tool_results[0]["content"]
+    assert out.output.startswith("Nobody approved")
+
+
+def test_parked_run_survives_worker_restart_then_approved(env, tmp_path: Path):
+    """The headline: no worker alive while the human decides, and the decision still lands."""
+    e, loop = env
+
+    async def go():
+        stop1 = asyncio.Event()
+        w1 = _worker_task(e, "t-park", EMAIL_SCRIPT, str(tmp_path / "j1"), stop1)
+        await asyncio.sleep(0.3)
+        h = await start_run("notify ops", client=e.client, task_queue="t-park")
+        await _wait_for_phase(h, "awaiting_approval")
+        p = await pending(h)
+
+        # Take the only worker down. Nothing is serving this task queue now.
+        stop1.set()
+        await w1
+        await asyncio.sleep(1.0)
+        desc = await h.describe()
+        assert desc.status.name == "RUNNING"
+
+        # Approve with no worker up: the signal is recorded by the server, not by a worker.
+        await approve(h, p.tool_use_id, by="reviewer-from-phone")
+        await asyncio.sleep(0.5)
+        still = await h.describe()
+        assert still.status.name == "RUNNING"  # it can't progress until something serves it
+
+        # New worker, fresh process state, fresh provider instance, different journal dir.
+        stop2 = asyncio.Event()
+        w2 = _worker_task(e, "t-park", EMAIL_SCRIPT, str(tmp_path / "j2"), stop2)
+        out = await asyncio.wait_for(h.result(), timeout=60)
+        stop2.set()
+        await w2
+        return out
+
+    out = loop.run_until_complete(go())
+    assert out.output == "Done: the email went out."
+    assert out.steps[0].approvals[0]["by"] == "reviewer-from-phone"
+    assert out.steps[0].tool_results[0]["content"].startswith("email queued")

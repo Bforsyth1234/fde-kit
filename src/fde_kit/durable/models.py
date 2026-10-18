@@ -22,7 +22,7 @@ class LLMCallInput:
 @dataclass
 class LLMCallOutput:
     text: str
-    tool_calls: list[dict[str, Any]]  # [{"id", "name", "input"}]
+    tool_calls: list[dict[str, Any]]  # [{"id", "name", "input", "requires_approval"}]
     stop_reason: str
     raw_content: list[dict[str, Any]]
     input_tokens: int = 0
@@ -51,6 +51,27 @@ class AgentRunInput:
     max_turns: int = 10
     system_prompt: str | None = None
     max_tokens: int = 2048
+    approval_timeout_seconds: int = 7 * 24 * 3600
+    """How long a gated tool call waits for a human before it is treated as rejected."""
+    require_approval_for: list[str] = field(default_factory=list)
+    """Extra tool names to gate for this run, on top of tools registered with
+    requires_approval=True."""
+
+
+@dataclass
+class PendingApproval:
+    tool_use_id: str
+    name: str
+    input: dict[str, Any]
+    turn: int
+
+
+@dataclass
+class ApprovalDecision:
+    tool_use_id: str
+    approved: bool
+    by: str = ""
+    note: str = ""
 
 
 @dataclass
@@ -59,6 +80,8 @@ class StepRecord:
     assistant_text: str
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     tool_results: list[dict[str, Any]] = field(default_factory=list)
+    approvals: list[dict[str, Any]] = field(default_factory=list)
+    """Decisions for gated tool calls in this step: {tool_use_id, name, outcome, by, note}"""
 
 
 @dataclass
@@ -83,6 +106,7 @@ class RunStatus:
     """Returned by the workflow's `status` query while a run is in flight."""
 
     turn: int
-    phase: str  # "llm" | "tools" | "done"
+    phase: str  # "llm" | "tools" | "awaiting_approval" | "done"
     tools_called: list[str]
     current_tool: str | None = None
+    pending_approval: PendingApproval | None = None

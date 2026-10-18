@@ -102,18 +102,55 @@ def cmd_durable_run(args: argparse.Namespace) -> int:
     try:
         import asyncio
 
-        from .durable.client import connect, history_summary, start_run
+        from .durable.client import approve, connect, history_summary, reject, start_run, status
     except ModuleNotFoundError:
         console.print("[red]temporalio not installed[/]: pip install 'fde-kit[durable]'")
         return 2
 
     async def go() -> int:
         client = await connect(args.address)
-        handle = await start_run(args.prompt, client=client, task_queue=args.task_queue)
-        console.print(
-            f"workflow id: {handle.id}  (UI: http://localhost:8233/namespaces/default/workflows/{handle.id})"
+        handle = await start_run(
+            args.prompt,
+            client=client,
+            task_queue=args.task_queue,
+            require_approval_for=args.gate or None,
         )
-        out = await handle.result()
+        console.print(
+            f"workflow id: {handle.id}  "
+            f"(UI: http://localhost:8233/namespaces/default/workflows/{handle.id})"
+        )
+
+        # Wait for the result, but surface approval requests as they appear so a person at
+        # this terminal can answer them. `fde approve <id> <tool_use_id>` works from any other
+        # terminal too; the run doesn't care where the signal comes from.
+        result_task = asyncio.create_task(handle.result())
+        answered: set[str] = set()
+        while not result_task.done():
+            await asyncio.wait({result_task}, timeout=0.5)
+            if result_task.done():
+                break
+            st = await status(handle)
+            p = st.pending_approval
+            if p and p.tool_use_id not in answered:
+                answered.add(p.tool_use_id)
+                console.rule("[bold yellow]approval required")
+                console.print(f"turn {p.turn}: the agent wants to call [bold]{p.name}[/] with")
+                console.print(json.dumps(p.input, indent=2))
+                if args.no_prompt:
+                    console.print(
+                        f"run: fde approve {handle.id} {p.tool_use_id}   "
+                        f"or: fde reject {handle.id} {p.tool_use_id} --note '...'"
+                    )
+                    continue
+                ans = await asyncio.to_thread(input, "approve? [y/N/note] ")
+                ans = ans.strip()
+                if ans.lower() in ("y", "yes"):
+                    await approve(handle, p.tool_use_id, by="cli")
+                    console.print("[green]approved[/]")
+                else:
+                    await reject(handle, p.tool_use_id, by="cli", note=ans or "rejected at CLI")
+                    console.print("[red]rejected[/]")
+        out = result_task.result()
         console.rule("[bold]answer")
         console.print(out.output)
         hist = await history_summary(handle)
@@ -133,9 +170,76 @@ def cmd_durable_run(args: argparse.Namespace) -> int:
     return asyncio.run(go())
 
 
+def _cmd_decide(args: argparse.Namespace, approved: bool) -> int:
+    try:
+        import asyncio
+
+        from .durable.client import approve, connect, handle_for, reject
+    except ModuleNotFoundError:
+        console.print("[red]temporalio not installed[/]: pip install 'fde-kit[durable]'")
+        return 2
+
+    async def go() -> int:
+        client = await connect(args.address)
+        h = handle_for(client, args.workflow_id)
+        fn = approve if approved else reject
+        await fn(h, args.tool_use_id, by=args.by, note=args.note or "")
+        console.print(f"{'approved' if approved else 'rejected'} {args.tool_use_id} on {h.id}")
+        return 0
+
+    return asyncio.run(go())
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    return _cmd_decide(args, approved=True)
+
+
+def cmd_reject(args: argparse.Namespace) -> int:
+    return _cmd_decide(args, approved=False)
+
+
+def cmd_pending(args: argparse.Namespace) -> int:
+    try:
+        import asyncio
+
+        from .durable.client import connect, handle_for, status
+    except ModuleNotFoundError:
+        console.print("[red]temporalio not installed[/]: pip install 'fde-kit[durable]'")
+        return 2
+
+    async def go() -> int:
+        client = await connect(args.address)
+        st = await status(handle_for(client, args.workflow_id))
+        console.print(f"turn {st.turn}  phase {st.phase}  tools so far {st.tools_called}")
+        if st.pending_approval:
+            p = st.pending_approval
+            console.print(f"[yellow]awaiting approval[/]: {p.name} (tool_use_id {p.tool_use_id})")
+            console.print(json.dumps(p.input, indent=2))
+        return 0
+
+    return asyncio.run(go())
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="fde", description="fde-kit command line")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    for name, fn, help_ in (
+        ("approve", cmd_approve, "approve a pending gated tool call on a durable run"),
+        ("reject", cmd_reject, "reject a pending gated tool call on a durable run"),
+    ):
+        sp = sub.add_parser(name, help=help_)
+        sp.add_argument("workflow_id")
+        sp.add_argument("tool_use_id")
+        sp.add_argument("--by", default="cli")
+        sp.add_argument("--note")
+        sp.add_argument("--address", default="localhost:7233")
+        sp.set_defaults(fn=fn)
+
+    pe = sub.add_parser("pending", help="show a durable run's phase and any pending approval")
+    pe.add_argument("workflow_id")
+    pe.add_argument("--address", default="localhost:7233")
+    pe.set_defaults(fn=cmd_pending)
 
     w = sub.add_parser("worker", help="run a Temporal worker for durable agent runs")
     w.add_argument("--address", default="localhost:7233")
@@ -147,6 +251,10 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("prompt")
     d.add_argument("--address", default="localhost:7233")
     d.add_argument("--task-queue", default="fde-agent")
+    d.add_argument(
+        "--gate", action="append", metavar="TOOL", help="require approval for TOOL this run"
+    )
+    d.add_argument("--no-prompt", action="store_true", help="print instructions instead of asking")
     d.set_defaults(fn=cmd_durable_run)
 
     r = sub.add_parser("run", help="run one prompt through the agent")

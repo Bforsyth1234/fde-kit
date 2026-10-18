@@ -8,6 +8,9 @@ side by side: the control flow is identical. What changes:
 - Each LLM call and each tool call is an activity with timeouts, heartbeats and a retry policy.
 - Tool calls carry an idempotency key derived from (workflow id, turn, tool_use id). Same inputs
   on retry -> same key -> journal hit -> no double execution.
+- Tools marked `requires_approval` pause the run until an `approve` or `reject` signal arrives.
+  The wait is a Temporal timer, not a process: no worker needs to be alive while a human
+  thinks about it, and the run survives any number of restarts in the meantime.
 - A `status` query lets anyone ask a running agent where it is without touching the worker.
 
 Determinism rules apply inside this file: no I/O, no clocks, no randomness, no network. All of
@@ -26,7 +29,9 @@ with workflow.unsafe.imports_passed_through():
     from .models import (
         AgentRunInput,
         AgentRunOutput,
+        ApprovalDecision,
         LLMCallInput,
+        PendingApproval,
         RunStatus,
         StepRecord,
         ToolCallInput,
@@ -58,6 +63,10 @@ class AgentWorkflow:
         self._phase = "llm"
         self._tools_called: list[str] = []
         self._current_tool: str | None = None
+        self._pending: PendingApproval | None = None
+        self._decisions: dict[str, ApprovalDecision] = {}
+
+    # ------------------------------------------------------------------ queries
 
     @workflow.query
     def status(self) -> RunStatus:
@@ -66,7 +75,24 @@ class AgentWorkflow:
             phase=self._phase,
             tools_called=list(self._tools_called),
             current_tool=self._current_tool,
+            pending_approval=self._pending,
         )
+
+    @workflow.query
+    def pending_approval(self) -> PendingApproval | None:
+        return self._pending
+
+    # ------------------------------------------------------------------ signals
+
+    @workflow.signal
+    def approve(self, tool_use_id: str, by: str = "", note: str = "") -> None:
+        self._decisions[tool_use_id] = ApprovalDecision(tool_use_id, True, by, note)
+
+    @workflow.signal
+    def reject(self, tool_use_id: str, by: str = "", note: str = "") -> None:
+        self._decisions[tool_use_id] = ApprovalDecision(tool_use_id, False, by, note)
+
+    # ------------------------------------------------------------------ run
 
     @workflow.run
     async def run(self, inp: AgentRunInput) -> AgentRunOutput:
@@ -75,6 +101,7 @@ class AgentWorkflow:
         steps: list[StepRecord] = []
         in_tok = out_tok = 0
         wf_id = workflow.info().workflow_id
+        extra_gated = set(inp.require_approval_for)
 
         for turn in range(1, inp.max_turns + 1):
             self._turn, self._phase = turn, "llm"
@@ -106,9 +133,51 @@ class AgentWorkflow:
             self._phase = "tools"
             result_blocks: list[dict] = []
             recorded: list[dict] = []
+            approvals: list[dict] = []
             for call in llm.tool_calls:
                 self._current_tool = call["name"]
                 self._tools_called.append(call["name"])
+
+                gated = call.get("requires_approval", False) or call["name"] in extra_gated
+                if gated:
+                    decision = await self._await_approval(call, turn, inp.approval_timeout_seconds)
+                    approvals.append(
+                        {
+                            "tool_use_id": call["id"],
+                            "name": call["name"],
+                            "outcome": "approved"
+                            if decision.approved
+                            else ("timeout" if decision.by == "timeout" else "rejected"),
+                            "by": decision.by,
+                            "note": decision.note,
+                        }
+                    )
+                    if not decision.approved:
+                        reason = decision.note or (
+                            "approval timed out" if decision.by == "timeout" else "no reason given"
+                        )
+                        content = (
+                            f"Tool call '{call['name']}' was not approved by a human reviewer "
+                            f"({reason}). Do not retry it; explain to the user or find another way."
+                        )
+                        result_blocks.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": call["id"],
+                                "content": content,
+                                "is_error": True,
+                            }
+                        )
+                        recorded.append(
+                            {
+                                "name": call["name"],
+                                "content": content,
+                                "is_error": True,
+                                "from_journal": False,
+                            }
+                        )
+                        continue
+
                 res = await workflow.execute_activity(
                     AgentActivities.tool_execute,
                     ToolCallInput(
@@ -141,6 +210,7 @@ class AgentWorkflow:
                     assistant_text=llm.text,
                     tool_calls=llm.tool_calls,
                     tool_results=recorded,
+                    approvals=approvals,
                 )
             )
 
@@ -152,3 +222,30 @@ class AgentWorkflow:
             input_tokens=in_tok,
             output_tokens=out_tok,
         )
+
+    # ------------------------------------------------------------------ helpers
+
+    async def _await_approval(self, call: dict, turn: int, timeout_s: int) -> ApprovalDecision:
+        """Park the run until a human decides, or the timeout elapses.
+
+        `wait_condition` is a durable wait: Temporal persists a timer and the workflow task
+        simply ends. Nothing runs, nothing polls, no worker needs to exist until a signal or the
+        timer wakes it. A decision that arrived *before* we started waiting (fast reviewer, or a
+        replay after restart) is honoured immediately because the condition checks the dict.
+        """
+        tool_use_id = call["id"]
+        self._pending = PendingApproval(
+            tool_use_id=tool_use_id, name=call["name"], input=call["input"], turn=turn
+        )
+        self._phase = "awaiting_approval"
+        try:
+            await workflow.wait_condition(
+                lambda: tool_use_id in self._decisions, timeout=timedelta(seconds=timeout_s)
+            )
+            decision = self._decisions[tool_use_id]
+        except TimeoutError:
+            decision = ApprovalDecision(tool_use_id, False, by="timeout", note="approval timed out")
+        finally:
+            self._pending = None
+            self._phase = "tools"
+        return decision

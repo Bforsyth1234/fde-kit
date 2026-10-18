@@ -112,7 +112,8 @@ that SIGKILLs a worker subprocess against a local dev server and asserts exactly
 | Determinism | `durable/workflow.py` vs `durable/activities.py` | The workflow body has no I/O, clocks or randomness. Both side effects are activities. |
 | Fast failure detection | `durable/activities.py` | Activities heartbeat every second while running; `heartbeat_timeout` is 10 s for tools, 20 s for LLM calls, so a dead worker is noticed in seconds, not at `start_to_close_timeout`. |
 | No double execution | `durable/journal.py` | Tool activities carry an idempotency key `(workflow_id, turn, tool_use_id)`. The result is journaled *before* the activity returns; a retry after a crash-between-complete-and-record is served from the journal. |
-| Visibility | `AgentWorkflow.status` query | Ask a running agent which turn, which phase, which tool, without touching the worker. |
+| Human approval | `requires_approval=True` on a tool; `approve`/`reject` signals | The run parks on a durable timer. No worker needs to be alive while a person decides. See below. |
+| Visibility | `AgentWorkflow.status` query | Ask a running agent which turn, which phase, which tool, and what it's waiting on, without touching the worker. |
 | Retries with backoff | `LLM_RETRY`, `TOOL_RETRY` | Rate limits and transient tool failures retry up to 5 times with exponential backoff. |
 
 ### The failure matrix
@@ -130,10 +131,55 @@ What happens when the worker dies at each point in a step:
 The remaining gap, the third row, is where the sandbox project comes in: journaling intent
 before the side effect and compensating on duplicate, not just caching results after.
 
+### Approval gates
+
+Some tools shouldn't run without a person saying so. Mark them:
+
+```python
+@registry.tool(requires_approval=True)
+def send_email(to: str, subject: str, body: str) -> str:
+    """Send an email on the user's behalf."""
+    ...
+```
+
+or gate a tool for one run only with `fde durable-run "..." --gate send_email`.
+
+When the model asks for a gated tool, the workflow records what it wants to do, sets its phase
+to `awaiting_approval`, and waits on a Temporal timer (default 7 days). That wait is state on
+the server, not a sleeping process: you can stop every worker, deploy a new version, come back
+the next morning, and the run is still there, still waiting. A signal resumes it:
+
+```bash
+fde durable-run "Email ops that the incident is resolved"
+# ── approval required ──────────────────────────────────────────
+# turn 2: the agent wants to call send_email with
+# {"to": "ops@example.com", "subject": "Incident resolved", "body": "..."}
+# approve? [y/N/note]
+
+# or, from any other terminal, laptop, or a Slack bot:
+fde pending agent-3ddf081f259b
+fde approve agent-3ddf081f259b toolu_01A09q90qw90lq917835lq9 --by brooks
+fde reject  agent-3ddf081f259b toolu_01A09q90qw90lq917835lq9 --note "wrong recipient"
+```
+
+| Decision | What the model sees next |
+| --- | --- |
+| approved | The tool runs (idempotency-journaled as usual) and its result comes back as a normal `tool_result`. |
+| rejected | A `tool_result` with `is_error: true` and the reviewer's note, plus an instruction not to retry. The model explains or finds another route. |
+| timeout | Same as rejected, with the note "approval timed out". The run never hangs forever. |
+
+Every decision is recorded on the step (`steps[n].approvals`) with who made it and when, so the
+audit trail is part of the run's output, not a separate log.
+
+Tests cover all three outcomes plus the one that matters:
+`test_parked_run_survives_worker_restart_then_approved` parks a run, shuts down the only worker,
+sends the approval with nothing serving the queue, starts a new worker, and asserts the run
+completes with the right reviewer recorded.
+
 ### Not yet
 
-Human-approval waits (Temporal signals), mid-run version upgrades (`workflow.patched`), and a
-Postgres/Redis journal backend. These are the next three commits on this branch.
+Mid-run version upgrades (`workflow.patched`) and a Postgres/Redis journal backend. Next two
+commits on this branch.
 
 ## Baseline results
 

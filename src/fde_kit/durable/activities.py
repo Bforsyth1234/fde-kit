@@ -72,7 +72,17 @@ class AgentActivities:
         resp = self._run_with_heartbeat(call, f"llm turn {inp.turn}")
         return LLMCallOutput(
             text=resp.text,
-            tool_calls=[{"id": c.id, "name": c.name, "input": c.input} for c in resp.tool_calls],
+            tool_calls=[
+                {
+                    "id": c.id,
+                    "name": c.name,
+                    "input": c.input,
+                    # Decided here, where the registry lives, so the workflow stays free of
+                    # registry access and the gate is visible in history alongside the call.
+                    "requires_approval": self.registry.requires_approval(c.name),
+                }
+                for c in resp.tool_calls
+            ],
             stop_reason=resp.stop_reason,
             raw_content=resp.raw_content,
             input_tokens=resp.usage.input_tokens,
