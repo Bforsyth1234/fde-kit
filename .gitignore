@@ -10,3 +10,4 @@ build/
 *.egg-info/
 eval-results.json
 .venv/
+rerun.json
