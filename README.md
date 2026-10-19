@@ -111,7 +111,7 @@ that SIGKILLs a worker subprocess against a local dev server and asserts exactly
 | State survives the process | `durable/workflow.py` | `messages`, `steps`, token counts are workflow variables. A new worker replays event history to rebuild them. |
 | Determinism | `durable/workflow.py` vs `durable/activities.py` | The workflow body has no I/O, clocks or randomness. Both side effects are activities. |
 | Fast failure detection | `durable/activities.py` | Activities heartbeat every second while running; `heartbeat_timeout` is 10 s for tools, 20 s for LLM calls, so a dead worker is noticed in seconds, not at `start_to_close_timeout`. |
-| No double execution | `durable/journal.py` | Tool activities carry an idempotency key `(workflow_id, turn, tool_use_id)`. The result is journaled *before* the activity returns; a retry after a crash-between-complete-and-record is served from the journal. |
+| No double execution | `durable/journal.py` | Tool activities carry an idempotency key `(workflow_id, turn, tool_use_id)`. The result is journaled *before* the activity returns; a retry after a crash-between-complete-and-record is served from the journal. Postgres-backed so every worker sees every record; see below. |
 | Human approval | `requires_approval=True` on a tool; `approve`/`reject` signals | The run parks on a durable timer. No worker needs to be alive while a person decides. See below. |
 | Safe upgrades | `workflow.patched("v2-summarize-results")` | Old runs stay on the old path to completion; new runs take the new path. Deploy without draining. See below. |
 | Visibility | `AgentWorkflow.status` query | Ask a running agent which turn, which phase, which tool, and what it's waiting on, without touching the worker. |
@@ -226,9 +226,41 @@ workflow:
 await Replayer(workflows=[AgentWorkflow]).replay_workflow(history)   # raises on drift
 ```
 
-### Not yet
+### The shared journal
 
-A Postgres/Redis journal backend. Next commit on this branch.
+The idempotency journal only helps if the worker that retries can see what the worker that
+died had recorded. A file on worker A's disk is invisible to worker B. So the journal is a
+Postgres table (`tool_journal`, one row per idempotency key, `INSERT ... ON CONFLICT DO
+NOTHING`), and the file backend is for local development only.
+
+```bash
+docker compose up -d                 # includes postgres on :5432
+FDE_JOURNAL_URL=postgresql://fde:fde@localhost:5432/fde fde worker
+```
+
+`tests/test_journal.py` reproduces the exact failure, both ways. A `charge_card` tool appends
+to a file every time it really runs. The test kills worker A in the window after the tool's
+result is journaled but before Temporal records the activity as complete, then lets worker B
+retry it:
+
+| Journal | Workers share it? | Card charged | `from_journal` on the result |
+| --- | --- | --- | --- |
+| file, one directory per worker | no | **2 times** | false |
+| Postgres | yes | **1 time** | true |
+
+The first row is kept as a test on purpose. It is the failure mode, made reproducible, that the
+second row fixes. CI runs both against a Postgres service container.
+
+The window is microseconds wide in real life, so the activity has a test-only hook
+(`FDE_TEST_HANG_AFTER_JOURNAL`) that holds it open after the journal write. Never set it in
+production; it exists so the crash lands in the right place every time instead of one run in
+ten thousand.
+
+### What's still open
+
+The journal covers crash-after-complete. A crash *during* a non-idempotent tool, before the
+journal write, still re-runs the tool on retry. Closing that needs the tool to record intent
+before acting and reconcile on retry, which is the sandbox project, not this one.
 
 ## Baseline results
 

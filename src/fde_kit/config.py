@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     )
     otel_service_name: str = "fde-kit"
 
+    # Durable runtime
+    journal_url: str | None = Field(
+        default=None,
+        description=(
+            "Tool idempotency journal: postgresql://user:pw@host/db for a shared journal, "
+            "file:<dir> for local files. Default: .fde/journal on local disk."
+        ),
+    )
+
     # Evals
     eval_pass_threshold: float = Field(
         default=0.85, description="CI fails if pass rate drops below this"

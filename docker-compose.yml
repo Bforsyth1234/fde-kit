@@ -23,6 +23,21 @@ services:
       - temporal-data:/data
     restart: unless-stopped
 
+  postgres:
+    # Shared tool-idempotency journal for durable runs. Any number of workers, one journal.
+    image: postgres:16-alpine
+    container_name: fde-postgres
+    environment:
+      POSTGRES_USER: fde
+      POSTGRES_PASSWORD: fde
+      POSTGRES_DB: fde
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
 volumes:
   phoenix-data:
   temporal-data:
+  postgres-data:

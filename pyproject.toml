@@ -23,9 +23,11 @@ dependencies = [
 [project.optional-dependencies]
 durable = [
     "temporalio>=1.8",
+    "psycopg[binary,pool]>=3.1",
 ]
 dev = [
     "temporalio>=1.8",
+    "psycopg[binary,pool]>=3.1",
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "ruff>=0.5",

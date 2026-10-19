@@ -8,6 +8,19 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fde
+          POSTGRES_PASSWORD: fde
+          POSTGRES_DB: fde
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U fde"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -16,6 +29,8 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: pytest --cov=fde_kit --cov-report=term-missing
+        env:
+          FDE_TEST_PG_URL: postgresql://fde:fde@localhost:5432/fde
       - name: offline eval (harness self-check)
         run: python -m evals.run_evals --provider mock --threshold 1.0
         env:

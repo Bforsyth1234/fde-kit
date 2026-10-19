@@ -27,7 +27,7 @@ eval:            ## golden set against the real model; exits 1 below threshold
 eval-mock:       ## offline harness self-check
 	FDE_OTEL_ENABLED=false python -m evals.run_evals --provider mock --threshold 1.0
 
-up:              ## start Phoenix (traces UI at http://localhost:6006)
+up:              ## Phoenix (:6006), Temporal (:7233, UI :8233), Postgres (:5432)
 	docker compose up -d
 
 down:

@@ -25,7 +25,7 @@ from ..config import Settings, get_settings
 from ..llm import LLMProvider, MockProvider, make_provider
 from ..tools import ToolRegistry
 from .activities import AgentActivities
-from .journal import ToolJournal
+from .journal import journal_from_url
 from .workflow import AgentWorkflow as _LiveWorkflow
 
 DEFAULT_TASK_QUEUE = "fde-agent"
@@ -66,18 +66,24 @@ async def run_worker(
     task_queue: str = DEFAULT_TASK_QUEUE,
     provider: LLMProvider | None = None,
     registry: ToolRegistry | None = None,
-    journal_dir: str = ".fde/journal",
+    journal_dir: str | None = None,
+    journal_url: str | None = None,
     client: Client | None = None,
     stop: asyncio.Event | None = None,
     workflow_cls: type | None = None,
 ) -> None:
     """`workflow_cls` lets a worker serve a specific workflow version (e.g. a frozen v1
-    during a rollout, or in the versioning tests). Defaults to the live AgentWorkflow."""
+    during a rollout, or in the versioning tests). Defaults to the live AgentWorkflow.
+
+    Journal selection, first match wins: `journal_url`, `journal_dir` (file backend),
+    `FDE_JOURNAL_URL` from settings, else `.fde/journal` on local disk."""
     settings = get_settings()
     client = client or await Client.connect(address)
     provider = provider or build_provider(settings, None, None)
     registry = registry or load_registry(None)
-    acts = AgentActivities(provider, registry, ToolJournal(journal_dir))
+    url = journal_url or (f"file:{journal_dir}" if journal_dir else None) or settings.journal_url
+    journal = journal_from_url(url)
+    acts = AgentActivities(provider, registry, journal)
 
     worker = Worker(
         client,
@@ -86,7 +92,13 @@ async def run_worker(
         activities=[acts.llm_call, acts.tool_execute, acts.summarize_result],
         activity_executor=ThreadPoolExecutor(max_workers=16),
     )
-    log.info("worker up: queue=%s pid=%s tools=%s", task_queue, os.getpid(), registry.names())
+    log.info(
+        "worker up: queue=%s pid=%s tools=%s journal=%r",
+        task_queue,
+        os.getpid(),
+        registry.names(),
+        journal,
+    )
     if stop is None:
         await worker.run()
     else:
@@ -101,7 +113,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--provider", choices=["anthropic", "mock"])
     p.add_argument("--mock-script", help="JSON file with a MockProvider script")
     p.add_argument("--tools", help="module.path:attr of a ToolRegistry")
-    p.add_argument("--journal-dir", default=".fde/journal")
+    p.add_argument("--journal-dir", help="file-backed journal directory")
+    p.add_argument("--journal-url", help="postgresql://... (overrides FDE_JOURNAL_URL)")
     p.add_argument(
         "--workflow-module",
         help="module.path exposing AgentWorkflow to serve (default: fde_kit.durable.workflow)",
@@ -122,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
             provider=provider,
             registry=registry,
             journal_dir=args.journal_dir,
+            journal_url=args.journal_url,
             workflow_cls=workflow_cls,
         )
     )

@@ -10,6 +10,7 @@ Tool execution consults the idempotency journal first. See journal.py for why.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -19,7 +20,7 @@ from temporalio import activity
 
 from ..llm import LLMProvider
 from ..tools import ToolRegistry
-from .journal import ToolJournal
+from .journal import FileJournal, ToolJournal
 from .models import (
     LLMCallInput,
     LLMCallOutput,
@@ -44,7 +45,7 @@ class AgentActivities:
     ):
         self.provider = provider
         self.registry = registry
-        self.journal = journal or ToolJournal()
+        self.journal = journal or FileJournal()
         self.heartbeat_every = heartbeat_every
         self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="fde-tool")
 
@@ -118,7 +119,12 @@ class AgentActivities:
         out = ToolCallOutput(content=res.content, is_error=res.is_error)
         # Record BEFORE returning. If the process dies between this line and Temporal recording
         # the completion, the retry is served from the journal and the tool does not run twice.
-        self.journal.put(inp.idempotency_key, out)
+        self.journal.put(inp.idempotency_key, out, tool_name=inp.name)
+        # Test hook: hold the activity open after journaling so a test can kill the worker in
+        # exactly the window the journal exists for. Never set in production.
+        hang = float(os.environ.get("FDE_TEST_HANG_AFTER_JOURNAL", "0") or 0)
+        if hang > 0:
+            self._run_with_heartbeat(lambda: time.sleep(hang), "test hang")
         activity.logger.info(
             "tool_execute %s done in %.0f ms", inp.name, (time.perf_counter() - t0) * 1000
         )
