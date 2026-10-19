@@ -10,7 +10,7 @@ knowing whether it works. Four pieces, nothing else:
 | Tracing | OpenTelemetry → Arize Phoenix (one container, no config). Token counts and tool I/O per span. | `src/fde_kit/tracing.py`, `docker-compose.yml` |
 | Eval harness | 20-case golden set, deterministic checks + optional LLM-as-judge, pass-rate gate wired into CI. | `evals/` |
 | Durable runtime | The same loop as a Temporal workflow. Kill the worker mid-run; the run finishes on the next one. Optional extra. | `src/fde_kit/durable/` |
-| Multi-tenant retrieval | Hybrid search (pgvector + BM25) with tenant isolation enforced by Postgres: forced RLS, a partition per tenant, no parameter logging, redacted traces. 67 tests, including timing. Optional extra. | `src/fde_kit/rag/` |
+| Multi-tenant retrieval | Hybrid search (pgvector + BM25) with tenant isolation enforced by Postgres: forced RLS, a partition per tenant, no parameter logging, redacted traces. 68 tests, including timing. Optional extra. | `src/fde_kit/rag/` |
 
 Provider-agnostic behind a 30-line interface; Anthropic is the default, a deterministic mock is
 built in for tests and offline eval runs.
@@ -317,7 +317,7 @@ pass every test.
 
 ### The attack suite
 
-`tests/test_rag_isolation.py` (60 tests) and `tests/test_tracing_tenants.py` (7), against a real
+`tests/test_rag_isolation.py` (61 tests) and `tests/test_tracing_tenants.py` (7), against a real
 Postgres + pgvector. The corpus is three property managers using the **same lease template**, so
 every leaked chunk reads like a correct answer with the wrong number in it: Summit's late fee is
 $50, Harbor's is $75, in the same sentence.
@@ -419,7 +419,7 @@ delete every copy of it:
   (point-in-time recovery) or streaming replicas, those segments are kept for the retention
   window, readable by anyone with access to the archive.
 - *Backups.* A base backup or `pg_dump` is a snapshot. `drop_tenant` removes the partitions'
-  files from the live database immediately, but every backup taken before still has them, and a
+  files from the live database immediately (`test_drop_tenant_removes_its_partitions_and_nothing_else`), but every backup taken before still has them, and a
   restore, even a partial one to debug something, brings them back.
 - *Dead rows.* A plain `DELETE` marks rows dead; the bytes stay in the data files until `VACUUM`
   reuses the space. Dropping a partition avoids that; deleting rows doesn't.
