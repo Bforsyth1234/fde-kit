@@ -12,6 +12,21 @@ side by side: the control flow is identical. What changes:
   The wait is a Temporal timer, not a process: no worker needs to be alive while a human
   thinks about it, and the run survives any number of restarts in the meantime.
 - A `status` query lets anyone ask a running agent where it is without touching the worker.
+- Code changes that alter the sequence of commands are guarded by `workflow.patched(...)`.
+  A run that started on the old code is pinned to the old branch for its whole lifetime, even
+  the steps executed after the upgrade; runs started on the new code take the new branch from
+  step one. Both kinds complete on the same worker without a non-determinism error. See
+  VERSIONING below.
+
+VERSIONING
+  v1  initial: llm_call / tool_execute / approval gates
+  v2  "v2-summarize-results": long tool results are condensed by a summarize_result activity
+      before re-entering the model's context. Adds one activity per long result, which is a
+      new command in the sequence, hence the patch.
+
+  Rollout: ship v2 with `patched` (now). Once no v1 runs are open, switch to
+  `workflow.deprecate_patch("v2-summarize-results")` and drop the else-branch. After v1
+  histories age out of retention, remove the deprecate call. Three deploys, zero failed runs.
 
 Determinism rules apply inside this file: no I/O, no clocks, no randomness, no network. All of
 that lives in activities.py.
@@ -34,8 +49,14 @@ with workflow.unsafe.imports_passed_through():
         PendingApproval,
         RunStatus,
         StepRecord,
+        SummarizeInput,
         ToolCallInput,
     )
+
+CODE_VERSION = 2
+PATCH_V2 = "v2-summarize-results"
+SUMMARIZE_OVER_CHARS = 1500
+SUMMARIZE_TO_CHARS = 600
 
 DEFAULT_SYSTEM = (
     "You are a careful assistant. Use the provided tools when they help answer "
@@ -120,7 +141,9 @@ class AgentWorkflow:
             messages.append({"role": "assistant", "content": llm.raw_content})
 
             if not llm.tool_calls:
-                steps.append(StepRecord(turn=turn, assistant_text=llm.text))
+                steps.append(
+                    StepRecord(turn=turn, assistant_text=llm.text, code_version=CODE_VERSION)
+                )
                 self._phase = "done"
                 return AgentRunOutput(
                     output=llm.text,
@@ -128,12 +151,14 @@ class AgentWorkflow:
                     stopped_reason="end_turn",
                     input_tokens=in_tok,
                     output_tokens=out_tok,
+                    code_version=CODE_VERSION,
                 )
 
             self._phase = "tools"
             result_blocks: list[dict] = []
             recorded: list[dict] = []
             approvals: list[dict] = []
+            step_version = 1
             for call in llm.tool_calls:
                 self._current_tool = call["name"]
                 self._tools_called.append(call["name"])
@@ -190,18 +215,45 @@ class AgentWorkflow:
                     heartbeat_timeout=timedelta(seconds=10),
                     retry_policy=TOOL_RETRY,
                 )
-                block = {"type": "tool_result", "tool_use_id": call["id"], "content": res.content}
+                content = res.content
+                summarized_from: int | None = None
+                # v2: condense long results. `patched` is sticky per run: a run that first
+                # evaluates it while replaying a history with no marker is pinned to the
+                # else-branch for good, so a deploy never changes an in-flight conversation's
+                # shape; a run that first evaluates it live records a marker and stays on v2.
+                if workflow.patched(PATCH_V2):
+                    step_version = 2
+                    if not res.is_error and len(content) > SUMMARIZE_OVER_CHARS:
+                        summ = await workflow.execute_activity(
+                            AgentActivities.summarize_result,
+                            SummarizeInput(
+                                tool_name=call["name"],
+                                content=content,
+                                max_chars=SUMMARIZE_TO_CHARS,
+                            ),
+                            start_to_close_timeout=timedelta(minutes=2),
+                            heartbeat_timeout=timedelta(seconds=20),
+                            retry_policy=LLM_RETRY,
+                        )
+                        if summ.summarized:
+                            content = summ.content
+                            summarized_from = summ.original_chars
+                else:
+                    step_version = 1
+
+                block = {"type": "tool_result", "tool_use_id": call["id"], "content": content}
                 if res.is_error:
                     block["is_error"] = True
                 result_blocks.append(block)
-                recorded.append(
-                    {
-                        "name": call["name"],
-                        "content": res.content,
-                        "is_error": res.is_error,
-                        "from_journal": res.from_journal,
-                    }
-                )
+                rec = {
+                    "name": call["name"],
+                    "content": content,
+                    "is_error": res.is_error,
+                    "from_journal": res.from_journal,
+                }
+                if summarized_from is not None:
+                    rec["summarized_from_chars"] = summarized_from
+                recorded.append(rec)
             self._current_tool = None
             messages.append({"role": "user", "content": result_blocks})
             steps.append(
@@ -211,6 +263,7 @@ class AgentWorkflow:
                     tool_calls=llm.tool_calls,
                     tool_results=recorded,
                     approvals=approvals,
+                    code_version=step_version,
                 )
             )
 
@@ -221,6 +274,7 @@ class AgentWorkflow:
             stopped_reason="max_turns",
             input_tokens=in_tok,
             output_tokens=out_tok,
+            code_version=CODE_VERSION,
         )
 
     # ------------------------------------------------------------------ helpers

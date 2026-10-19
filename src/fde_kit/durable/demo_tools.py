@@ -28,3 +28,10 @@ def send_email(to: str, subject: str, body: str) -> str:
     requires human approval before it runs."""
     # Stub: a real deployment would call the mail provider here.
     return f"email queued to {to} with subject {subject!r} ({len(body)} chars)"
+
+
+@registry.tool
+def fetch_report(report_id: str) -> str:
+    """Fetch a long internal report by id. Returns several thousand characters."""
+    line = f"Report {report_id}: line {{i}} — metric value {{v}} units, status nominal.\n"
+    return "".join(line.format(i=i, v=100 + i * 3) for i in range(60))

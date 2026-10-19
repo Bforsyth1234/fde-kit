@@ -46,6 +46,20 @@ class ToolCallOutput:
 
 
 @dataclass
+class SummarizeInput:
+    tool_name: str
+    content: str
+    max_chars: int
+
+
+@dataclass
+class SummarizeOutput:
+    content: str
+    original_chars: int
+    summarized: bool
+
+
+@dataclass
 class AgentRunInput:
     prompt: str
     max_turns: int = 10
@@ -82,6 +96,8 @@ class StepRecord:
     tool_results: list[dict[str, Any]] = field(default_factory=list)
     approvals: list[dict[str, Any]] = field(default_factory=list)
     """Decisions for gated tool calls in this step: {tool_use_id, name, outcome, by, note}"""
+    code_version: int = 1
+    """Which version of the workflow code produced this step. Changes mid-run on an upgrade."""
 
 
 @dataclass
@@ -91,6 +107,8 @@ class AgentRunOutput:
     stopped_reason: str
     input_tokens: int
     output_tokens: int
+    code_version: int = 1
+    """Version of the workflow code that completed the run."""
 
     @property
     def turns(self) -> int:

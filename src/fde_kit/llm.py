@@ -132,8 +132,15 @@ class MockProvider:
 
     model = "mock"
 
-    def __init__(self, script: Iterable[str | dict[str, Any]] = ()):
+    def __init__(
+        self,
+        script: Iterable[str | dict[str, Any]] = (),
+        utility_reply: str = "[mock utility reply]",
+    ):
         self._script = list(script)
+        self.utility_reply = utility_reply
+        """Returned for tool-free, single-message calls (summarizers, judges) so they never
+        consume an entry from the agent-turn script."""
         self.calls: list[dict[str, Any]] = []
 
     def complete(
@@ -148,6 +155,12 @@ class MockProvider:
         self.calls.append(
             {"system": system, "messages": copy.deepcopy(messages), "tools": list(tools)}
         )
+        if not tools and len(messages) == 1:
+            return LLMResponse(
+                text=self.utility_reply,
+                raw_content=[{"type": "text", "text": self.utility_reply}],
+                usage=Usage(5, 2),
+            )
         idx = sum(1 for m in messages if m.get("role") == "assistant")
         if idx >= len(self._script):
             return LLMResponse(text="[mock: script exhausted]", stop_reason="end_turn")

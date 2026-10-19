@@ -26,7 +26,7 @@ from ..llm import LLMProvider, MockProvider, make_provider
 from ..tools import ToolRegistry
 from .activities import AgentActivities
 from .journal import ToolJournal
-from .workflow import AgentWorkflow
+from .workflow import AgentWorkflow as _LiveWorkflow
 
 DEFAULT_TASK_QUEUE = "fde-agent"
 DEFAULT_ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
@@ -48,8 +48,10 @@ def load_registry(spec: str | None) -> ToolRegistry:
 def build_provider(settings: Settings, name: str | None, mock_script: str | None) -> LLMProvider:
     name = name or settings.provider
     if name == "mock":
-        script = json.loads(open(mock_script).read()) if mock_script else []
-        return MockProvider(script)
+        data = json.loads(open(mock_script).read()) if mock_script else []
+        if isinstance(data, dict):
+            return MockProvider(data.get("script", []), data.get("utility_reply", "[mock]"))
+        return MockProvider(data)
     return make_provider(
         name,
         settings.model,
@@ -67,7 +69,10 @@ async def run_worker(
     journal_dir: str = ".fde/journal",
     client: Client | None = None,
     stop: asyncio.Event | None = None,
+    workflow_cls: type | None = None,
 ) -> None:
+    """`workflow_cls` lets a worker serve a specific workflow version (e.g. a frozen v1
+    during a rollout, or in the versioning tests). Defaults to the live AgentWorkflow."""
     settings = get_settings()
     client = client or await Client.connect(address)
     provider = provider or build_provider(settings, None, None)
@@ -77,8 +82,8 @@ async def run_worker(
     worker = Worker(
         client,
         task_queue=task_queue,
-        workflows=[AgentWorkflow],
-        activities=[acts.llm_call, acts.tool_execute],
+        workflows=[workflow_cls or _LiveWorkflow],
+        activities=[acts.llm_call, acts.tool_execute, acts.summarize_result],
         activity_executor=ThreadPoolExecutor(max_workers=16),
     )
     log.info("worker up: queue=%s pid=%s tools=%s", task_queue, os.getpid(), registry.names())
@@ -97,12 +102,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--mock-script", help="JSON file with a MockProvider script")
     p.add_argument("--tools", help="module.path:attr of a ToolRegistry")
     p.add_argument("--journal-dir", default=".fde/journal")
+    p.add_argument(
+        "--workflow-module",
+        help="module.path exposing AgentWorkflow to serve (default: fde_kit.durable.workflow)",
+    )
     args = p.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     settings = get_settings()
     provider = build_provider(settings, args.provider, args.mock_script)
     registry = load_registry(args.tools)
+    workflow_cls = None
+    if args.workflow_module:
+        workflow_cls = importlib.import_module(args.workflow_module).AgentWorkflow
     asyncio.run(
         run_worker(
             address=args.address,
@@ -110,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
             provider=provider,
             registry=registry,
             journal_dir=args.journal_dir,
+            workflow_cls=workflow_cls,
         )
     )
     return 0

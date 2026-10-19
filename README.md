@@ -113,6 +113,7 @@ that SIGKILLs a worker subprocess against a local dev server and asserts exactly
 | Fast failure detection | `durable/activities.py` | Activities heartbeat every second while running; `heartbeat_timeout` is 10 s for tools, 20 s for LLM calls, so a dead worker is noticed in seconds, not at `start_to_close_timeout`. |
 | No double execution | `durable/journal.py` | Tool activities carry an idempotency key `(workflow_id, turn, tool_use_id)`. The result is journaled *before* the activity returns; a retry after a crash-between-complete-and-record is served from the journal. |
 | Human approval | `requires_approval=True` on a tool; `approve`/`reject` signals | The run parks on a durable timer. No worker needs to be alive while a person decides. See below. |
+| Safe upgrades | `workflow.patched("v2-summarize-results")` | Old runs stay on the old path to completion; new runs take the new path. Deploy without draining. See below. |
 | Visibility | `AgentWorkflow.status` query | Ask a running agent which turn, which phase, which tool, and what it's waiting on, without touching the worker. |
 | Retries with backoff | `LLM_RETRY`, `TOOL_RETRY` | Rate limits and transient tool failures retry up to 5 times with exponential backoff. |
 
@@ -176,10 +177,58 @@ Tests cover all three outcomes plus the one that matters:
 sends the approval with nothing serving the queue, starts a new worker, and asserts the run
 completes with the right reviewer recorded.
 
+### Upgrading a running agent
+
+Changing the workflow code while runs are in flight is the thing durable execution makes
+dangerous: a worker replaying an old history through new code that issues different commands
+fails the workflow task with a non-determinism error. v2 of the workflow adds a
+`summarize_result` activity for long tool outputs, which is a new command in the sequence, so
+it is guarded:
+
+```python
+if workflow.patched("v2-summarize-results"):
+    ... summarize, then use the summary ...     # new runs
+else:
+    ... use the raw result ...                  # runs that started on v1
+```
+
+`patched()` is sticky per run. A run that first evaluates it while replaying a v1 history is
+pinned to the old branch for the rest of its life; a run that first evaluates it live records a
+marker and stays on v2. The consequence for agents is the one you want: **a deploy never changes
+the shape of an in-flight conversation.** The model's context in run A is exactly what it would
+have been had you never deployed.
+
+```bash
+python examples/upgrade_demo.py
+```
+
+```
+run A  (started on v1, finished on v2)          run B  (started on v2)
+turn  ver  tool          chars  summarized      turn  ver  tool          chars  summarized
+   1    1  fetch_report   3650  no                 1    2  fetch_report     39  yes
+   2    1  wait_seconds     12  no                 2    2  wait_seconds     12  no
+   3    1  fetch_report   3650  no                 3    2  fetch_report     39  yes
+summarize_result calls: 0  failed tasks: 0      summarize_result calls: 2  failed tasks: 0
+```
+
+The rollout is three deploys: `patched()` (two live paths), then `deprecate_patch()` once no
+v1 runs are open (one path, old histories still replay), then remove the call once v1 histories
+have aged out of retention.
+
+**The pre-deploy check.** `tests/fixtures/workflow_v1.py` is the workflow frozen at the
+previous commit. `tests/test_versioning.py` starts a run on it, swaps in the live worker mid-
+activity, and asserts zero failed workflow tasks, zero summarizer calls, and no patch marker.
+It also replays a complete v1 history through the live code with `temporalio.worker.Replayer`,
+which is the one-liner to run against production histories before any deploy that touches a
+workflow:
+
+```python
+await Replayer(workflows=[AgentWorkflow]).replay_workflow(history)   # raises on drift
+```
+
 ### Not yet
 
-Mid-run version upgrades (`workflow.patched`) and a Postgres/Redis journal backend. Next two
-commits on this branch.
+A Postgres/Redis journal backend. Next commit on this branch.
 
 ## Baseline results
 

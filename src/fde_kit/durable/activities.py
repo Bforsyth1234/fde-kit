@@ -20,7 +20,14 @@ from temporalio import activity
 from ..llm import LLMProvider
 from ..tools import ToolRegistry
 from .journal import ToolJournal
-from .models import LLMCallInput, LLMCallOutput, ToolCallInput, ToolCallOutput
+from .models import (
+    LLMCallInput,
+    LLMCallOutput,
+    SummarizeInput,
+    SummarizeOutput,
+    ToolCallInput,
+    ToolCallOutput,
+)
 
 T = TypeVar("T")
 
@@ -116,3 +123,36 @@ class AgentActivities:
             "tool_execute %s done in %.0f ms", inp.name, (time.perf_counter() - t0) * 1000
         )
         return out
+
+    @activity.defn(name="summarize_result")
+    def summarize_result(self, inp: SummarizeInput) -> SummarizeOutput:
+        """v2: compress a long tool result before it goes back into the model's context.
+
+        Added behind `workflow.patched("v2-summarize-results")`. Short results pass through
+        untouched so the common case costs nothing.
+        """
+        n = len(inp.content)
+        if n <= inp.max_chars:
+            return SummarizeOutput(content=inp.content, original_chars=n, summarized=False)
+
+        def call():
+            return self.provider.complete(
+                system=(
+                    "Condense the following tool output to the facts a downstream assistant "
+                    "needs, under the requested length. Keep numbers, names and errors verbatim."
+                ),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Tool: {inp.tool_name}\nMax chars: {inp.max_chars}\n\n{inp.content}"
+                        ),
+                    }
+                ],
+                tools=[],
+                max_tokens=max(64, inp.max_chars // 3),
+            )
+
+        resp = self._run_with_heartbeat(call, f"summarize {inp.tool_name}")
+        text = resp.text.strip() or inp.content[: inp.max_chars]
+        return SummarizeOutput(content=text, original_chars=n, summarized=True)
