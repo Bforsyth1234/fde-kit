@@ -13,14 +13,15 @@ services:
 
   temporal:
     # Single-binary dev server: server + in-memory persistence + web UI. Not for production.
+    # Histories live in memory and are lost on `make down`. The image runs as a non-root
+    # user, so an on-disk --db-filename under a named volume fails with SQLite "unable to
+    # open database file (14)"; in-memory is the fix and is all the demos and tests need.
     image: temporalio/temporal:latest
     container_name: fde-temporal
-    command: ["server", "start-dev", "--ip", "0.0.0.0", "--db-filename", "/data/temporal.db"]
+    command: ["server", "start-dev", "--ip", "0.0.0.0"]
     ports:
       - "7233:7233"   # gRPC frontend (workers and clients connect here)
       - "8233:8233"   # web UI
-    volumes:
-      - temporal-data:/data
     restart: unless-stopped
 
   postgres:
@@ -39,5 +40,4 @@ services:
 
 volumes:
   phoenix-data:
-  temporal-data:
   postgres-data:
