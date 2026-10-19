@@ -73,6 +73,45 @@ def test_postgres_journal_visible_across_instances():
         b.close()
 
 
+def test_file_journal_isolates_tenants_on_colliding_key(tmp_path: Path):
+    """Two tenants that choose the same workflow_id and tool_use_id must never read each other's
+    journaled tool outputs."""
+    j = FileJournal(tmp_path)
+    key = "shared-wf:1:toolu_mock_0_0"
+    j.put(
+        key,
+        ToolCallOutput(content="Harbor late fee is $75"),
+        tool_name="search_documents",
+        tenant_id="harbor",
+    )
+    assert j.get(key, tenant_id="summit", tool_name="search_documents") is None
+    assert j.get(key, tenant_id=None, tool_name="search_documents") is None
+    assert j.get(key, tenant_id="harbor", tool_name="other_tool") is None
+    hit = j.get(key, tenant_id="harbor", tool_name="search_documents")
+    assert hit is not None and hit.content == "Harbor late fee is $75"
+
+
+@needs_pg
+def test_postgres_journal_isolates_tenants_on_colliding_key():
+    j = PostgresJournal(PG_URL)
+    key = f"shared-wf:{uuid.uuid4().hex}:1:toolu_mock_0_0"
+    try:
+        j.put(
+            key,
+            ToolCallOutput(content="Harbor late fee is $75"),
+            tool_name="search_documents",
+            tenant_id="harbor",
+        )
+        assert j.get(key, tenant_id="summit", tool_name="search_documents") is None
+        assert j.get(key, tenant_id=None, tool_name="search_documents") is None
+        assert j.get(key, tenant_id="harbor", tool_name="other_tool") is None
+        hit = j.get(key, tenant_id="harbor", tool_name="search_documents")
+        assert hit is not None and hit.content == "Harbor late fee is $75"
+    finally:
+        j.close()
+
+
+
 # ------------------------------------------------------------- the crash-window scenario
 
 temporalio = pytest.importorskip("temporalio")

@@ -189,6 +189,8 @@ class TenantSession:
         max_chars: int = 900,
     ) -> str:
         """Replace-or-insert one document and its chunks. Returns doc_id (a UUID string)."""
+        chunks = chunk_text(text, title=title, max_chars=max_chars)
+        vecs = self.embedder.embed_documents(chunks) if chunks else []
         row = self.conn.execute(
             self.sql("""
             INSERT INTO @docs (tenant_id, source, title, metadata)
@@ -202,8 +204,6 @@ class TenantSession:
         assert row is not None
         doc_id = row[0]
         self.conn.execute(self.sql("DELETE FROM @chunks WHERE doc_id = %s"), (doc_id,))
-        chunks = chunk_text(text, title=title, max_chars=max_chars)
-        vecs = self.embedder.embed_documents(chunks) if chunks else []
         with self.conn.cursor() as cur:
             cur.executemany(
                 self.sql(

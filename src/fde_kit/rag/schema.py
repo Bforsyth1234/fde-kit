@@ -34,6 +34,8 @@ Beyond row visibility:
 from __future__ import annotations
 
 import hashlib
+import hmac
+import os
 import re
 from dataclasses import dataclass
 
@@ -48,6 +50,66 @@ TENANT_SETTING = "app.tenant_id"
 TENANT_TABLES = ("rag_tenants", "rag_documents", "rag_chunks", "rag_cache")
 
 _TENANT_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+
+# Columns of pg_catalog.pg_class that fde_rag_app may read. Omitted on purpose:
+# - relpartbound: contains `FOR VALUES IN ('<tenant_id>')` in plaintext for every partition;
+# - reltuples, relpages, relallvisible: reveal every other tenant's row and page counts.
+_PG_CLASS_SAFE_COLS = (
+    "oid",
+    "relname",
+    "relnamespace",
+    "reltype",
+    "reloftype",
+    "relowner",
+    "relam",
+    "relkind",
+    "relnatts",
+    "relchecks",
+    "relhasrules",
+    "relhastriggers",
+    "relhasindex",
+    "relisshared",
+    "relpersistence",
+    "relispopulated",
+    "relreplident",
+    "relispartition",
+    "relrewrite",
+    "relrowsecurity",
+    "relforcerowsecurity",
+)
+_PG_CLASS_FORBIDDEN_COLS = ("relpartbound", "reltuples", "relpages", "relallvisible")
+
+_REVOKED_CATALOG_TABLES = (
+    "pg_catalog.pg_description",
+    "pg_catalog.pg_stat_all_tables",
+    "pg_catalog.pg_stat_user_tables",
+    "pg_catalog.pg_stat_xact_all_tables",
+    "pg_catalog.pg_stat_xact_user_tables",
+    "pg_catalog.pg_statio_all_tables",
+    "pg_catalog.pg_statio_user_tables",
+    "pg_catalog.pg_stat_all_indexes",
+    "pg_catalog.pg_stat_user_indexes",
+    "pg_catalog.pg_statio_all_indexes",
+    "pg_catalog.pg_statio_user_indexes",
+)
+
+_REVOKED_CATALOG_FUNCTIONS = (
+    "pg_catalog.pg_relation_size(regclass)",
+    "pg_catalog.pg_relation_size(regclass, text)",
+    "pg_catalog.pg_table_size(regclass)",
+    "pg_catalog.pg_total_relation_size(regclass)",
+    "pg_catalog.pg_indexes_size(regclass)",
+    "pg_catalog.pg_stat_get_live_tuples(oid)",
+    "pg_catalog.pg_stat_get_dead_tuples(oid)",
+    "pg_catalog.pg_stat_get_tuples_inserted(oid)",
+    "pg_catalog.pg_stat_get_tuples_updated(oid)",
+    "pg_catalog.pg_stat_get_tuples_deleted(oid)",
+    "pg_catalog.pg_stat_get_numscans(oid)",
+    "pg_catalog.pg_stat_get_tuples_returned(oid)",
+    "pg_catalog.pg_stat_get_tuples_fetched(oid)",
+    "pg_catalog.pg_stat_get_blocks_fetched(oid)",
+    "pg_catalog.pg_stat_get_blocks_hit(oid)",
+)
 
 
 def validate_tenant_id(tenant_id: str) -> str:
@@ -132,9 +194,18 @@ LOG_PARAM_SETTINGS = ("log_parameter_max_length", "log_parameter_max_length_on_e
 EXPECTED_QUAL = f"(tenant_id = current_setting('{TENANT_SETTING}'::text, true))"
 
 
-def partition_name(table: str, tenant_id: str) -> str:
-    """Stable, length-safe partition name (tenant ids can be 63 chars; so can identifiers)."""
-    return f"{table}_t_{hashlib.sha256(tenant_id.encode()).hexdigest()[:16]}"
+def partition_name(table: str, tenant_id: str, *, key: str | None = None) -> str:
+    """Stable, length-safe partition name (tenant ids can be 63 chars; so can identifiers).
+
+    If `key` (or `FDE_RAG_PARTITION_KEY`) is set, uses HMAC-SHA256 so a dictionary of candidate
+    tenant ids cannot be matched against partition names in `pg_class` or server logs.
+    """
+    secret = key if key is not None else os.environ.get("FDE_RAG_PARTITION_KEY", "")
+    if secret:
+        digest = hmac.new(secret.encode(), tenant_id.encode(), hashlib.sha256).hexdigest()[:16]
+    else:
+        digest = hashlib.sha256(tenant_id.encode()).hexdigest()[:16]
+    return f"{table}_t_{digest}"
 
 
 def _policy_sql(table: str) -> str:
@@ -200,6 +271,19 @@ END $$;
             conn.execute(f"GRANT USAGE ON SCHEMA public TO {APP_ROLE}")
             # Creating tenants is an operator action, not something a tenant session can do.
             conn.execute(f"REVOKE INSERT, UPDATE, DELETE ON rag_tenants FROM {APP_ROLE}")
+            # Lock down system catalogs that would let fde_rag_app learn other tenants' names,
+            # row counts, byte sizes, or write activity across partitions.
+            conn.execute(f"REVOKE SELECT ON pg_catalog.pg_class FROM PUBLIC, {APP_ROLE}")
+            conn.execute(
+                f"GRANT SELECT ({', '.join(_PG_CLASS_SAFE_COLS)}) ON pg_catalog.pg_class TO PUBLIC"
+            )
+            conn.execute(
+                f"REVOKE SELECT ON {', '.join(_REVOKED_CATALOG_TABLES)} FROM PUBLIC, {APP_ROLE}"
+            )
+            conn.execute(
+                f"REVOKE EXECUTE ON FUNCTION {', '.join(_REVOKED_CATALOG_FUNCTIONS)} "
+                f"FROM PUBLIC, {APP_ROLE}"
+            )
 
 
 def create_tenant(admin_url: str, tenant_id: str, name: str = "") -> None:
@@ -224,8 +308,8 @@ def create_tenant(admin_url: str, tenant_id: str, name: str = "") -> None:
             )
             conn.execute(sql.SQL("ALTER TABLE {} OWNER TO {}").format(
                 part, sql.Identifier(OWNER_ROLE)))
-            conn.execute(sql.SQL("COMMENT ON TABLE {} IS {}").format(
-                part, sql.Literal(f"{table} partition for tenant {tenant_id}")))
+            # Never store the plaintext tenant_id in a table comment: pg_description is global.
+            conn.execute(sql.SQL("COMMENT ON TABLE {} IS NULL").format(part))
             name = partition_name(table, tenant_id)  # [a-z0-9_] only
             conn.execute(_policy_sql(name))
             conn.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {name} TO {APP_ROLE}")
@@ -312,6 +396,46 @@ def check_posture(conn: psycopg.Connection) -> list[PostureProblem]:
                     "params_logged",
                     f"{guc} = {value[0] if value else '?'}; the server log can record query "
                     "parameters (document text, questions). Run migrate, or set it to 0.",
+                )
+            )
+
+    # Catalog columns, views and size/stat functions that expose other tenants' names, row counts
+    # or activity on partitions.
+    for col in _PG_CLASS_FORBIDDEN_COLS:
+        can_read = conn.execute(
+            "SELECT has_column_privilege(current_user, 'pg_catalog.pg_class', %s, 'SELECT')",
+            (col,),
+        ).fetchone()
+        if can_read and can_read[0]:
+            problems.append(
+                PostureProblem(
+                    "catalog_leak",
+                    f"{user} can SELECT pg_class.{col}, which exposes partition bounds or row "
+                    "counts across tenants; run migrate",
+                )
+            )
+    for view in ("pg_catalog.pg_description", "pg_catalog.pg_stat_user_tables"):
+        can_read = conn.execute(
+            "SELECT has_table_privilege(current_user, %s, 'SELECT')", (view,)
+        ).fetchone()
+        if can_read and can_read[0]:
+            problems.append(
+                PostureProblem(
+                    "catalog_leak",
+                    f"{user} can SELECT {view}, which exposes cross-tenant metadata or activity; "
+                    "run migrate",
+                )
+            )
+    for fn in ("pg_catalog.pg_relation_size(regclass)", "pg_catalog.pg_stat_get_live_tuples(oid)"):
+        can_exec = conn.execute(
+            "SELECT has_function_privilege(current_user, %s, 'EXECUTE')", (fn,)
+        ).fetchone()
+        if can_exec and can_exec[0]:
+            problems.append(
+                PostureProblem(
+                    "catalog_leak",
+                    f"{user} can EXECUTE {fn}, which exposes other tenants' partition sizes or "
+                    "tuple counts; run migrate",
                 )
             )
 
@@ -416,3 +540,4 @@ def check_posture(conn: psycopg.Connection) -> list[PostureProblem]:
                 PostureProblem("owner", f"{user} owns {name} or can act as its owner")
             )
     return problems
+

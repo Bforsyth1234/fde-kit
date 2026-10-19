@@ -14,9 +14,11 @@ deployment that is a cross-tenant leak outside the database. So inside `tenant_s
 - every span gets a `tenant.id` attribute (TenantSpanProcessor), so traces can be filtered and
   access-scoped by tenant;
 - content (prompts, messages, tool arguments and results, answers) is replaced at the source by
-  `[redacted: N chars]` before it is set on a span, so it never reaches an exporter, a batch
-  queue or a collector. Structure stays: span names, tool names, turns, token counts, latency,
-  error flags.
+  `[redacted]` before it is set on a span (with no character-length hint, since on shared
+  document templates length alone can distinguish values like `$50` from `5% of the monthly
+  rent`), and any exception events or error status descriptions recorded on the span have their
+  message and stacktrace scrubbed before export. Structure stays: span names, tool names, turns,
+  token counts, latency, error flags, exception types.
 
 `FDE_OTEL_TENANT_CONTENT=true` turns content back on for tenant runs. Only do that if the trace
 store itself is partitioned or access-controlled per tenant. An Agent whose registry is bound to
@@ -34,8 +36,9 @@ from contextvars import ContextVar
 from typing import Any
 
 from opentelemetry import trace
-from opentelemetry.sdk.trace import SpanProcessor
+from opentelemetry.sdk.trace import Event, SpanProcessor
 from opentelemetry.trace import Tracer
+from opentelemetry.trace.status import Status, StatusCode
 
 from .config import Settings, get_settings
 
@@ -65,20 +68,43 @@ def current_tenant() -> str | None:
 
 def trace_content(value: Any, limit: int = 4000) -> str:
     """What to put in a content attribute (input.value, output.value). Inside a tenant scope,
-    a redaction marker unless FDE_OTEL_TENANT_CONTENT is on; otherwise `safe_json`."""
-    text = value if isinstance(value, str) else safe_json(value, limit=10**9)
+    a constant redaction marker unless FDE_OTEL_TENANT_CONTENT is on; otherwise `safe_json`."""
     if _tenant.get() is not None and not get_settings().otel_tenant_content:
-        return f"[redacted: {len(text)} chars]"
+        return "[redacted]"
+    text = value if isinstance(value, str) else safe_json(value, limit=10**9)
     return text if len(text) <= limit else text[:limit] + "...<truncated>"
 
 
 class TenantSpanProcessor(SpanProcessor):
-    """Stamps `tenant.id` on every span started inside a tenant scope."""
+    """Stamps `tenant.id` on every span started inside a tenant scope, and scrubs exception
+    messages/stacktraces and error status descriptions on end unless tenant content is enabled."""
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:
         tid = _tenant.get()
         if tid is not None:
             span.set_attribute(TENANT_ATTRIBUTE, tid)
+
+    def on_end(self, span: Any) -> None:
+        attrs = getattr(span, "attributes", None) or {}
+        if TENANT_ATTRIBUTE not in attrs or get_settings().otel_tenant_content:
+            return
+        events = getattr(span, "_events", None)
+        if events:
+            cleaned = []
+            for ev in events:
+                if ev.name == "exception":
+                    ev_attrs = dict(ev.attributes or {})
+                    if "exception.message" in ev_attrs:
+                        ev_attrs["exception.message"] = "[redacted]"
+                    if "exception.stacktrace" in ev_attrs:
+                        ev_attrs["exception.stacktrace"] = "[redacted]"
+                    cleaned.append(Event(name=ev.name, attributes=ev_attrs, timestamp=ev.timestamp))
+                else:
+                    cleaned.append(ev)
+            span._events = cleaned
+        status = getattr(span, "_status", None)
+        if status is not None and status.status_code == StatusCode.ERROR and status.description:
+            span._status = Status(StatusCode.ERROR, "[redacted]")
 
 
 def init_tracing(settings: Settings | None = None) -> Tracer:

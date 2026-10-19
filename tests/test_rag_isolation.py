@@ -212,6 +212,67 @@ def test_drop_tenant_removes_its_partitions_and_nothing_else(
         assert s.count_chunks() == harbor_before
 
 
+@pytest.mark.parametrize(
+    "sql_query",
+    [
+        "SELECT relpartbound FROM pg_class WHERE relispartition",
+        "SELECT pg_get_expr(relpartbound, oid) FROM pg_class WHERE relispartition",
+        "SELECT reltuples FROM pg_class WHERE relispartition",
+        "SELECT relpages FROM pg_class WHERE relispartition",
+        "SELECT relallvisible FROM pg_class WHERE relispartition",
+        "SELECT * FROM pg_description",
+        "SELECT * FROM pg_stat_user_tables",
+        "SELECT * FROM pg_stat_all_tables",
+        "SELECT * FROM pg_statio_user_tables",
+        "SELECT pg_relation_size('rag_chunks'::regclass)",
+        "SELECT pg_table_size('rag_chunks'::regclass)",
+        "SELECT pg_total_relation_size('rag_chunks'::regclass)",
+        "SELECT pg_stat_get_live_tuples('rag_chunks'::regclass)",
+        "SELECT pg_stat_get_tuples_inserted('rag_chunks'::regclass)",
+    ],
+)
+def test_app_role_cannot_read_other_tenants_names_or_counts_from_catalogs(
+    store: TenantStore, sql_query: str
+):
+    """System catalogs bypass RLS on rag_tenants: pg_class.relpartbound holds `FOR VALUES IN
+    ('<tenant_id>')` in plaintext, and pg_class.reltuples / pg_stat_user_tables / pg_relation_size
+    reveal every other tenant's row counts, byte sizes and write activity. migrate revokes all of
+    them from fde_rag_app."""
+    with pytest.raises(psycopg.errors.InsufficientPrivilege), store.session("harbor") as s:
+        s.conn.execute(sql_query).fetchall()
+
+
+def test_partitions_carry_no_table_comments(admin_url: str, store: TenantStore):
+    """A table comment with the tenant name in it would be readable if pg_description were ever
+    exposed."""
+    with psycopg.connect(admin_url) as conn:
+        comments = conn.execute(
+            "SELECT obj_description(oid, 'pg_class') FROM pg_class "
+            "WHERE relispartition AND relname LIKE 'rag_%'"
+        ).fetchall()
+    assert comments and all(c == (None,) for c in comments)
+
+
+def test_posture_check_catches_catalog_leaks(admin_url: str, app_url: str, store: TenantStore):
+    with psycopg.connect(admin_url, autocommit=True) as admin:
+        admin.execute("GRANT SELECT (relpartbound) ON pg_catalog.pg_class TO fde_rag_app")
+        try:
+            with psycopg.connect(app_url) as conn:
+                assert "catalog_leak" in {p.check for p in check_posture(conn)}
+            with pytest.raises(InsecureConnection):
+                TenantStore(app_url, HashEmbedder())
+        finally:
+            admin.execute("REVOKE SELECT (relpartbound) ON pg_catalog.pg_class FROM fde_rag_app")
+
+
+def test_partition_name_supports_deployment_key(monkeypatch: pytest.MonkeyPatch):
+    unk = partition_name("rag_chunks", "summit")
+    keyed = partition_name("rag_chunks", "summit", key="deploy-secret")
+    assert unk != keyed
+    monkeypatch.setenv("FDE_RAG_PARTITION_KEY", "deploy-secret")
+    assert partition_name("rag_chunks", "summit") == keyed
+
+
 def test_demonstration_superuser_sees_every_tenant(superuser):
     """Why the posture check exists: tenant set to summit, policy in place, every tenant's rows
     anyway, because superusers skip RLS."""
@@ -422,6 +483,40 @@ def test_tenant_registry_turns_on_trace_redaction(store: TenantStore):
     assert reg.tenant_id == "summit"
     with pytest.raises(ValueError):
         tenant_search_registry(store, "harbor", registry=reg)
+
+
+@pytest.mark.parametrize("bad", ["", "harbor' OR '1'='1", "Harbor", "a" * 64])
+def test_tenant_registry_validates_tenant_id_upfront(store: TenantStore, bad: str):
+    """Invalid tenant ids are rejected when the registry is constructed, even if the model
+    never calls search_documents."""
+    with pytest.raises(ValueError):
+        tenant_search_registry(store, bad)
+
+
+def test_shared_base_registry_is_not_mutated_by_tenant_search_registry(store: TenantStore):
+    """Passing a shared base registry (with tenant_id=None, e.g. builtin_tools.registry) must
+    not bind that shared registry in place to the first tenant that uses it."""
+    from fde_kit.tools import ToolRegistry
+
+    base = ToolRegistry()
+
+    @base.tool
+    def ping() -> str:
+        """Ping."""
+        return "pong"
+
+    reg_harbor = tenant_search_registry(store, "harbor", registry=base, cached=False)
+    reg_summit = tenant_search_registry(store, "summit", registry=base, cached=False)
+
+    assert base.tenant_id is None
+    assert "search_documents" not in base.names()
+    assert reg_harbor.tenant_id == "harbor" and "ping" in reg_harbor.names()
+    assert reg_summit.tenant_id == "summit" and "ping" in reg_summit.names()
+
+    out_h = reg_harbor.execute("search_documents", {"query": LATE_Q})
+    out_s = reg_summit.execute("search_documents", {"query": LATE_Q})
+    assert LATE_FEES["harbor"] in out_h.content and LATE_FEES["summit"] not in out_h.content
+    assert LATE_FEES["summit"] in out_s.content and LATE_FEES["harbor"] not in out_s.content
 
 
 def test_injected_tenant_argument_is_dropped(store: TenantStore):

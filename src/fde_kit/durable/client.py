@@ -31,9 +31,12 @@ async def start_run(
     system_prompt: str | None = None,
     approval_timeout_seconds: int | None = None,
     require_approval_for: list[str] | None = None,
+    tenant_id: str | None = None,
 ) -> WorkflowHandle[Any, AgentRunOutput]:
     client = client or await connect()
-    inp = AgentRunInput(prompt=prompt, max_turns=max_turns, system_prompt=system_prompt)
+    inp = AgentRunInput(
+        prompt=prompt, max_turns=max_turns, system_prompt=system_prompt, tenant_id=tenant_id
+    )
     if approval_timeout_seconds is not None:
         inp.approval_timeout_seconds = approval_timeout_seconds
     if require_approval_for:

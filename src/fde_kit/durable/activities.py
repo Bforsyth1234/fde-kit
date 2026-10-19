@@ -10,6 +10,7 @@ Tool execution consults the idempotency journal first. See journal.py for why.
 
 from __future__ import annotations
 
+import contextvars
 import os
 import time
 from collections.abc import Callable
@@ -20,6 +21,7 @@ from temporalio import activity
 
 from ..llm import LLMProvider
 from ..tools import ToolRegistry
+from ..tracing import tenant_scope
 from .journal import FileJournal, ToolJournal
 from .models import (
     LLMCallInput,
@@ -51,9 +53,23 @@ class AgentActivities:
 
     # -------------------------------------------------------------- helpers
 
+    def _effective_tenant(self, requested: str | None) -> str | None:
+        if (
+            requested is not None
+            and self.registry.tenant_id is not None
+            and requested != self.registry.tenant_id
+        ):
+            raise PermissionError(
+                f"activity for tenant {requested!r} routed to worker bound to "
+                f"{self.registry.tenant_id!r}"
+            )
+        return requested or self.registry.tenant_id
+
     def _run_with_heartbeat(self, fn: Callable[[], T], detail: str) -> T:
-        """Run blocking `fn` in a side thread and heartbeat until it returns."""
-        fut = self._pool.submit(fn)
+        """Run blocking `fn` in a side thread, preserving ContextVars (`tenant_scope`), and
+        heartbeat until it returns."""
+        ctx = contextvars.copy_context()
+        fut = self._pool.submit(ctx.run, fn)
         while True:
             try:
                 return fut.result(timeout=self.heartbeat_every)
@@ -64,6 +80,7 @@ class AgentActivities:
 
     @activity.defn(name="llm_call")
     def llm_call(self, inp: LLMCallInput) -> LLMCallOutput:
+        tid = self._effective_tenant(inp.tenant_id)
         info = activity.info()
         activity.logger.info(
             "llm_call turn=%s attempt=%s", inp.turn, info.attempt
@@ -77,7 +94,8 @@ class AgentActivities:
                 max_tokens=inp.max_tokens,
             )
 
-        resp = self._run_with_heartbeat(call, f"llm turn {inp.turn}")
+        with tenant_scope(tid):
+            resp = self._run_with_heartbeat(call, f"llm turn {inp.turn}")
         return LLMCallOutput(
             text=resp.text,
             tool_calls=[
@@ -100,8 +118,9 @@ class AgentActivities:
 
     @activity.defn(name="tool_execute")
     def tool_execute(self, inp: ToolCallInput) -> ToolCallOutput:
+        tid = self._effective_tenant(inp.tenant_id)
         info = activity.info()
-        cached = self.journal.get(inp.idempotency_key)
+        cached = self.journal.get(inp.idempotency_key, tenant_id=tid, tool_name=inp.name)
         if cached is not None:
             activity.logger.info(
                 "tool_execute %s attempt=%s served from journal (key=%s)",
@@ -113,13 +132,14 @@ class AgentActivities:
 
         activity.logger.info("tool_execute %s attempt=%s", inp.name, info.attempt)
         t0 = time.perf_counter()
-        res = self._run_with_heartbeat(
-            lambda: self.registry.execute(inp.name, inp.input), f"tool {inp.name}"
-        )
+        with tenant_scope(tid):
+            res = self._run_with_heartbeat(
+                lambda: self.registry.execute(inp.name, inp.input), f"tool {inp.name}"
+            )
         out = ToolCallOutput(content=res.content, is_error=res.is_error)
         # Record BEFORE returning. If the process dies between this line and Temporal recording
         # the completion, the retry is served from the journal and the tool does not run twice.
-        self.journal.put(inp.idempotency_key, out, tool_name=inp.name)
+        self.journal.put(inp.idempotency_key, out, tool_name=inp.name, tenant_id=tid)
         # Test hook: hold the activity open after journaling so a test can kill the worker in
         # exactly the window the journal exists for. Never set in production.
         hang = float(os.environ.get("FDE_TEST_HANG_AFTER_JOURNAL", "0") or 0)
@@ -137,6 +157,7 @@ class AgentActivities:
         Added behind `workflow.patched("v2-summarize-results")`. Short results pass through
         untouched so the common case costs nothing.
         """
+        tid = self._effective_tenant(inp.tenant_id)
         n = len(inp.content)
         if n <= inp.max_chars:
             return SummarizeOutput(content=inp.content, original_chars=n, summarized=False)
@@ -159,6 +180,8 @@ class AgentActivities:
                 max_tokens=max(64, inp.max_chars // 3),
             )
 
-        resp = self._run_with_heartbeat(call, f"summarize {inp.tool_name}")
+        with tenant_scope(tid):
+            resp = self._run_with_heartbeat(call, f"summarize {inp.tool_name}")
         text = resp.text.strip() or inp.content[: inp.max_chars]
         return SummarizeOutput(content=text, original_chars=n, summarized=True)
+
