@@ -51,6 +51,22 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Multi-tenant retrieval
+    rag_url: str | None = Field(
+        default=None,
+        description=(
+            "App connection for retrieval: postgresql://fde_rag_app:...@host/db. Must not be "
+            "a superuser, BYPASSRLS, or table owner; the store checks and refuses."
+        ),
+    )
+    rag_admin_url: str = Field(
+        default="postgresql://fde:fde@localhost:5432/fde",
+        description="Used only by `fde rag migrate` / `seed-demo` to create roles and tables.",
+    )
+    rag_embedder: str = Field(
+        default="bge", description="'bge' (BAAI/bge-small-en-v1.5 via fastembed) or 'hash'"
+    )
+
     # Evals
     eval_pass_threshold: float = Field(
         default=0.85, description="CI fails if pass rate drops below this"

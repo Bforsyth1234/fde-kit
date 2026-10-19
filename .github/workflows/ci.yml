@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: fde
           POSTGRES_PASSWORD: fde
@@ -31,6 +31,10 @@ jobs:
       - run: pytest --cov=fde_kit --cov-report=term-missing
         env:
           FDE_TEST_PG_URL: postgresql://fde:fde@localhost:5432/fde
+      - name: retrieval eval (hash embedder, offline) and tenant-leak gate
+        run: python -m evals.rag_eval --embedder hash --threshold 0.8
+        env:
+          FDE_RAG_ADMIN_URL: postgresql://fde:fde@localhost:5432/fde
       - name: offline eval (harness self-check)
         run: python -m evals.run_evals --provider mock --threshold 1.0
         env:

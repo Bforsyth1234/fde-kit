@@ -1,4 +1,5 @@
-.PHONY: install test lint eval eval-mock trace up down worker crash-demo upgrade-demo replay-check
+.PHONY: install test lint eval eval-mock trace up down worker crash-demo upgrade-demo replay-check \
+	rag-demo rag-eval rag-test
 
 worker:          ## Temporal worker for durable runs (needs `make up`)
 	fde worker
@@ -11,6 +12,15 @@ upgrade-demo:    ## deploy v2 while a v1 run is in flight (needs `make up`)
 
 replay-check:    ## replay v1 histories through the live workflow; the pre-deploy gate
 	pytest tests/test_versioning.py -q
+
+rag-demo:        ## three tenants, one lease template, same question (needs `make up`)
+	python examples/rag_demo.py
+
+rag-eval:        ## per-tenant retrieval eval with bge-small embeddings (needs `make up`)
+	python -m evals.rag_eval
+
+rag-test:        ## the tenant-isolation attack suite (needs `make up`)
+	FDE_TEST_PG_URL=postgresql://fde:fde@localhost:5432/fde pytest tests/test_rag_isolation.py -v
 
 install:
 	pip install -e ".[dev]"

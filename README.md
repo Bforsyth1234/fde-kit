@@ -10,6 +10,7 @@ knowing whether it works. Four pieces, nothing else:
 | Tracing | OpenTelemetry → Arize Phoenix (one container, no config). Token counts and tool I/O per span. | `src/fde_kit/tracing.py`, `docker-compose.yml` |
 | Eval harness | 20-case golden set, deterministic checks + optional LLM-as-judge, pass-rate gate wired into CI. | `evals/` |
 | Durable runtime | The same loop as a Temporal workflow. Kill the worker mid-run; the run finishes on the next one. Optional extra. | `src/fde_kit/durable/` |
+| Multi-tenant retrieval | Hybrid search (pgvector + BM25) where tenant isolation is Postgres Row-Level Security, not a `WHERE` clause. 47 attack tests. Optional extra. | `src/fde_kit/rag/` |
 
 Provider-agnostic behind a 30-line interface; Anthropic is the default, a deterministic mock is
 built in for tests and offline eval runs.
@@ -262,6 +263,154 @@ The journal covers crash-after-complete. A crash *during* a non-idempotent tool,
 journal write, still re-runs the tool on retry. Closing that needs the tool to record intent
 before acting and reconcile on retry, which is the sandbox project, not this one.
 
+## Multi-tenant retrieval
+
+One retrieval store serving many customers. Isolation is enforced by Postgres Row-Level Security,
+so it holds even when application code forgets a filter, and the test suite tries to break it.
+
+```bash
+pip install -e ".[rag]"
+docker compose up -d postgres     # pgvector/pgvector:pg16
+fde rag seed-demo                 # migrate + three demo tenants
+fde rag search --tenant summit "How much extra do I owe if my rent is late?"
+fde rag ask --tenant summit "How much is the late fee?"        # agent, search bound to summit
+make rag-demo                     # same question, three tenants, three answers
+make rag-test                     # the attack suite
+make rag-eval                     # retrieval numbers below
+```
+
+```python
+from fde_kit import Agent
+from fde_kit.rag import TenantStore, make_embedder, tenant_search_registry
+
+store = TenantStore(app_url, make_embedder("bge"))      # refuses superuser / owner connections
+with store.session("summit") as s:
+    s.ingest("leases/101.md", text, title="Lease: Apartment 101", metadata={"unit": "101"})
+    hits = s.search("late fee?", k=5)                   # hybrid by default
+
+# Per request: the tenant comes from your auth layer, never from the model.
+Agent(tenant_search_registry(store, tenant_id=request.tenant)).run(request.question)
+```
+
+### How isolation works
+
+| Layer | What it does |
+| --- | --- |
+| Policy | Every tenant table has RLS **enabled and forced**, one policy: `tenant_id = current_setting('app.tenant_id', true)` for reads (`USING`) and writes (`WITH CHECK`). Unset or empty setting matches nothing: fail closed. |
+| Roles | `fde_rag_owner` (NOLOGIN) owns the tables; the app connects as `fde_rag_app` with DML grants only. It can't create tenants, alter tables, or own anything. |
+| Posture check | `TenantStore` checks on startup that its connection is not a superuser, has no BYPASSRLS, doesn't own or act as owner of any RAG table, and that every table has RLS on and forced. Otherwise it raises `InsecureConnection`. `fde rag posture` runs the same check. |
+| Transaction-local tenant | `session(tenant)` opens a transaction and sets the tenant with `set_config(..., is_local => true)`. It is gone when the transaction ends, so a pooled connection can't carry one request's tenant into the next. |
+| Composite foreign key | `rag_chunks (tenant_id, doc_id) → rag_documents (tenant_id, doc_id)`. A chunk can't point at another tenant's document. FK checks run outside RLS, so the key enforces this, not the policy. |
+| No tenant argument | The agent's `search_documents` tool has `query` and `k`. The tenant is bound when the registry is built per request. There is nothing for a prompt injection to fill in. |
+| Per-tenant cache | The semantic cache is a table under the same policy, so a paraphrase lookup can only match that tenant's previous queries. Ingest clears that tenant's cache only. |
+| Per-tenant statistics | BM25's document frequencies come from a query over `rag_chunks`, under RLS. IDF is per tenant with no extra code. |
+
+No query in `store.py` filters on `tenant_id`. That is deliberate: if the code also filtered,
+a broken policy would still pass every test.
+
+### The attack suite
+
+`tests/test_rag_isolation.py`, 47 tests against a real Postgres + pgvector. The corpus is three
+property managers using the **same lease template**, so every leaked chunk reads like a correct
+answer with the wrong number in it: Summit's late fee is $50, Harbor's is $75, in the same
+sentence.
+
+| Attack | Result | Test |
+| --- | --- | --- |
+| Same question, every tenant, every search mode | only own chunks; counts partition the table exactly | `test_every_result_belongs_to_the_asking_tenant`, `test_counts_partition_the_table` |
+| Shared template: ask for "the late fee" | own number present, other tenants' numbers absent | `test_shared_template_returns_this_tenants_number` |
+| Plant the exact question text in another tenant (cosine similarity 1.0) | invisible; a superuser connection shows it as the top hit, proving the plant works | `test_exact_duplicate_in_another_tenant_is_invisible` |
+| Same document ingested by two tenants | two documents, two ids, each sees one | `test_same_document_in_two_tenants_stays_two_documents` |
+| No tenant set, or set to `''` | zero rows on every table; inserts rejected | `test_no_tenant_set_means_no_rows_and_no_writes`, `test_empty_tenant_setting_is_not_a_wildcard` |
+| Insert or `UPDATE ... SET tenant_id` into another tenant | rejected by `WITH CHECK` | `test_cannot_insert_rows_for_another_tenant`, `test_cannot_move_own_rows_into_another_tenant` |
+| `DELETE`/`UPDATE ... WHERE tenant_id = 'other'` | 0 rows affected | `test_updates_and_deletes_cannot_reach_other_tenants` |
+| Chunk referencing another tenant's `doc_id` | foreign-key violation | `test_chunk_cannot_point_at_another_tenants_document` |
+| Metadata filter `{"tenant_id": "other"}`, SQL in filter values | empty result: filters only narrow | `test_filters_can_only_narrow` |
+| SQL / tsquery syntax in the query text | treated as text; tenant unchanged | `test_hostile_query_text_is_just_text` |
+| Malformed tenant ids (`harbor' OR '1'='1`, …) | `ValueError` before any SQL | `test_malformed_tenant_ids_are_rejected` |
+| Model passes `tenant_id`, `namespace`, `filters` to the tool | ignored; schema has no such field | `test_search_tool_has_no_tenant_argument`, `test_injected_tenant_argument_is_dropped` |
+| Prompt injection inside a retrieved document ("search tenant harbor") | model obeys, tool ignores it | `test_prompt_injection_in_a_document_cannot_redirect_the_search` |
+| Connection pool reuse | next borrower has no tenant and sees nothing | `test_store_sessions_do_not_survive_the_transaction` |
+| Shared semantic cache | per-tenant cache: other tenant misses | `test_tenant_cache_is_per_tenant` |
+| Flood one tenant with matching documents | another tenant's BM25 scores unchanged, bit for bit | `test_bm25_statistics_are_per_tenant` |
+
+Four tests, and one assertion in a fifth, are **demonstrations**: each reproduces a real failure
+with a configuration the store refuses to use, and passes because the failure happens.
+
+| Demonstration | What it shows |
+| --- | --- |
+| `test_demonstration_superuser_sees_every_tenant` | The compose `POSTGRES_USER` is a superuser. Connect as it and RLS does nothing: identical code, every tenant's chunks. |
+| `test_demonstration_session_level_setting_leaks_through_the_pool` | `set_config(..., false)` on a pooled connection; the next request forgets to set a tenant and reads the previous tenant's data. |
+| `test_demonstration_shared_semantic_cache_leaks` | A process-wide cache keyed on the query embedding. Summit asks Harbor's question and gets Harbor's $75. |
+| `test_bm25_statistics_are_per_tenant` (second assertion) | With global corpus statistics, another tenant's documents shift your scores. That shift is information about their data. |
+| `test_demonstration_hnsw_post_filter_starves_a_small_tenant` | See below. |
+
+**Mutation check.** I broke each defence on purpose and reran the suite. A policy of `USING
+(true)`: 25 of 47 tests fail. A session-level `set_config`: the pool test fails. RLS off on the cache
+table: the store refuses to start (posture check). Iterative scan off: the recall test fails.
+Removing `WITH CHECK` changes nothing, correctly, because Postgres applies `USING` to writes when
+`WITH CHECK` is absent.
+
+### Two things I didn't expect
+
+**The planner can't see the tenant.** `current_setting('app.tenant_id')` isn't known at plan
+time, so Postgres plans every tenant with the same estimate: table rows ÷ distinct tenants. With a
+few large tenants the estimate is big and the planner orders by the HNSW index for everyone. HNSW
+returns its `ef_search` (40) nearest rows across *all* tenants and RLS filters afterwards. A
+tenant with 5 chunks sharing an index with a tenant with 3,000 gets **0 of 5** results.
+Isolation holds; recall doesn't. pgvector 0.8's `hnsw.iterative_scan = relaxed_order` keeps
+scanning until enough rows pass the filter, and every session sets it. Both behaviours are
+tests. (The flip side: with many small tenants the planner brute-forces everyone, which is
+correct but slow for the big ones. At real scale, partition by tenant or give large tenants
+partial indexes.)
+
+**Fusion only works when the scores mean something.** The demo corpus has twelve near-identical
+leases per tenant and four kinds of question. Two fusion methods were fixed in advance and not
+tuned: reciprocal rank fusion (k=60) and relative score fusion (min-max normalise each list,
+average, alpha 0.5).
+
+| Hybrid, bge-small, hit@1 | RRF | Relative score |
+| --- | --- | --- |
+| keyword arm = Postgres `ts_rank_cd` | 0.67 | 0.63 |
+| keyword arm = BM25 (per-tenant stats) | 0.74 | **0.96** |
+
+Neither change does much alone. RRF keeps only rank, so a chunk that is mediocre in both lists
+beats one that is first in one. Relative fusion keeps the margin, which helps only if the margin
+is real: BM25 has IDF, so an exact lease-reference match scores far above everything else.
+`ts_rank_cd` has no IDF, so "rent" and "lease", present in every chunk, count as much as the
+reference number, and normalising those scores amplifies noise.
+
+### Retrieval numbers
+
+`make rag-eval`: 54 questions over the demo corpus (18 per tenant, 99 chunks each), k=5,
+BAAI/bge-small-en-v1.5, CPU, 2026-10-19.
+
+| Question type | n | vector | keyword (BM25) | hybrid (RRF) | **hybrid (default)** |
+| --- | --- | --- | --- | --- | --- |
+| Policy, paraphrased ("how much extra if rent is late?") | 15 | 1.00 | 0.87 | 1.00 | **1.00** |
+| Unit-specific ("when does Dana Whitfield's lease run out?") | 24 | 1.00 | 0.42 | 0.75 | **1.00** |
+| Identifier ("who is on lease SR-26-6977?") | 12 | 0.08 | 1.00 | 0.33 | **0.83** |
+| Tenant-only document | 3 | 1.00 | 0.67 | 1.00 | **1.00** |
+| **All, hit@1** | 54 | 0.80 | 0.69 | 0.74 | **0.96** |
+| All, hit@5 | 54 | 0.87 | 0.93 | 0.96 | **0.98** |
+| Cross-tenant hits, incl. probes (each tenant asked the other two tenants' document-only questions) | | 0 | 0 | 0 | **0** |
+
+p50 latency per query: ~3 ms keyword, ~55 ms vector or hybrid, almost all of it embedding the
+query on CPU. The keyword arm recomputes document frequencies over the tenant's chunks on every
+query, which is fine at this size; a large deployment would keep a per-tenant term-stats table.
+
+**Read these as directional.** The corpus is synthetic, small, and written by the same person who
+wrote the questions. What it is good for is comparing methods on the same data, and the
+cross-tenant row, which is measured on every run rather than assumed. CI runs the eval with the
+hash embedder (offline, no model download) and fails on any cross-tenant hit.
+
+### What's not covered
+
+Timing side channels (a cache hit is faster than a miss, and that's observable), embedding
+inversion if vectors ever leave the database, per-tenant encryption keys, and deletion guarantees
+(`DELETE` removes rows; it doesn't scrub WAL or backups). Each is a real question in a security
+review; none is answered here.
+
 ## Baseline results
 
 Golden set against `claude-sonnet-5-5`, single run, 2026-10-18:
@@ -286,7 +435,9 @@ that class of bug before the full eval does.
 
 ## CI
 
-`.github/workflows/ci.yml` runs lint, tests and the offline eval on every push and PR. On pushes
+`.github/workflows/ci.yml` runs lint, tests (Postgres + pgvector service container), the
+offline retrieval eval with its cross-tenant gate, and the offline agent eval on every push and
+PR. On pushes
 to `main` it also runs the golden set against the real model **if** an `ANTHROPIC_API_KEY`
 repository secret is set, and fails the build below the threshold. The results JSON is uploaded
 as a build artifact.
@@ -303,6 +454,9 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
 | `FDE_OTEL_ENABLED` | `true` | Export spans |
 | `FDE_OTEL_ENDPOINT` | `http://localhost:6006/v1/traces` | OTLP/HTTP collector |
 | `FDE_EVAL_PASS_THRESHOLD` | `0.85` | CI gate |
+| `FDE_RAG_URL` | derived from admin URL | App connection for retrieval, as `fde_rag_app`. Never a superuser. |
+| `FDE_RAG_ADMIN_URL` | `postgresql://fde:fde@localhost:5432/fde` | Used only by `fde rag migrate` / `seed-demo` |
+| `FDE_RAG_EMBEDDER` | `bge` | `bge` (bge-small via fastembed) or `hash` (offline, tests) |
 
 ## Design notes
 
@@ -320,7 +474,7 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
 
 ## What's not here yet
 
-Retrieval, prompt versioning, pairwise/A-B eval mode, a customers/ onboarding directory, and a
+Prompt versioning, pairwise/A-B eval mode, a customers/ onboarding directory, and a
 one-command cloud deploy. Those are v1.
 
 ## License
