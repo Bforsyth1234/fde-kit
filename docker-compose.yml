@@ -11,5 +11,33 @@ services:
       - phoenix-data:/data
     restart: unless-stopped
 
+  temporal:
+    # Single-binary dev server: server + in-memory persistence + web UI. Not for production.
+    image: temporalio/temporal:latest
+    container_name: fde-temporal
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--db-filename", "/data/temporal.db"]
+    ports:
+      - "7233:7233"   # gRPC frontend (workers and clients connect here)
+      - "8233:8233"   # web UI
+    volumes:
+      - temporal-data:/data
+    restart: unless-stopped
+
+  postgres:
+    # Shared tool-idempotency journal for durable runs. Any number of workers, one journal.
+    image: postgres:16-alpine
+    container_name: fde-postgres
+    environment:
+      POSTGRES_USER: fde
+      POSTGRES_PASSWORD: fde
+      POSTGRES_DB: fde
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
 volumes:
   phoenix-data:
+  temporal-data:
+  postgres-data:
