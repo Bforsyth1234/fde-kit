@@ -12,6 +12,7 @@ from .schema import (
     app_url_from_admin,
     check_posture,
     create_tenant,
+    drop_tenant,
     migrate,
 )
 from .store import Hit, SearchResult, TenantSession, TenantStore
@@ -32,6 +33,7 @@ __all__ = [
     "check_posture",
     "chunk_text",
     "create_tenant",
+    "drop_tenant",
     "make_embedder",
     "migrate",
     "tenant_search_registry",

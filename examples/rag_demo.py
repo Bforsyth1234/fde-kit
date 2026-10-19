@@ -5,8 +5,8 @@
 
 Every tenant's late-fee clause is the same sentence with a different number in it. The demo asks
 all three the same question and prints what each one gets back. Then it tries the same thing on
-a superuser connection, which the store refuses, and shows what that connection would have
-returned if it hadn't. With ANTHROPIC_API_KEY set, it also runs the agent per tenant.
+a superuser connection, which the store refuses, and runs the search as that superuser anyway
+to show what RLS stops applying to. With ANTHROPIC_API_KEY set, it also runs the agent per tenant.
 """
 
 from __future__ import annotations
@@ -71,12 +71,22 @@ def main() -> int:
             TenantStore(a.admin_url, embedder)
         except InsecureConnection as exc:
             console.print(f"[yellow]refused[/]: {exc.problems[0]}")
-        with TenantStore(a.admin_url, embedder, allow_insecure=True) as unsafe:
-            with unsafe.session("summit") as s:
-                hits = s.search(QUESTION, k=5)
-            console.print("what 'summit' would have seen, with allow_insecure=True:")
-            for h in hits:
-                console.print(f"  {h.source:38} late fee: {fee_line(h.content)}")
+        import psycopg
+
+        with psycopg.connect(a.admin_url) as conn:
+            conn.execute("SELECT set_config('app.tenant_id', 'summit', false)")
+            rows = conn.execute(
+                "SELECT tenant_id, count(*) FROM rag_chunks WHERE tenant_id = ANY(%s) "
+                "GROUP BY 1 ORDER BY 1",
+                (list(TENANTS),),
+            ).fetchall()
+        console.print(
+            "as that superuser anyway, tenant set to 'summit', policy in place, "
+            "SELECT count(*) FROM rag_chunks sees:"
+        )
+        for tid, n in rows:
+            mark = "" if tid == "summit" else "   [red]<- not summit's[/]"
+            console.print(f"  {tid:10} {n:5} chunks{mark}")
 
         if os.environ.get("ANTHROPIC_API_KEY"):
             console.rule("the agent, one registry per tenant")

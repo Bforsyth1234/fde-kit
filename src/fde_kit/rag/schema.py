@@ -17,11 +17,23 @@ the application connects as, with DML grants and nothing else. `check_posture` v
 this on the live connection, and `TenantStore` refuses to start if any check fails. A store that
 silently runs as a superuser would pass every functional test and isolate nothing.
 
+Beyond row visibility:
+
+- Documents, chunks and cache are partitioned by tenant, one partition each, created by
+  `create_tenant`. Shared indexes make a query's cost depend on other tenants' data, which is
+  observable as latency; tests/test_rag_isolation.py measures it.
+- Ids are random UUIDs, not shared sequences.
+- The app role never logs bound parameters (document text, questions) to the server log.
+- `check_posture` also rejects any permissive policy other than tenant_isolation as written
+  here, on parents and partitions: permissive policies are OR-ed, so one extra `USING (true)`
+  would open every tenant's rows.
+
 `migrate` is idempotent and runs with an admin URL (the compose superuser is fine for that).
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 
@@ -56,17 +68,20 @@ CREATE TABLE IF NOT EXISTS rag_tenants (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Partitioned by tenant, one partition per tenant (created by `create_tenant`). Each tenant's
+-- rows, B-trees, GIN and HNSW indexes are physically its own, so the work a query does, and so
+-- its latency, can't depend on another tenant's data. Ids are random UUIDs, not a shared
+-- sequence, so the gap between two of your ids says nothing about anyone else's inserts.
 CREATE TABLE IF NOT EXISTS rag_documents (
-    doc_id      BIGSERIAL PRIMARY KEY,
+    doc_id      UUID NOT NULL DEFAULT gen_random_uuid(),
     tenant_id   TEXT NOT NULL REFERENCES rag_tenants (tenant_id) ON DELETE CASCADE,
     source      TEXT NOT NULL,
     title       TEXT NOT NULL DEFAULT '',
     metadata    JSONB NOT NULL DEFAULT '{{}}'::jsonb,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (tenant_id, source),
-    -- Target for the composite foreign key below.
-    UNIQUE (tenant_id, doc_id)
-);
+    PRIMARY KEY (tenant_id, doc_id),
+    UNIQUE (tenant_id, source)
+) PARTITION BY LIST (tenant_id);
 
 -- Token count for BM25 length normalisation. IMMUTABLE so it can back a generated column.
 CREATE OR REPLACE FUNCTION rag_token_count(content TEXT) RETURNS INT
@@ -76,19 +91,20 @@ CREATE OR REPLACE FUNCTION rag_token_count(content TEXT) RETURNS INT
 $$;
 
 CREATE TABLE IF NOT EXISTS rag_chunks (
-    chunk_id    BIGSERIAL PRIMARY KEY,
+    chunk_id    UUID NOT NULL DEFAULT gen_random_uuid(),
     tenant_id   TEXT NOT NULL,
-    doc_id      BIGINT NOT NULL,
+    doc_id      UUID NOT NULL,
     ord         INT NOT NULL,
     content     TEXT NOT NULL,
     embedding   vector({EMBED_DIM}) NOT NULL,
     tsv         tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
     n_tokens    INT GENERATED ALWAYS AS (rag_token_count(content)) STORED,
+    PRIMARY KEY (tenant_id, chunk_id),
     -- A chunk can only point at a document of its own tenant. Referential checks run outside
     -- RLS, so this is enforced by the key itself, not by the policy.
     FOREIGN KEY (tenant_id, doc_id)
         REFERENCES rag_documents (tenant_id, doc_id) ON DELETE CASCADE
-);
+) PARTITION BY LIST (tenant_id);
 
 CREATE TABLE IF NOT EXISTS rag_cache (
     tenant_id   TEXT NOT NULL REFERENCES rag_tenants (tenant_id) ON DELETE CASCADE,
@@ -99,15 +115,26 @@ CREATE TABLE IF NOT EXISTS rag_cache (
     result      JSONB NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, query_hash)
-);
+) PARTITION BY LIST (tenant_id);
 
-CREATE INDEX IF NOT EXISTS rag_chunks_tenant_idx ON rag_chunks (tenant_id);
+-- Defined on the parents, built per partition.
+CREATE INDEX IF NOT EXISTS rag_chunks_doc_idx ON rag_chunks (tenant_id, doc_id);
 CREATE INDEX IF NOT EXISTS rag_chunks_embedding_idx
     ON rag_chunks USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS rag_chunks_tsv_idx ON rag_chunks USING gin (tsv);
 CREATE INDEX IF NOT EXISTS rag_cache_embedding_idx
     ON rag_cache USING hnsw (embedding vector_cosine_ops);
 """
+
+PARTITIONED_TABLES = ("rag_documents", "rag_chunks", "rag_cache")
+LOG_PARAM_SETTINGS = ("log_parameter_max_length", "log_parameter_max_length_on_error")
+# How Postgres deparses the policy condition; posture compares the live policies against it.
+EXPECTED_QUAL = f"(tenant_id = current_setting('{TENANT_SETTING}'::text, true))"
+
+
+def partition_name(table: str, tenant_id: str) -> str:
+    """Stable, length-safe partition name (tenant ids can be 63 chars; so can identifiers)."""
+    return f"{table}_t_{hashlib.sha256(tenant_id.encode()).hexdigest()[:16]}"
 
 
 def _policy_sql(table: str) -> str:
@@ -144,6 +171,24 @@ END $$;
                 sql.Identifier(APP_ROLE), sql.Literal(app_password)
             )
         )
+        # Never write bound parameter values to the server log for this role. With the default
+        # (-1, unlimited), turning on slow-query logging puts every document's text, every
+        # embedding and every user question into the Postgres log, which usually ships to a
+        # shared log system. Per-role settings take precedence over postgresql.conf.
+        # log_parameter_max_length is superuser-only, so the app can't undo it;
+        # log_parameter_max_length_on_error is user-settable, so TenantStore.session also sets
+        # it to 0 at the start of every transaction.
+        for guc in LOG_PARAM_SETTINGS:
+            conn.execute(f"ALTER ROLE {APP_ROLE} SET {guc} = 0")
+        old = conn.execute(
+            "SELECT relname FROM pg_class WHERE relname = ANY(%s) AND relkind = 'r'",
+            (list(PARTITIONED_TABLES),),
+        ).fetchall()
+        if old:
+            raise RuntimeError(
+                f"{', '.join(r[0] for r in old)} exist as unpartitioned tables from an older "
+                "schema. Drop them (fde_kit.rag.schema.drop_all) and re-ingest."
+            )
         with conn.transaction():
             conn.execute(DDL)
             for table in TENANT_TABLES:
@@ -152,23 +197,57 @@ END $$;
                 conn.execute(
                     f"GRANT SELECT, INSERT, UPDATE, DELETE ON {table} TO {APP_ROLE}"
                 )
-            conn.execute(
-                f"GRANT USAGE ON SCHEMA public TO {APP_ROLE};"
-                f"GRANT USAGE, SELECT ON SEQUENCE rag_documents_doc_id_seq, "
-                f"rag_chunks_chunk_id_seq TO {APP_ROLE};"
-            )
+            conn.execute(f"GRANT USAGE ON SCHEMA public TO {APP_ROLE}")
             # Creating tenants is an operator action, not something a tenant session can do.
             conn.execute(f"REVOKE INSERT, UPDATE, DELETE ON rag_tenants FROM {APP_ROLE}")
 
 
 def create_tenant(admin_url: str, tenant_id: str, name: str = "") -> None:
+    """Register a tenant and create its partitions. Idempotent.
+
+    Each partition gets the parent's forced policy and the app role's grants: the store queries
+    a tenant's partitions by name (so planning never looks at other tenants), and the policy
+    means a session pointed at the wrong partition still sees nothing."""
     validate_tenant_id(tenant_id)
-    with psycopg.connect(admin_url, autocommit=True) as conn:
+    with psycopg.connect(admin_url, autocommit=True) as conn, conn.transaction():
         conn.execute(
             "INSERT INTO rag_tenants (tenant_id, name) VALUES (%s, %s) "
             "ON CONFLICT (tenant_id) DO UPDATE SET name = EXCLUDED.name",
             (tenant_id, name or tenant_id),
         )
+        for table in PARTITIONED_TABLES:
+            part = sql.Identifier(partition_name(table, tenant_id))
+            conn.execute(
+                sql.SQL("CREATE TABLE IF NOT EXISTS {} PARTITION OF {} FOR VALUES IN ({})").format(
+                    part, sql.Identifier(table), sql.Literal(tenant_id)
+                )
+            )
+            conn.execute(sql.SQL("ALTER TABLE {} OWNER TO {}").format(
+                part, sql.Identifier(OWNER_ROLE)))
+            conn.execute(sql.SQL("COMMENT ON TABLE {} IS {}").format(
+                part, sql.Literal(f"{table} partition for tenant {tenant_id}")))
+            name = partition_name(table, tenant_id)  # [a-z0-9_] only
+            conn.execute(_policy_sql(name))
+            conn.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {name} TO {APP_ROLE}")
+
+
+def drop_tenant(admin_url: str, tenant_id: str) -> None:
+    """Offboard a tenant: drop its partitions (rows, indexes and files go with them) and the
+    tenant row. Idempotent. What this does not reach: WAL already written, replicas' WAL
+    archives, and backups. See README "Backups and logs"."""
+    validate_tenant_id(tenant_id)
+    with psycopg.connect(admin_url, autocommit=True) as conn, conn.transaction():
+        for table in ("rag_cache", "rag_chunks", "rag_documents"):  # referencing side first
+            part = partition_name(table, tenant_id)
+            exists = conn.execute("SELECT to_regclass(%s)", (part,)).fetchone()
+            if exists and exists[0]:
+                conn.execute(
+                    sql.SQL("ALTER TABLE {} DETACH PARTITION {}").format(
+                        sql.Identifier(table), sql.Identifier(part)
+                    )
+                )
+                conn.execute(sql.SQL("DROP TABLE {}").format(sql.Identifier(part)))
+        conn.execute("DELETE FROM rag_tenants WHERE tenant_id = %s", (tenant_id,))
 
 
 def drop_all(admin_url: str) -> None:
@@ -225,6 +304,51 @@ def check_posture(conn: psycopg.Connection) -> list[PostureProblem]:
     if bypass:
         problems.append(PostureProblem("bypassrls", f"role {user} has BYPASSRLS"))
 
+    for guc in LOG_PARAM_SETTINGS:
+        value = conn.execute("SELECT current_setting(%s)", (guc,)).fetchone()
+        if not value or value[0] != "0":
+            problems.append(
+                PostureProblem(
+                    "params_logged",
+                    f"{guc} = {value[0] if value else '?'}; the server log can record query "
+                    "parameters (document text, questions). Run migrate, or set it to 0.",
+                )
+            )
+
+    # Every policy on every RAG table and partition. Permissive policies are OR-ed together, so
+    # one extra `USING (true)` policy, added for debugging say, opens every tenant's rows even
+    # though tenant_isolation is still there. The only permissive policy allowed is ours,
+    # exactly as migrate wrote it; restrictive policies only narrow access and are fine.
+    for table, name, permissive, cmd, roles, qual, check in conn.execute(
+        """
+        SELECT pol.tablename, pol.policyname, pol.permissive, pol.cmd, pol.roles::text[],
+               pol.qual, pol.with_check
+        FROM pg_policies pol
+        WHERE pol.schemaname = 'public' AND (pol.tablename = ANY(%s) OR pol.tablename IN (
+            SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_class p ON p.oid = i.inhparent WHERE p.relname = ANY(%s)))
+        """,
+        (list(TENANT_TABLES), list(PARTITIONED_TABLES)),
+    ).fetchall():
+        if permissive != "PERMISSIVE":
+            continue
+        ok = (
+            name == "tenant_isolation"
+            and cmd == "ALL"
+            and roles == ["public"]
+            and qual == EXPECTED_QUAL
+            and check == EXPECTED_QUAL
+        )
+        if not ok:
+            problems.append(
+                PostureProblem(
+                    "policy",
+                    f"{table} has permissive policy {name} ({cmd}, roles {roles}) with "
+                    f"USING {qual} / WITH CHECK {check}; only tenant_isolation as written by "
+                    "migrate is allowed",
+                )
+            )
+
     rows = conn.execute(
         """
         SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
@@ -237,7 +361,50 @@ def check_posture(conn: psycopg.Connection) -> list[PostureProblem]:
     found = {r[0] for r in rows}
     for missing in sorted(set(TENANT_TABLES) - found):
         problems.append(PostureProblem("missing_table", f"{missing} not found; run migrate"))
+    for (name,) in conn.execute(
+        "SELECT relname FROM pg_class WHERE relname = ANY(%s) AND relkind <> 'p'",
+        (list(PARTITIONED_TABLES),),
+    ).fetchall():
+        problems.append(
+            PostureProblem(
+                "not_partitioned",
+                f"{name} is not partitioned by tenant; shared indexes make one tenant's query "
+                "cost depend on other tenants' data",
+            )
+        )
+    for part, rls, force, has_policy, acts_as_owner in conn.execute(
+        """
+        SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
+               EXISTS (SELECT 1 FROM pg_policy pol WHERE pol.polrelid = c.oid),
+               pg_has_role(current_user, c.relowner, 'USAGE')
+        FROM pg_inherits i
+        JOIN pg_class c ON c.oid = i.inhrelid JOIN pg_class p ON p.oid = i.inhparent
+        WHERE p.relname = ANY(%s)
+        """,
+        (list(PARTITIONED_TABLES),),
+    ).fetchall():
+        # The store queries partitions directly, so each one needs its own forced policy.
+        if not (rls and force and has_policy):
+            problems.append(
+                PostureProblem(
+                    "partition_rls",
+                    f"partition {part} lacks an enabled, forced tenant policy; direct "
+                    "queries to it would not be filtered",
+                )
+            )
+        if acts_as_owner:
+            problems.append(PostureProblem("owner", f"{user} owns partition {part}"))
+    with_policy = {
+        r[0]
+        for r in conn.execute(
+            "SELECT tablename FROM pg_policies WHERE policyname = 'tenant_isolation' "
+            "AND tablename = ANY(%s)",
+            (list(TENANT_TABLES),),
+        ).fetchall()
+    }
     for name, rls, force, acts_as_owner in rows:
+        if name not in with_policy:
+            problems.append(PostureProblem("policy", f"{name} has no tenant_isolation policy"))
         if not rls:
             problems.append(PostureProblem("rls_disabled", f"{name} has RLS disabled"))
         if not force:

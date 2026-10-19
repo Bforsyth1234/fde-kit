@@ -41,6 +41,13 @@ class Settings(BaseSettings):
         description="OTLP/HTTP endpoint. Default is a local Arize Phoenix instance.",
     )
     otel_service_name: str = "fde-kit"
+    otel_tenant_content: bool = Field(
+        default=False,
+        description=(
+            "Record prompts, tool I/O and answers on spans for tenant-scoped runs. Off by "
+            "default: a shared trace store would show every tenant's data to anyone with access."
+        ),
+    )
 
     # Durable runtime
     journal_url: str | None = Field(

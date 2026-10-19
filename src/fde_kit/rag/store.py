@@ -19,10 +19,14 @@ Search modes:
 - keyword: BM25 over Postgres full-text lexemes, with per-tenant corpus statistics.
 - hybrid:  both, fused by relative score (default) or reciprocal rank. The default mode.
 
-HNSW and RLS interact badly by default: the index returns its `ef_search` nearest rows across
-*all* tenants and the policy filters afterwards, so a small tenant in a large table can get zero
-results. `hnsw.iterative_scan = relaxed_order` (pgvector >= 0.8) keeps scanning until it has
-enough rows that pass the filter. The session sets it on every transaction.
+Tables are partitioned by tenant (see schema.py), and the policy's condition prunes every other
+tenant's partition at run time, so each search walks only this tenant's own HNSW, GIN and B-tree
+indexes. On a shared index, HNSW returns its `ef_search` nearest rows across *all* tenants and
+the policy filters afterwards: a small tenant can get zero results, and with pgvector's
+iterative scan turned on to fix that, the scan's length (so its latency) depends on how much
+*other* tenants have written about your query. tests/test_rag_isolation.py reproduces both on a
+deliberately shared table. Iterative scan stays on here because metadata filters still
+post-filter within a tenant.
 """
 
 from __future__ import annotations
@@ -40,7 +44,13 @@ from psycopg_pool import ConnectionPool
 
 from .chunk import chunk_text
 from .embed import Embedder, to_pgvector
-from .schema import TENANT_SETTING, InsecureConnection, check_posture, validate_tenant_id
+from .schema import (
+    TENANT_SETTING,
+    InsecureConnection,
+    check_posture,
+    partition_name,
+    validate_tenant_id,
+)
 
 SearchMode = Literal["vector", "keyword", "hybrid"]
 Fusion = Literal["relative", "rrf"]
@@ -49,8 +59,8 @@ RRF_K = 60
 
 @dataclass
 class Hit:
-    chunk_id: int
-    doc_id: int
+    chunk_id: str
+    doc_id: str
     source: str
     title: str
     content: str
@@ -134,6 +144,8 @@ class TenantStore:
         validate_tenant_id(tenant_id)
         with self.pool.connection() as conn, conn.transaction():
             conn.execute("SELECT set_config(%s, %s, true)", (TENANT_SETTING, tenant_id))
+            # User-settable, so a pooled connection could carry a changed value; pin it.
+            conn.execute("SET LOCAL log_parameter_max_length_on_error = 0")
             conn.execute(f"SET LOCAL hnsw.ef_search = {int(self.ef_search)}")
             if self.iterative_scan:
                 conn.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
@@ -141,10 +153,29 @@ class TenantStore:
 
 
 class TenantSession:
+    """Every statement goes to this tenant's own partitions, named explicitly, so Postgres plans
+    against one tenant's tables instead of all of them. Planning through the parent tables
+    considers every partition before pruning, which made planning time grow with the number
+    of tenants (0.2 ms at 8, 5.6 ms at 208): slow, and a way to count the customers. Each
+    partition carries the same forced policy as its parent, so a session pointed at the wrong
+    tenant's partition would still see nothing."""
+
     def __init__(self, conn: psycopg.Connection, tenant_id: str, embedder: Embedder):
         self.conn = conn
         self.tenant_id = tenant_id
         self.embedder = embedder
+        # Partition names are derived from a hash and are always [a-z0-9_]; quoting is safe.
+        self._tables = {
+            "@chunks": f'"{partition_name("rag_chunks", tenant_id)}"',
+            "@docs": f'"{partition_name("rag_documents", tenant_id)}"',
+            "@cache": f'"{partition_name("rag_cache", tenant_id)}"',
+        }
+
+    def sql(self, template: str) -> str:
+        """Fill a template's @chunks / @docs / @cache with this tenant's partitions."""
+        for token, name in self._tables.items():
+            template = template.replace(token, name)
+        return template
 
     # ------------------------------------------------------------------ writes
 
@@ -156,40 +187,42 @@ class TenantSession:
         title: str = "",
         metadata: dict[str, Any] | None = None,
         max_chars: int = 900,
-    ) -> int:
-        """Replace-or-insert one document and its chunks. Returns doc_id."""
+    ) -> str:
+        """Replace-or-insert one document and its chunks. Returns doc_id (a UUID string)."""
         row = self.conn.execute(
-            """
-            INSERT INTO rag_documents (tenant_id, source, title, metadata)
+            self.sql("""
+            INSERT INTO @docs (tenant_id, source, title, metadata)
             VALUES (%s, %s, %s, %s)
             ON CONFLICT (tenant_id, source)
             DO UPDATE SET title = EXCLUDED.title, metadata = EXCLUDED.metadata
-            RETURNING doc_id
-            """,
+            RETURNING doc_id::text
+            """),
             (self.tenant_id, source, title, Jsonb(metadata or {})),
         ).fetchone()
         assert row is not None
         doc_id = row[0]
-        self.conn.execute("DELETE FROM rag_chunks WHERE doc_id = %s", (doc_id,))
+        self.conn.execute(self.sql("DELETE FROM @chunks WHERE doc_id = %s"), (doc_id,))
         chunks = chunk_text(text, title=title, max_chars=max_chars)
         vecs = self.embedder.embed_documents(chunks) if chunks else []
         with self.conn.cursor() as cur:
             cur.executemany(
-                "INSERT INTO rag_chunks (tenant_id, doc_id, ord, content, embedding) "
-                "VALUES (%s, %s, %s, %s, %s::vector)",
+                self.sql(
+                    "INSERT INTO @chunks (tenant_id, doc_id, ord, content, embedding) "
+                    "VALUES (%s, %s, %s, %s, %s::vector)"
+                ),
                 [
                     (self.tenant_id, doc_id, i, c, to_pgvector(v))
                     for i, (c, v) in enumerate(zip(chunks, vecs, strict=True))
                 ],
             )
         # Anything cached for this tenant may now be stale.
-        self.conn.execute("DELETE FROM rag_cache")
+        self.conn.execute(self.sql("DELETE FROM @cache"))
         return doc_id
 
     # ------------------------------------------------------------------ reads
 
     def count_chunks(self) -> int:
-        row = self.conn.execute("SELECT count(*) FROM rag_chunks").fetchone()
+        row = self.conn.execute(self.sql("SELECT count(*) FROM @chunks")).fetchone()
         return int(row[0]) if row else 0
 
     def search(
@@ -223,11 +256,15 @@ class TenantSession:
         return fuse(self._vector(qvec, f, n), self._keyword(query, f, n), k, fusion, alpha)
 
     def _vector(self, qvec: str, f: Jsonb, n: int) -> list[Hit]:
-        rows = self.conn.execute(_VECTOR_SQL, {"q": qvec, "f": f, "n": n, "k": n}).fetchall()
+        rows = self.conn.execute(
+            self.sql(_VECTOR_SQL), {"q": qvec, "f": f, "n": n, "k": n}
+        ).fetchall()
         return [Hit(*r) for r in rows]
 
     def _keyword(self, query: str, f: Jsonb, n: int) -> list[Hit]:
-        rows = self.conn.execute(_KEYWORD_SQL, {"t": query, "f": f, "n": n, "k": n}).fetchall()
+        rows = self.conn.execute(
+            self.sql(_KEYWORD_SQL), {"t": query, "f": f, "n": n, "k": n}
+        ).fetchall()
         return [Hit(*r) for r in rows]
 
     def cached_search(
@@ -250,12 +287,7 @@ class TenantSession:
         params = {"k": k, "mode": mode, "filters": filters or {}}
         qvec = to_pgvector(self.embedder.embed_query(query))
         row = self.conn.execute(
-            """
-            SELECT result FROM rag_cache
-            WHERE params = %(p)s AND embedding <=> %(q)s::vector < %(d)s
-            ORDER BY embedding <=> %(q)s::vector LIMIT 1
-            """,
-            {"p": Jsonb(params), "q": qvec, "d": max_distance},
+            self.sql(CACHE_LOOKUP_SQL), {"p": Jsonb(params), "q": qvec, "d": max_distance}
         ).fetchone()
         if row is not None:
             return SearchResult([Hit(**h) for h in row[0]], cached=True, params=params)
@@ -264,11 +296,11 @@ class TenantSession:
             json.dumps([query.strip().lower(), params], sort_keys=True).encode()
         ).hexdigest()
         self.conn.execute(
-            """
-            INSERT INTO rag_cache (tenant_id, query_hash, query, embedding, params, result)
+            self.sql("""
+            INSERT INTO @cache (tenant_id, query_hash, query, embedding, params, result)
             VALUES (%s, %s, %s, %s::vector, %s, %s)
             ON CONFLICT (tenant_id, query_hash) DO UPDATE SET result = EXCLUDED.result
-            """,
+            """),
             (
                 self.tenant_id,
                 key,
@@ -281,6 +313,12 @@ class TenantSession:
         return SearchResult(hits, cached=False, params=params)
 
 
+CACHE_LOOKUP_SQL = """
+SELECT result FROM @cache
+WHERE params = %(p)s AND embedding <=> %(q)s::vector < %(d)s
+ORDER BY embedding <=> %(q)s::vector LIMIT 1
+"""
+
 # Shared projection: (chunk_id, doc_id, source, title, content, score, vector_rank, keyword_rank)
 #
 # Candidate queries scan rag_chunks alone and ORDER BY the distance directly, so the HNSW index
@@ -289,13 +327,13 @@ class TenantSession:
 # row. The metadata filter is an EXISTS on the scanned row, which iterative scan can re-check.
 
 _FILTER = (
-    "(%(f)s = '{}'::jsonb OR EXISTS (SELECT 1 FROM rag_documents fd "
+    "(%(f)s = '{}'::jsonb OR EXISTS (SELECT 1 FROM @docs fd "
     "WHERE fd.doc_id = c.doc_id AND fd.metadata @> %(f)s))"
 )
 
 _VEC_CANDIDATES = f"""
     SELECT c.chunk_id, c.embedding <=> %(q)s::vector AS dist
-    FROM rag_chunks c
+    FROM @chunks c
     WHERE {_FILTER}
     ORDER BY c.embedding <=> %(q)s::vector
     LIMIT %(n)s
@@ -321,17 +359,17 @@ _KW_CANDIDATES = f"""
     ),
     stats AS (
         SELECT count(*)::float8 AS n, GREATEST(avg(n_tokens), 1)::float8 AS avgdl
-        FROM rag_chunks
+        FROM @chunks
     ),
     df AS (
         SELECT u.lexeme, count(*)::float8 AS df
-        FROM rag_chunks c, unnest(c.tsv) u
+        FROM @chunks c, unnest(c.tsv) u
         WHERE u.lexeme IN (SELECT lexeme FROM ql)
         GROUP BY u.lexeme
     ),
     matches AS (
         SELECT c.chunk_id, c.n_tokens, u.lexeme, array_length(u.positions, 1)::float8 AS tf
-        FROM rag_chunks c, unnest(c.tsv) u
+        FROM @chunks c, unnest(c.tsv) u
         WHERE u.lexeme IN (SELECT lexeme FROM ql) AND {_FILTER}
     )
     SELECT m.chunk_id,
@@ -346,10 +384,10 @@ _KW_CANDIDATES = f"""
 """
 
 _PROJECT = """
-SELECT c.chunk_id, c.doc_id, d.source, d.title, c.content, {score}::float8, {vr}, {tr}
+SELECT c.chunk_id::text, c.doc_id::text, d.source, d.title, c.content, {score}::float8, {vr}, {tr}
 FROM {src}
-JOIN rag_chunks c ON c.chunk_id = x.chunk_id
-JOIN rag_documents d ON d.doc_id = c.doc_id
+JOIN @chunks c ON c.chunk_id = x.chunk_id
+JOIN @docs d ON d.doc_id = c.doc_id
 ORDER BY {order}
 LIMIT %(k)s
 """

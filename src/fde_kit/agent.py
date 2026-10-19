@@ -22,7 +22,7 @@ from typing import Any
 from .config import Settings, get_settings
 from .llm import LLMProvider, Usage, make_provider
 from .tools import ToolRegistry
-from .tracing import get_tracer, safe_json
+from .tracing import get_tracer, tenant_scope, trace_content
 
 
 @dataclass
@@ -76,8 +76,11 @@ class Agent:
         result = AgentResult(output="")
         t0 = time.perf_counter()
 
-        with self._tracer.start_as_current_span("agent.run") as run_span:
-            run_span.set_attribute("input.value", prompt)
+        with (
+            tenant_scope(self.registry.tenant_id),
+            self._tracer.start_as_current_span("agent.run") as run_span,
+        ):
+            run_span.set_attribute("input.value", trace_content(prompt))
             run_span.set_attribute("llm.model_name", self.provider.model)
             run_span.set_attribute("agent.max_turns", max_turns)
 
@@ -94,7 +97,7 @@ class Agent:
                 result.output = result.steps[-1].assistant_text if result.steps else ""
 
             result.total_ms = (time.perf_counter() - t0) * 1000
-            run_span.set_attribute("output.value", result.output)
+            run_span.set_attribute("output.value", trace_content(result.output))
             run_span.set_attribute("agent.turns", result.turns)
             run_span.set_attribute("agent.stopped_reason", result.stopped_reason)
             run_span.set_attribute("llm.token_count.prompt", result.usage.input_tokens)
@@ -113,14 +116,14 @@ class Agent:
         t0 = time.perf_counter()
         with self._tracer.start_as_current_span("llm.call") as span:
             span.set_attribute("llm.turn", turn)
-            span.set_attribute("input.value", safe_json(messages[-1]))
+            span.set_attribute("input.value", trace_content(messages[-1]))
             resp = self.provider.complete(
                 system=self.system_prompt,
                 messages=messages,
                 tools=self.registry.api_schemas(),
                 max_tokens=self.settings.max_tokens,
             )
-            span.set_attribute("output.value", safe_json(resp.raw_content))
+            span.set_attribute("output.value", trace_content(resp.raw_content))
             span.set_attribute("llm.stop_reason", resp.stop_reason)
             span.set_attribute("llm.token_count.prompt", resp.usage.input_tokens)
             span.set_attribute("llm.token_count.completion", resp.usage.output_tokens)
@@ -136,9 +139,9 @@ class Agent:
         for call in resp.tool_calls:
             with self._tracer.start_as_current_span(f"tool.{call.name}") as tspan:
                 tspan.set_attribute("tool.name", call.name)
-                tspan.set_attribute("input.value", safe_json(call.input))
+                tspan.set_attribute("input.value", trace_content(call.input))
                 res = self.registry.execute(call.name, call.input)
-                tspan.set_attribute("output.value", res.content[:4000])
+                tspan.set_attribute("output.value", trace_content(res.content))
                 tspan.set_attribute("tool.is_error", res.is_error)
             block: dict[str, Any] = {
                 "type": "tool_result",

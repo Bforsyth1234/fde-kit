@@ -27,6 +27,9 @@ def tenant_search_registry(
     cached: bool = True,
 ) -> ToolRegistry:
     registry = registry or ToolRegistry()
+    if registry.tenant_id not in (None, tenant_id):
+        raise ValueError(f"registry already belongs to tenant {registry.tenant_id!r}")
+    registry.tenant_id = tenant_id  # Agent runs on this registry trace as this tenant
 
     @registry.tool(name="search_documents")
     def search_documents(query: str, k: int = 5) -> str:
