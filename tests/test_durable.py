@@ -29,7 +29,7 @@ from fde_kit.builtin_tools import registry  # noqa: E402
 from fde_kit.durable.client import history_summary, start_run, status  # noqa: E402
 from fde_kit.durable.journal import FileJournal  # noqa: E402
 from fde_kit.durable.models import ToolCallOutput  # noqa: E402
-from fde_kit.durable.worker import run_worker  # noqa: E402
+from fde_kit.durable.worker import cipher_of, run_worker  # noqa: E402
 from fde_kit.llm import MockProvider  # noqa: E402
 
 pytestmark = pytest.mark.durable
@@ -121,7 +121,9 @@ def test_max_turns_is_a_result_not_an_error(env):
 def test_journal_hit_skips_execution(env, tmp_path: Path):
     """A pre-recorded result under the idempotency key is returned without running the tool."""
     e, loop = env
-    journal = FileJournal(tmp_path)
+    # Seal the pre-recorded row the way the worker will (a plaintext row is refused once a
+    # payload key is in use, by design).
+    journal = FileJournal(tmp_path, cipher=cipher_of(e.client))
     wf_id = "agent-journal-test"
     # The mock's first tool_use id is deterministic: toolu_mock_<turn-1>_<n>.
     journal.put(f"{wf_id}:1:toolu_mock_0_0", ToolCallOutput(content="FROM_JOURNAL"))

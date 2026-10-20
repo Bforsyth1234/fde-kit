@@ -3,6 +3,7 @@
 fde run "What is 17 * 23?"          # one prompt through the agent, prints the trace summary
 fde eval                              # run the golden set, exit 1 if below threshold
 fde tools                             # list registered tools and their schemas
+fde keygen                            # payload key: Temporal history + journal become ciphertext
 fde rag migrate                       # create RAG roles, tables and RLS policies
 fde rag seed-demo                     # three demo tenants on a shared lease template
 fde rag search --tenant summit "late fee?"
@@ -89,6 +90,17 @@ def cmd_eval(args: argparse.Namespace) -> int:
     if args.json:
         argv += ["--json", args.json]
     return eval_main(argv)
+
+
+def cmd_keygen(_: argparse.Namespace) -> int:
+    """Print a fresh payload key. Put it in .env as FDE_PAYLOAD_KEY on every worker and client."""
+    try:
+        from .durable.crypto import PayloadCipher
+    except ModuleNotFoundError:
+        console.print("[red]cryptography not installed[/]: pip install 'fde-kit[durable]'")
+        return 2
+    print(f"FDE_PAYLOAD_KEY={PayloadCipher.generate().export_current()}")
+    return 0
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
@@ -313,6 +325,9 @@ def main(argv: list[str] | None = None) -> int:
     pe.add_argument("workflow_id")
     pe.add_argument("--address", default="localhost:7233")
     pe.set_defaults(fn=cmd_pending)
+
+    kg = sub.add_parser("keygen", help="generate an FDE_PAYLOAD_KEY for durable-run encryption")
+    kg.set_defaults(fn=cmd_keygen)
 
     w = sub.add_parser("worker", help="run a Temporal worker for durable agent runs")
     w.add_argument("--address", default="localhost:7233")

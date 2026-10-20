@@ -224,8 +224,12 @@ which is the one-liner to run against production histories before any deploy tha
 workflow:
 
 ```python
-await Replayer(workflows=[AgentWorkflow]).replay_workflow(history)   # raises on drift
+from fde_kit.durable.worker import replayer
+await replayer([AgentWorkflow]).replay_workflow(history)   # raises on drift
 ```
+
+(`fde_kit.durable.worker.replayer` is Temporal's `Replayer` with the payload codec attached;
+a bare `Replayer` can't read histories once `FDE_PAYLOAD_KEY` is in use.)
 
 ### The shared journal
 
@@ -256,6 +260,48 @@ The window is microseconds wide in real life, so the activity has a test-only ho
 (`FDE_TEST_HANG_AFTER_JOURNAL`) that holds it open after the journal write. Never set it in
 production; it exists so the crash lands in the right place every time instead of one run in
 ten thousand.
+
+### What the history holds, and who can read it
+
+Every durable run leaves its content in two places outside the worker: Temporal's event
+history (the prompt, every retrieved passage, every tool argument, the answer, as payloads the
+server stores and the UI on :8233 renders) and the journal's `content` column. Measured, before
+the fix: a plain Temporal client with nothing but the address fetched a tenant run's history,
+base64-decoded the payloads, and had the confidential passage and the question. The journal
+file had the passage in plaintext.
+
+```bash
+fde keygen >> .env                  # FDE_PAYLOAD_KEY=<base64, 32 bytes>
+fde worker                          # payloads=encrypted in the startup log
+```
+
+With a key, every payload is AES-256-GCM ciphertext before it leaves the process (a Temporal
+`PayloadCodec`, applied by the worker and by every client), and the journal seals `content`
+the same way. The same outsider now gets `binary/encrypted` blobs and nothing else; a worker
+or client with the key sees the run as before. Crash-resume works through it: a second worker
+with the key replays the encrypted history and finishes the run.
+
+| | Before | After |
+| --- | --- | --- |
+| Temporal UI, run detail | prompt, passages, answer | `[encrypted]` per payload |
+| `fetch_history()` with a bare client | base64 of the JSON | ciphertext |
+| `tool_journal.content` | passage text | `enc:<base64 ciphertext>` |
+| Activity names, attempts, timings, workflow ids | visible | visible (operators need them) |
+
+A run that names a tenant is refused without a key, by both `start_run` and the worker. Runs
+without a tenant still work unencrypted, which is the right default for a laptop.
+
+**Keys.** `FDE_PAYLOAD_KEYS=k2=<b64>,k1=<b64>` rotates: the first id encrypts, every listed id
+decrypts, and each ciphertext carries its key id. Drop an old id only when no run encrypted
+under it is still open or inside history retention. A wrong or missing key fails closed
+(`PayloadKeyError`), including for journal rows written before encryption was turned on. The
+key must be present on every worker and client; the server never has it, which is the point and
+also means the Temporal UI can't show payloads unless you run a codec server for it
+(`temporalio` ships one; `fde_kit.durable.crypto.EncryptionCodec` is the codec to serve).
+
+`tests/test_payload_encryption.py` has the demonstration (plaintext in history and journal),
+the outsider check, resume through the codec, wrong-key, no-key refusal, rotation, tampering,
+and both journals.
 
 ### What's still open
 
@@ -503,7 +549,8 @@ row estimates and, with `pg_get_partition_constraintdef`, their tenant ids; that
 also just set `app.tenant_id` and read the rows, so the boundary against a SQL-capable attacker
 is the role, not the catalog), and the authentication layer: RLS enforces whichever tenant the code sets, so the boundary is
 only as good as the line that maps a logged-in user to `tenant_id`. The model provider sees
-retrieved passages by design.
+retrieved passages by design. Durable runs: see "What the history holds" above; with
+`FDE_PAYLOAD_KEY` set, Temporal and the journal hold ciphertext.
 
 ## Baseline results
 
@@ -551,6 +598,8 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
 | `FDE_EVAL_PASS_THRESHOLD` | `0.85` | CI gate |
 | `FDE_RAG_URL` | derived from admin URL | App connection for retrieval, as `fde_rag_app`. Never a superuser. |
 | `FDE_RAG_ADMIN_URL` | `postgresql://fde:fde@localhost:5432/fde` | Used only by `fde rag migrate` / `seed-demo` |
+| `FDE_PAYLOAD_KEY` | unset | Base64 32-byte key; encrypts Temporal payloads and the journal. Required for tenant runs. `fde keygen` |
+| `FDE_PAYLOAD_KEYS` | unset | Rotation form `id=b64,id=b64`; first encrypts, all decrypt |
 | `FDE_RAG_PARTITION_KEY` | unset | Optional secret; partition names become an HMAC of the tenant id. Fixed at first `migrate`. |
 | `FDE_RAG_EMBEDDER` | `bge` | `bge` (bge-small via fastembed) or `hash` (offline, tests) |
 

@@ -29,6 +29,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Protocol
 
+from .crypto import PayloadCipher
 from .models import ToolCallOutput
 
 DDL = """
@@ -70,9 +71,10 @@ class ToolJournal(Protocol):
 
 
 class FileJournal:
-    def __init__(self, root: str | Path = ".fde/journal"):
+    def __init__(self, root: str | Path = ".fde/journal", cipher: PayloadCipher | None = None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.cipher = cipher
 
     def _path(self, key: str, tenant_id: str | None = None) -> Path:
         scoped = _scoped_key(key, tenant_id)
@@ -91,7 +93,8 @@ class FileJournal:
         recorded_tool = data.get("tool_name", "")
         if recorded_tool and tool_name and recorded_tool != tool_name:
             return None
-        return ToolCallOutput(content=data["content"], is_error=data["is_error"], from_journal=True)
+        content = _unseal(self.cipher, data["content"])
+        return ToolCallOutput(content=content, is_error=data["is_error"], from_journal=True)
 
     def put(
         self,
@@ -103,7 +106,12 @@ class FileJournal:
     ) -> None:
         p = self._path(key, tenant_id)
         fd, tmp = tempfile.mkstemp(dir=self.root, suffix=".tmp")
-        payload = {**asdict(result), "tool_name": tool_name, "tenant_id": tenant_id or ""}
+        payload = {
+            **asdict(result),
+            "content": _seal(self.cipher, result.content),
+            "tool_name": tool_name,
+            "tenant_id": tenant_id or "",
+        }
         with os.fdopen(fd, "w") as f:
             json.dump(payload, f)
         os.replace(tmp, p)  # atomic on POSIX; a crash leaves either the old file or the new one
@@ -129,7 +137,15 @@ class PostgresJournal:
     can never hit each other's journal entries.
     """
 
-    def __init__(self, url: str, *, min_size: int = 1, max_size: int = 8):
+    def __init__(
+        self,
+        url: str,
+        *,
+        min_size: int = 1,
+        max_size: int = 8,
+        cipher: PayloadCipher | None = None,
+    ):
+        self.cipher = cipher
         from psycopg_pool import ConnectionPool
 
         self.url = url
@@ -154,7 +170,9 @@ class PostgresJournal:
         content, is_error, recorded_tool = row
         if recorded_tool and tool_name and recorded_tool != tool_name:
             return None
-        return ToolCallOutput(content=content, is_error=is_error, from_journal=True)
+        return ToolCallOutput(
+            content=_unseal(self.cipher, content), is_error=is_error, from_journal=True
+        )
 
     def put(
         self,
@@ -170,7 +188,7 @@ class PostgresJournal:
             conn.execute(
                 "INSERT INTO tool_journal (idempotency_key, tenant_id, tool_name, content, "
                 "is_error) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (idempotency_key) DO NOTHING",
-                (scoped, tid, tool_name, result.content, result.is_error),
+                (scoped, tid, tool_name, _seal(self.cipher, result.content), result.is_error),
             )
             conn.commit()
 
@@ -188,12 +206,22 @@ class PostgresJournal:
 # --------------------------------------------------------------------------- factory
 
 
-def journal_from_url(url: str | None) -> ToolJournal:
+def _seal(cipher: PayloadCipher | None, content: str) -> str:
+    return cipher.encrypt_text(content) if cipher else content
+
+
+def _unseal(cipher: PayloadCipher | None, stored: str) -> str:
+    if cipher is None:
+        return stored
+    return cipher.decrypt_text(stored)
+
+
+def journal_from_url(url: str | None, cipher: PayloadCipher | None = None) -> ToolJournal:
     """`postgresql://...` -> PostgresJournal; `file:<dir>` or a bare path -> FileJournal."""
     if not url:
-        return FileJournal()
+        return FileJournal(cipher=cipher)
     if url.startswith(("postgresql://", "postgres://")):
-        return PostgresJournal(url)
+        return PostgresJournal(url, cipher=cipher)
     if url.startswith("file:"):
-        return FileJournal(url[len("file:") :])
-    return FileJournal(url)
+        return FileJournal(url[len("file:") :], cipher=cipher)
+    return FileJournal(url, cipher=cipher)

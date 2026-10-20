@@ -19,12 +19,13 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 
 from temporalio.client import Client
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 
 from ..config import Settings, get_settings
 from ..llm import LLMProvider, MockProvider, make_provider
 from ..tools import ToolRegistry
 from .activities import AgentActivities
+from .crypto import EncryptionCodec, PayloadCipher, data_converter
 from .journal import journal_from_url
 from .workflow import AgentWorkflow as _LiveWorkflow
 
@@ -32,6 +33,30 @@ DEFAULT_TASK_QUEUE = "fde-agent"
 DEFAULT_ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
 
 log = logging.getLogger("fde.worker")
+
+
+def payload_cipher(settings: Settings | None = None) -> PayloadCipher | None:
+    settings = settings or get_settings()
+    return PayloadCipher.from_settings(settings.payload_key, settings.payload_keys)
+
+
+def cipher_of(client: Client) -> PayloadCipher | None:
+    codec = client.data_converter.payload_codec
+    return codec.cipher if isinstance(codec, EncryptionCodec) else None
+
+
+def replayer(workflows: list[type], settings: Settings | None = None) -> Replayer:
+    """A `Replayer` that can read encrypted histories. The pre-deploy replay check
+    (`tests/test_versioning.py`, README "Upgrading a running agent") must use this, or every
+    production history will fail with 'Unknown payload encoding' once a key is in use."""
+    return Replayer(workflows=workflows, data_converter=data_converter(payload_cipher(settings)))
+
+
+async def connect(address: str = DEFAULT_ADDRESS, settings: Settings | None = None) -> Client:
+    """Connect with the payload codec, so this process encrypts what it sends and decrypts
+    what it reads. Every client and worker in a deployment must use this, not a bare
+    `Client.connect`, or they will see ciphertext (and the server would see plaintext)."""
+    return await Client.connect(address, data_converter=data_converter(payload_cipher(settings)))
 
 
 def load_registry(spec: str | None) -> ToolRegistry:
@@ -78,11 +103,24 @@ async def run_worker(
     Journal selection, first match wins: `journal_url`, `journal_dir` (file backend),
     `FDE_JOURNAL_URL` from settings, else `.fde/journal` on local disk."""
     settings = get_settings()
-    client = client or await Client.connect(address)
+    if client is None:
+        cipher = payload_cipher(settings)
+        client = await connect(address, settings)
+    else:
+        # One source of truth per process: the journal seals with whatever the client's codec
+        # uses, so a client built without the codec gets an unencrypted journal to match, and
+        # the two can never disagree about what "encrypted" means.
+        cipher = cipher_of(client)
     provider = provider or build_provider(settings, None, None)
     registry = registry or load_registry(None)
+    if registry.tenant_id is not None and cipher is None:
+        raise RuntimeError(
+            f"worker is bound to tenant {registry.tenant_id!r} but no FDE_PAYLOAD_KEY is set; "
+            "its runs' prompts and tool results would be stored in plaintext in Temporal's "
+            "history and the journal. Set a key (`fde keygen`) or unbind the registry."
+        )
     url = journal_url or (f"file:{journal_dir}" if journal_dir else None) or settings.journal_url
-    journal = journal_from_url(url)
+    journal = journal_from_url(url, cipher)
     acts = AgentActivities(provider, registry, journal)
 
     worker = Worker(
@@ -93,11 +131,12 @@ async def run_worker(
         activity_executor=ThreadPoolExecutor(max_workers=16),
     )
     log.info(
-        "worker up: queue=%s pid=%s tools=%s journal=%r",
+        "worker up: queue=%s pid=%s tools=%s journal=%r payloads=%s",
         task_queue,
         os.getpid(),
         registry.names(),
         journal,
+        "encrypted" if cipher else "PLAINTEXT",
     )
     if stop is None:
         await worker.run()

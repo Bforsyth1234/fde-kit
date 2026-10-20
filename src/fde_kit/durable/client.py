@@ -13,12 +13,10 @@ from temporalio.api.enums.v1 import EventType
 from temporalio.client import Client, WorkflowHandle
 
 from .models import AgentRunInput, AgentRunOutput, PendingApproval, RunStatus
-from .worker import DEFAULT_ADDRESS, DEFAULT_TASK_QUEUE
+from .worker import DEFAULT_TASK_QUEUE, connect
 from .workflow import AgentWorkflow
 
-
-async def connect(address: str = DEFAULT_ADDRESS) -> Client:
-    return await Client.connect(address)
+__all__ = ["connect"]  # re-exported: clients must connect with the payload codec
 
 
 async def start_run(
@@ -34,6 +32,11 @@ async def start_run(
     tenant_id: str | None = None,
 ) -> WorkflowHandle[Any, AgentRunOutput]:
     client = client or await connect()
+    if tenant_id is not None and client.data_converter.payload_codec is None:
+        raise RuntimeError(
+            f"refusing to start a run for tenant {tenant_id!r} without payload encryption: "
+            "set FDE_PAYLOAD_KEY and connect with fde_kit.durable.client.connect"
+        )
     inp = AgentRunInput(
         prompt=prompt, max_turns=max_turns, system_prompt=system_prompt, tenant_id=tenant_id
     )

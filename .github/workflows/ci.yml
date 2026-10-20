@@ -28,6 +28,8 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
       - run: ruff check .
+      - name: payload key for the durable tests (encrypted histories and journal)
+        run: python -m fde_kit.cli keygen >> "$GITHUB_ENV"
       - run: pytest --cov=fde_kit --cov-report=term-missing
         env:
           FDE_TEST_PG_URL: postgresql://fde:fde@localhost:5432/fde
