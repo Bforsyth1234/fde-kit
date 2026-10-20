@@ -51,7 +51,14 @@ def _run(registry: ToolRegistry) -> list:
 
 
 def _attribute_text(spans: list) -> str:
-    return "\n".join(f"{s.name} {k}={v}" for s in spans for k, v in (s.attributes or {}).items())
+    parts = [f"{s.name} {k}={v}" for s in spans for k, v in (s.attributes or {}).items()]
+    for s in spans:
+        if s.status and s.status.description:
+            parts.append(f"{s.name} status.description={s.status.description}")
+        for ev in getattr(s, "events", ()) or ():
+            for k, v in (ev.attributes or {}).items():
+                parts.append(f"{s.name} event.{ev.name}.{k}={v}")
+    return "\n".join(parts)
 
 
 def test_tenant_run_records_no_tenant_content():
@@ -59,7 +66,48 @@ def test_tenant_run_records_no_tenant_content():
     text = _attribute_text(spans)
     for secret in SECRETS:
         assert secret not in text, f"{secret!r} reached a span"
-    assert "[redacted:" in text
+    assert "[redacted]" in text
+
+
+def test_redacted_marker_does_not_leak_content_length():
+    """On a shared template, '$50' vs '5% of the monthly rent' changes the passage length by
+    19 chars. The redaction marker must be constant so length cannot fingerprint the answer."""
+    with tenant_scope("summit"):
+        short = trace_content("late fee is $50")
+    with tenant_scope("oakline"):
+        long = trace_content("late fee is 5% of the monthly rent, after a 7-day grace period")
+    assert short == long == "[redacted]"
+
+
+def test_exception_in_tenant_run_scrubs_event_message_stacktrace_and_status():
+    """OpenTelemetry's start_as_current_span records an `exception` event and sets the error
+    status description to `str(exc)` by default. If a provider error echoes the prompt or
+    passage, TenantSpanProcessor must scrub both before export while keeping exception.type."""
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(TenantSpanProcessor())
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    class FailingProvider:
+        model = "failing"
+
+        def complete(self, **kwargs):
+            raise RuntimeError(f"provider rejected prompt: {QUESTION} / {PASSAGE}")
+
+    agent = Agent(_registry("summit"), provider=FailingProvider())
+    agent._tracer = provider.get_tracer("test")
+    with pytest.raises(RuntimeError):
+        agent.run(QUESTION)
+
+    spans = list(exporter.get_finished_spans())
+    text = _attribute_text(spans)
+    for secret in SECRETS:
+        assert secret not in text, f"{secret!r} leaked via span exception event or status"
+    llm_span = next(s for s in spans if s.name == "llm.call")
+    assert llm_span.events and llm_span.events[0].attributes["exception.type"] == "RuntimeError"
+    assert llm_span.events[0].attributes["exception.message"] == "[redacted]"
+    assert llm_span.events[0].attributes["exception.stacktrace"] == "[redacted]"
+    assert llm_span.status.description == "[redacted]"
 
 
 def test_tenant_run_tags_every_span():
@@ -100,6 +148,6 @@ def test_scope_ends_with_the_run():
 def test_nested_scopes_restore_the_outer_tenant():
     with tenant_scope("harbor"):
         with tenant_scope("summit"):
-            assert trace_content("x").startswith("[redacted")
-        assert trace_content("x").startswith("[redacted")
+            assert trace_content("x") == "[redacted]"
+        assert trace_content("x") == "[redacted]"
     assert trace_content("x") == "x"

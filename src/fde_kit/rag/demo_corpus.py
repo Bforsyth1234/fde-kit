@@ -75,17 +75,96 @@ TENANTS: dict[str, dict] = {
 }
 
 
-_FIRST = ["Dana", "Marcus", "Priya", "Tomas", "Alicia", "Ben", "Chen", "Rosa", "Gregor", "Imani",
-          "Hiro", "Sofia", "Kwame", "Lena", "Rafael", "Ines", "Owen", "Mira", "Jonas", "Talia",
-          "Eamon", "Noor", "Viktor", "Ama", "Felix", "Yara", "Desmond", "Kiri", "Arjun", "Elsa",
-          "Mateo", "Zoe", "Idris", "Hana", "Lucas", "Freya"]
-_LAST = ["Whitfield", "Oyelaran", "Raman", "Brennan", "Fernsby", "Okafor", "Liwei", "Delgado",
-         "Lindqvist", "Castellanos", "Tanabe", "Marchetti", "Mensah", "Vogel", "Ibarra", "Soto",
-         "Pryce", "Halvorsen", "Achterberg", "Novak", "Quill", "Haddad", "Petrov", "Boateng",
-         "Ashby", "Kaur", "Moreau", "Tane", "Iyer", "Strand", "Rossi", "Kimura", "Bello",
-         "Sato", "Ferreira", "Nyberg"]
-_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August",
-           "September", "October", "November", "December"]
+_FIRST = [
+    "Dana",
+    "Marcus",
+    "Priya",
+    "Tomas",
+    "Alicia",
+    "Ben",
+    "Chen",
+    "Rosa",
+    "Gregor",
+    "Imani",
+    "Hiro",
+    "Sofia",
+    "Kwame",
+    "Lena",
+    "Rafael",
+    "Ines",
+    "Owen",
+    "Mira",
+    "Jonas",
+    "Talia",
+    "Eamon",
+    "Noor",
+    "Viktor",
+    "Ama",
+    "Felix",
+    "Yara",
+    "Desmond",
+    "Kiri",
+    "Arjun",
+    "Elsa",
+    "Mateo",
+    "Zoe",
+    "Idris",
+    "Hana",
+    "Lucas",
+    "Freya",
+]
+_LAST = [
+    "Whitfield",
+    "Oyelaran",
+    "Raman",
+    "Brennan",
+    "Fernsby",
+    "Okafor",
+    "Liwei",
+    "Delgado",
+    "Lindqvist",
+    "Castellanos",
+    "Tanabe",
+    "Marchetti",
+    "Mensah",
+    "Vogel",
+    "Ibarra",
+    "Soto",
+    "Pryce",
+    "Halvorsen",
+    "Achterberg",
+    "Novak",
+    "Quill",
+    "Haddad",
+    "Petrov",
+    "Boateng",
+    "Ashby",
+    "Kaur",
+    "Moreau",
+    "Tane",
+    "Iyer",
+    "Strand",
+    "Rossi",
+    "Kimura",
+    "Bello",
+    "Sato",
+    "Ferreira",
+    "Nyberg",
+]
+_MONTHS = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+]
 _LAST_DAY = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 _UNIT_NAMES = {
     "harbor": [f"Unit {f}{c}" for f in (1, 2, 3, 4) for c in "ABC"],
@@ -123,9 +202,7 @@ def lease_ref(tid: str, i: int) -> str:
     return f"{_PREFIX[tid]}-26-{(i * 7919 + 1301) % 9000 + 1000}"
 
 
-def _lease(
-    t: dict, unit: str, tenant_name: str, rent: str, start: str, end: str, ref: str
-) -> str:
+def _lease(t: dict, unit: str, tenant_name: str, rent: str, start: str, end: str, ref: str) -> str:
     return f"""RESIDENTIAL LEASE AGREEMENT
 
 Lease reference: {ref}
@@ -242,33 +319,71 @@ def questions() -> list[Question]:
         leases = tuple(f"{tid}/leases/{_slug(u[0])}.md" for u in t["units"])
         # Paraphrased on purpose: none of these reuse the clause's own wording.
         qs += [
-            Question(f"{tid}-late-fee", tid, "How much extra do I owe if my rent is late?",
-                     t["late_fee"], leases),
-            Question(f"{tid}-grace", tid, "Is there any slack before a late payment is penalised?",
-                     f"more than {t['grace_days']} days", leases),
-            Question(f"{tid}-notice", tid,
-                     "If I'm not renewing, how far ahead do I have to tell the landlord?",
-                     f"{t['notice_days']} days", leases),
-            Question(f"{tid}-pets", tid, "Can I keep a dog in the apartment?", t["pet_rule"],
-                     leases),
-            Question(f"{tid}-deposit", tid, "How much money do I put down before moving in?",
-                     t["deposit"], leases),
+            Question(
+                f"{tid}-late-fee",
+                tid,
+                "How much extra do I owe if my rent is late?",
+                t["late_fee"],
+                leases,
+            ),
+            Question(
+                f"{tid}-grace",
+                tid,
+                "Is there any slack before a late payment is penalised?",
+                f"more than {t['grace_days']} days",
+                leases,
+            ),
+            Question(
+                f"{tid}-notice",
+                tid,
+                "If I'm not renewing, how far ahead do I have to tell the landlord?",
+                f"{t['notice_days']} days",
+                leases,
+            ),
+            Question(
+                f"{tid}-pets", tid, "Can I keep a dog in the apartment?", t["pet_rule"], leases
+            ),
+            Question(
+                f"{tid}-deposit",
+                tid,
+                "How much money do I put down before moving in?",
+                t["deposit"],
+                leases,
+            ),
         ]
         for unit, name, rent, _start, end in t["units"][::3]:
             src = (f"{tid}/leases/{_slug(unit)}.md",)
             qs += [
-                Question(f"{tid}-rent-{_slug(unit)}", tid, f"What does {unit} pay each month?",
-                         rent, src, "unit-specific"),
-                Question(f"{tid}-end-{_slug(unit)}", tid,
-                         f"When does {name}'s lease run out?", end, src, "unit-specific"),
+                Question(
+                    f"{tid}-rent-{_slug(unit)}",
+                    tid,
+                    f"What does {unit} pay each month?",
+                    rent,
+                    src,
+                    "unit-specific",
+                ),
+                Question(
+                    f"{tid}-end-{_slug(unit)}",
+                    tid,
+                    f"When does {name}'s lease run out?",
+                    end,
+                    src,
+                    "unit-specific",
+                ),
             ]
         for i, (unit, *_rest) in enumerate(t["units"]):
             if i % 3 != 1:
                 continue
             ref = lease_ref(tid, i)
             qs.append(
-                Question(f"{tid}-ref-{ref.lower()}", tid, f"Who is the tenant on lease {ref}?",
-                         unit, (f"{tid}/leases/{_slug(unit)}.md",), "identifier")
+                Question(
+                    f"{tid}-ref-{ref.lower()}",
+                    tid,
+                    f"Who is the tenant on lease {ref}?",
+                    unit,
+                    (f"{tid}/leases/{_slug(unit)}.md",),
+                    "identifier",
+                )
             )
     extra = {
         "harbor": ("My kitchen is flooding at 2am, what number do I call?", "203-555-0148"),

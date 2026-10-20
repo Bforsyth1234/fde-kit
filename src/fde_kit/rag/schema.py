@@ -34,11 +34,14 @@ Beyond row visibility:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
 from dataclasses import dataclass
 
 import psycopg
 from psycopg import sql
+
+from ..config import get_settings
 
 EMBED_DIM = 384
 OWNER_ROLE = "fde_rag_owner"
@@ -46,6 +49,7 @@ APP_ROLE = "fde_rag_app"
 TENANT_SETTING = "app.tenant_id"
 
 TENANT_TABLES = ("rag_tenants", "rag_documents", "rag_chunks", "rag_cache")
+META_TABLE = "rag_meta"
 
 _TENANT_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 
@@ -61,6 +65,12 @@ def validate_tenant_id(tenant_id: str) -> str:
 
 DDL = f"""
 CREATE EXTENSION IF NOT EXISTS vector;
+
+-- One row of deployment facts the posture check compares against. Readable by the app role.
+CREATE TABLE IF NOT EXISTS rag_meta (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS rag_tenants (
     tenant_id   TEXT PRIMARY KEY,
@@ -132,9 +142,30 @@ LOG_PARAM_SETTINGS = ("log_parameter_max_length", "log_parameter_max_length_on_e
 EXPECTED_QUAL = f"(tenant_id = current_setting('{TENANT_SETTING}'::text, true))"
 
 
-def partition_name(table: str, tenant_id: str) -> str:
-    """Stable, length-safe partition name (tenant ids can be 63 chars; so can identifiers)."""
-    return f"{table}_t_{hashlib.sha256(tenant_id.encode()).hexdigest()[:16]}"
+def partition_name(table: str, tenant_id: str, *, key: str | None = None) -> str:
+    """Stable, length-safe partition name (tenant ids can be 63 chars; so can identifiers).
+
+    By default a truncated SHA-256 of the tenant id, which anyone holding a list of candidate
+    tenant ids can match against names in `pg_class` or the server log. With a deployment key
+    (`FDE_RAG_PARTITION_KEY` in settings or `.env`, or `key=`) the name is an HMAC instead, and
+    the catalog reveals nothing about who the tenants are.
+
+    The key is part of the schema: `migrate` records a fingerprint of it in `rag_meta`, and
+    `check_posture` refuses a connection whose key doesn't match, because under a different
+    key every partition lookup would miss and `create_tenant` would try to make a second
+    partition for the same tenant id. The key is not rotatable without renaming partitions.
+    """
+    secret = key if key is not None else get_settings().rag_partition_key
+    if secret:
+        digest = hmac.new(secret.encode(), tenant_id.encode(), hashlib.sha256).hexdigest()[:16]
+    else:
+        digest = hashlib.sha256(tenant_id.encode()).hexdigest()[:16]
+    return f"{table}_t_{digest}"
+
+
+def key_fingerprint(key: str) -> str:
+    """What gets stored to detect a key mismatch. Not the key, not reversible to it."""
+    return hashlib.sha256(b"fde-rag-partition-key:" + key.encode()).hexdigest()[:32]
 
 
 def _policy_sql(table: str) -> str:
@@ -194,12 +225,25 @@ END $$;
             for table in TENANT_TABLES:
                 conn.execute(f"ALTER TABLE {table} OWNER TO {OWNER_ROLE}")
                 conn.execute(_policy_sql(table))
-                conn.execute(
-                    f"GRANT SELECT, INSERT, UPDATE, DELETE ON {table} TO {APP_ROLE}"
-                )
+                conn.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {table} TO {APP_ROLE}")
             conn.execute(f"GRANT USAGE ON SCHEMA public TO {APP_ROLE}")
             # Creating tenants is an operator action, not something a tenant session can do.
             conn.execute(f"REVOKE INSERT, UPDATE, DELETE ON rag_tenants FROM {APP_ROLE}")
+            conn.execute(f"GRANT SELECT ON rag_meta TO {APP_ROLE}")
+            fp = key_fingerprint(get_settings().rag_partition_key)
+            existing = conn.execute(
+                "SELECT value FROM rag_meta WHERE key = 'partition_key_fingerprint'"
+            ).fetchone()
+            if existing and existing[0] != fp:
+                raise RuntimeError(
+                    "FDE_RAG_PARTITION_KEY does not match the key this database was migrated "
+                    "with; existing partitions were named under the other key"
+                )
+            conn.execute(
+                "INSERT INTO rag_meta (key, value) VALUES ('partition_key_fingerprint', %s) "
+                "ON CONFLICT (key) DO NOTHING",
+                (fp,),
+            )
 
 
 def create_tenant(admin_url: str, tenant_id: str, name: str = "") -> None:
@@ -222,10 +266,11 @@ def create_tenant(admin_url: str, tenant_id: str, name: str = "") -> None:
                     part, sql.Identifier(table), sql.Literal(tenant_id)
                 )
             )
-            conn.execute(sql.SQL("ALTER TABLE {} OWNER TO {}").format(
-                part, sql.Identifier(OWNER_ROLE)))
-            conn.execute(sql.SQL("COMMENT ON TABLE {} IS {}").format(
-                part, sql.Literal(f"{table} partition for tenant {tenant_id}")))
+            conn.execute(
+                sql.SQL("ALTER TABLE {} OWNER TO {}").format(part, sql.Identifier(OWNER_ROLE))
+            )
+            # Never store the plaintext tenant_id in a table comment: pg_description is global.
+            conn.execute(sql.SQL("COMMENT ON TABLE {} IS NULL").format(part))
             name = partition_name(table, tenant_id)  # [a-z0-9_] only
             conn.execute(_policy_sql(name))
             conn.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {name} TO {APP_ROLE}")
@@ -254,7 +299,8 @@ def drop_all(admin_url: str) -> None:
     """Tests only: remove every rag_* table (roles are left in place)."""
     with psycopg.connect(admin_url, autocommit=True) as conn:
         conn.execute(
-            "DROP TABLE IF EXISTS rag_cache, rag_chunks, rag_documents, rag_tenants CASCADE"
+            "DROP TABLE IF EXISTS rag_cache, rag_chunks, rag_documents, rag_tenants, rag_meta "
+            "CASCADE"
         )
 
 
@@ -314,6 +360,20 @@ def check_posture(conn: psycopg.Connection) -> list[PostureProblem]:
                     "parameters (document text, questions). Run migrate, or set it to 0.",
                 )
             )
+
+    stored = conn.execute(
+        "SELECT value FROM rag_meta WHERE key = 'partition_key_fingerprint'"
+    ).fetchone()
+    if stored is None:
+        problems.append(PostureProblem("partition_key", "rag_meta has no key record; run migrate"))
+    elif stored[0] != key_fingerprint(get_settings().rag_partition_key):
+        problems.append(
+            PostureProblem(
+                "partition_key",
+                "FDE_RAG_PARTITION_KEY differs from the key the schema was migrated with; "
+                "partition names would not resolve",
+            )
+        )
 
     # Every policy on every RAG table and partition. Permissive policies are OR-ed together, so
     # one extra `USING (true)` policy, added for debugging say, opens every tenant's rows even
@@ -412,7 +472,5 @@ def check_posture(conn: psycopg.Connection) -> list[PostureProblem]:
                 PostureProblem("rls_not_forced", f"{name} lacks FORCE ROW LEVEL SECURITY")
             )
         if acts_as_owner:
-            problems.append(
-                PostureProblem("owner", f"{user} owns {name} or can act as its owner")
-            )
+            problems.append(PostureProblem("owner", f"{user} owns {name} or can act as its owner"))
     return problems

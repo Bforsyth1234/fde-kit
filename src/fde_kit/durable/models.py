@@ -17,6 +17,7 @@ class LLMCallInput:
     messages: list[dict[str, Any]]
     max_tokens: int
     turn: int
+    tenant_id: str | None = None
 
 
 @dataclass
@@ -36,6 +37,7 @@ class ToolCallInput:
     input: dict[str, Any]
     idempotency_key: str
     tool_use_id: str
+    tenant_id: str | None = None
 
 
 @dataclass
@@ -50,6 +52,7 @@ class SummarizeInput:
     tool_name: str
     content: str
     max_chars: int
+    tenant_id: str | None = None
 
 
 @dataclass
@@ -70,6 +73,7 @@ class AgentRunInput:
     require_approval_for: list[str] = field(default_factory=list)
     """Extra tool names to gate for this run, on top of tools registered with
     requires_approval=True."""
+    tenant_id: str | None = None
 
 
 @dataclass

@@ -173,9 +173,7 @@ def test_posture_check_rejects_a_weakened_policy_on_a_partition(
     part = partition_name("rag_chunks", "summit")
     with psycopg.connect(admin_url, autocommit=True) as admin:
         admin.execute(
-            sql.SQL("ALTER POLICY tenant_isolation ON {} USING (true)").format(
-                sql.Identifier(part)
-            )
+            sql.SQL("ALTER POLICY tenant_isolation ON {} USING (true)").format(sql.Identifier(part))
         )
         try:
             with psycopg.connect(app_url) as conn:
@@ -185,9 +183,7 @@ def test_posture_check_rejects_a_weakened_policy_on_a_partition(
             create_tenant(admin_url, "summit")  # re-applies the policy as migrate writes it
 
 
-def test_drop_tenant_removes_its_partitions_and_nothing_else(
-    admin_url: str, store: TenantStore
-):
+def test_drop_tenant_removes_its_partitions_and_nothing_else(admin_url: str, store: TenantStore):
     from fde_kit.rag import drop_tenant
 
     create_tenant(admin_url, "leaver")
@@ -210,6 +206,42 @@ def test_drop_tenant_removes_its_partitions_and_nothing_else(
         ).fetchone() == (0,)
     with store.session("harbor") as s:
         assert s.count_chunks() == harbor_before
+
+
+def test_partitions_carry_no_table_comments(admin_url: str, store: TenantStore):
+    """pg_description is world-readable, so a comment naming the tenant would undo the hashed
+    partition name."""
+    with psycopg.connect(admin_url) as conn:
+        comments = conn.execute(
+            "SELECT obj_description(oid, 'pg_class') FROM pg_class "
+            "WHERE relispartition AND relname LIKE 'rag_%'"
+        ).fetchall()
+    assert comments and all(c == (None,) for c in comments)
+
+
+def test_partition_key_comes_from_settings(monkeypatch: pytest.MonkeyPatch):
+    """The key is a Settings field, so .env and FDE_RAG_PARTITION_KEY both work, and a key
+    that only lives in one process's environment can't silently split admin from app."""
+    plain = partition_name("rag_chunks", "summit")
+    keyed = partition_name("rag_chunks", "summit", key="deploy-secret")
+    assert plain != keyed
+    monkeypatch.setenv("FDE_RAG_PARTITION_KEY", "deploy-secret")
+    assert partition_name("rag_chunks", "summit") == keyed
+
+
+def test_store_refuses_a_mismatched_partition_key(
+    app_url: str, store: TenantStore, monkeypatch: pytest.MonkeyPatch
+):
+    """Under the wrong key every partition lookup would miss (empty results, not an error) and
+    create_tenant would try to add a second partition for an existing tenant. The fingerprint
+    migrate stored turns that into a refusal at startup."""
+    monkeypatch.setenv("FDE_RAG_PARTITION_KEY", "some-other-key")
+    with psycopg.connect(app_url) as conn:
+        assert "partition_key" in {p.check for p in check_posture(conn)}
+    with pytest.raises(InsecureConnection):
+        TenantStore(app_url, HashEmbedder())
+    with pytest.raises(RuntimeError, match="does not match"):
+        migrate(PG_URL)  # type: ignore[arg-type]
 
 
 def test_demonstration_superuser_sees_every_tenant(superuser):
@@ -304,9 +336,7 @@ def test_no_tenant_set_means_no_rows_and_no_writes(app_url: str, store: TenantSt
         for table in ("rag_chunks", "rag_documents", "rag_tenants", "rag_cache"):
             assert conn.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
-            conn.execute(
-                "INSERT INTO rag_documents (tenant_id, source) VALUES ('harbor', 'x.md')"
-            )
+            conn.execute("INSERT INTO rag_documents (tenant_id, source) VALUES ('harbor', 'x.md')")
 
 
 def test_empty_tenant_setting_is_not_a_wildcard(app_url: str, store: TenantStore):
@@ -422,6 +452,40 @@ def test_tenant_registry_turns_on_trace_redaction(store: TenantStore):
     assert reg.tenant_id == "summit"
     with pytest.raises(ValueError):
         tenant_search_registry(store, "harbor", registry=reg)
+
+
+@pytest.mark.parametrize("bad", ["", "harbor' OR '1'='1", "Harbor", "a" * 64])
+def test_tenant_registry_validates_tenant_id_upfront(store: TenantStore, bad: str):
+    """Invalid tenant ids are rejected when the registry is constructed, even if the model
+    never calls search_documents."""
+    with pytest.raises(ValueError):
+        tenant_search_registry(store, bad)
+
+
+def test_shared_base_registry_is_not_mutated_by_tenant_search_registry(store: TenantStore):
+    """Passing a shared base registry (with tenant_id=None, e.g. builtin_tools.registry) must
+    not bind that shared registry in place to the first tenant that uses it."""
+    from fde_kit.tools import ToolRegistry
+
+    base = ToolRegistry()
+
+    @base.tool
+    def ping() -> str:
+        """Ping."""
+        return "pong"
+
+    reg_harbor = tenant_search_registry(store, "harbor", registry=base, cached=False)
+    reg_summit = tenant_search_registry(store, "summit", registry=base, cached=False)
+
+    assert base.tenant_id is None
+    assert "search_documents" not in base.names()
+    assert reg_harbor.tenant_id == "harbor" and "ping" in reg_harbor.names()
+    assert reg_summit.tenant_id == "summit" and "ping" in reg_summit.names()
+
+    out_h = reg_harbor.execute("search_documents", {"query": LATE_Q})
+    out_s = reg_summit.execute("search_documents", {"query": LATE_Q})
+    assert LATE_FEES["harbor"] in out_h.content and LATE_FEES["summit"] not in out_h.content
+    assert LATE_FEES["summit"] in out_s.content and LATE_FEES["harbor"] not in out_s.content
 
 
 def test_injected_tenant_argument_is_dropped(store: TenantStore):
@@ -626,8 +690,13 @@ def _load(st: TenantStore, tid: str, n: int, near: bool, seed: int = 0) -> None:
                     "INSERT INTO rag_cache (tenant_id, query_hash, query, embedding, params, "
                     "result) VALUES (%s, %s, %s, %s::vector, %s, '[]')",
                     [
-                        (tid, f"h{i}", q, to_pgvector(emb.embed_query(q)),
-                         Jsonb({"k": 5, "mode": "hybrid", "filters": {}}))
+                        (
+                            tid,
+                            f"h{i}",
+                            q,
+                            to_pgvector(emb.embed_query(q)),
+                            Jsonb({"k": 5, "mode": "hybrid", "filters": {}}),
+                        )
                         for i, q in enumerate(f"{QUERY} {w}" for w in _WORDS[: n // 10])
                     ],
                 )
@@ -721,15 +790,17 @@ def test_posture_check_flags_a_partition_without_forced_rls(
 ):
     part = partition_name("rag_chunks", probe_tenants[1])
     with psycopg.connect(admin_url, autocommit=True) as admin:
-        admin.execute(sql.SQL("ALTER TABLE {} NO FORCE ROW LEVEL SECURITY").format(
-            sql.Identifier(part)))
+        admin.execute(
+            sql.SQL("ALTER TABLE {} NO FORCE ROW LEVEL SECURITY").format(sql.Identifier(part))
+        )
         try:
             with psycopg.connect(app_url) as conn:
                 checks = {p.check for p in check_posture(conn)}
             assert "partition_rls" in checks
         finally:
-            admin.execute(sql.SQL("ALTER TABLE {} FORCE ROW LEVEL SECURITY").format(
-                sql.Identifier(part)))
+            admin.execute(
+                sql.SQL("ALTER TABLE {} FORCE ROW LEVEL SECURITY").format(sql.Identifier(part))
+            )
 
 
 def test_another_tenants_partition_is_empty_from_your_session(store: TenantStore, probe_tenants):
@@ -741,8 +812,10 @@ def test_another_tenants_partition_is_empty_from_your_session(store: TenantStore
         assert s.conn.execute(sql.SQL("SELECT count(*) FROM {}").format(other)).fetchone() == (0,)
     with pytest.raises(psycopg.errors.InsufficientPrivilege), store.session(a) as s:
         s.conn.execute(
-            sql.SQL("INSERT INTO {} (tenant_id, doc_id, ord, content, embedding) "
-                    "VALUES (%s, gen_random_uuid(), 0, 'x', %s::vector)").format(other),
+            sql.SQL(
+                "INSERT INTO {} (tenant_id, doc_id, ord, content, embedding) "
+                "VALUES (%s, gen_random_uuid(), 0, 'x', %s::vector)"
+            ).format(other),
             (b, to_pgvector([0.0] * 384)),
         )
 
@@ -856,8 +929,11 @@ def test_demonstration_iterative_scan_on_a_shared_index_leaks_through_timing(
     create_tenant(admin_url, "shared-a")
     _fill_shared(admin_url, "shared-a", 50, near=False, seed=6)
     work = {}
-    for label, n, near in (("bigco empty", 0, False), ("bigco unrelated", 4000, False),
-                           ("bigco about the query", 4000, True)):
+    for label, n, near in (
+        ("bigco empty", 0, False),
+        ("bigco unrelated", 4000, False),
+        ("bigco about the query", 4000, True),
+    ):
         _fill_shared(admin_url, "bigco", n, near=near, seed=5)
         rows, work[label] = _shared(store, "shared-a", iterative=True)
         assert rows == 5

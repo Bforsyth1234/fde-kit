@@ -93,13 +93,27 @@ def run(admin_url: str, embedder_name: str, k: int) -> tuple[list[Row], list[dic
                         hits_at_k.append(rank is not None)
                         rr.append(1 / rank if rank else 0.0)
                         detail.append(
-                            {"tenant": tid, "mode": mode, "id": q.id, "category": q.category,
-                             "query": q.query,
-                             "rank": rank, "top": [h.source for h in hits]}
+                            {
+                                "tenant": tid,
+                                "mode": mode,
+                                "id": q.id,
+                                "category": q.category,
+                                "query": q.query,
+                                "rank": rank,
+                                "top": [h.source for h in hits],
+                            }
                         )
                 rows.append(
-                    Row(tid, mode, len(own), sum(hits_at_1) / len(own), sum(hits_at_k) / len(own),
-                        statistics.mean(rr), statistics.median(lat), leaks)
+                    Row(
+                        tid,
+                        mode,
+                        len(own),
+                        sum(hits_at_1) / len(own),
+                        sum(hits_at_k) / len(own),
+                        statistics.mean(rr),
+                        statistics.median(lat),
+                        leaks,
+                    )
                 )
     return rows, detail
 
@@ -119,13 +133,28 @@ def main(argv: list[str] | None = None) -> int:
     rows, detail = run(a.admin_url, a.embedder, a.k)
 
     table = Table(title=f"retrieval, k={a.k}, embedder={a.embedder}")
-    for col in ("tenant", "mode", "questions", "hit@1", f"hit@{a.k}", "MRR", "p50 ms",
-                "cross-tenant"):
+    for col in (
+        "tenant",
+        "mode",
+        "questions",
+        "hit@1",
+        f"hit@{a.k}",
+        "MRR",
+        "p50 ms",
+        "cross-tenant",
+    ):
         table.add_column(col, justify="left" if col in ("tenant", "mode") else "right")
     for r in rows:
-        table.add_row(r.tenant, r.mode, str(r.n), f"{r.hit_at_1:.2f}", f"{r.hit_at_k:.2f}",
-                      f"{r.mrr:.2f}",
-                      f"{r.p50_ms:.1f}", str(r.cross_tenant_hits))
+        table.add_row(
+            r.tenant,
+            r.mode,
+            str(r.n),
+            f"{r.hit_at_1:.2f}",
+            f"{r.hit_at_k:.2f}",
+            f"{r.mrr:.2f}",
+            f"{r.p50_ms:.1f}",
+            str(r.cross_tenant_hits),
+        )
     console.print(table)
 
     cats = sorted({d["category"] for d in detail})
