@@ -82,9 +82,7 @@ class AgentActivities:
     def llm_call(self, inp: LLMCallInput) -> LLMCallOutput:
         tid = self._effective_tenant(inp.tenant_id)
         info = activity.info()
-        activity.logger.info(
-            "llm_call turn=%s attempt=%s", inp.turn, info.attempt
-        )
+        activity.logger.info("llm_call turn=%s attempt=%s", inp.turn, info.attempt)
 
         def call():
             return self.provider.complete(
@@ -184,4 +182,3 @@ class AgentActivities:
             resp = self._run_with_heartbeat(call, f"summarize {inp.tool_name}")
         text = resp.text.strip() or inp.content[: inp.max_chars]
         return SummarizeOutput(content=text, original_chars=n, summarized=True)
-

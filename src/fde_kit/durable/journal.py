@@ -197,4 +197,3 @@ def journal_from_url(url: str | None) -> ToolJournal:
     if url.startswith("file:"):
         return FileJournal(url[len("file:") :])
     return FileJournal(url)
-

@@ -111,10 +111,27 @@ def test_postgres_journal_isolates_tenants_on_colliding_key():
         j.close()
 
 
-
 # ------------------------------------------------------------- the crash-window scenario
 
 temporalio = pytest.importorskip("temporalio")
+
+
+def test_worker_bound_to_one_tenant_rejects_another_tenants_activity(tmp_path: Path):
+    """A worker whose registry is bound to one tenant must not run another tenant's step, even
+    if a misrouted task queue hands it one. (Unbound workers take the tenant from the input.)"""
+    from fde_kit import MockProvider, ToolRegistry
+    from fde_kit.durable.activities import AgentActivities
+
+    reg = ToolRegistry(tenant_id="summit")
+    acts = AgentActivities(MockProvider(), reg, journal=FileJournal(tmp_path))
+    assert acts._effective_tenant("summit") == "summit"
+    assert acts._effective_tenant(None) == "summit"
+    with pytest.raises(PermissionError):
+        acts._effective_tenant("harbor")
+    unbound = AgentActivities(MockProvider(), ToolRegistry(), journal=FileJournal(tmp_path))
+    assert unbound._effective_tenant("harbor") == "harbor"
+
+
 from temporalio.testing import WorkflowEnvironment  # noqa: E402
 
 from fde_kit.durable.client import start_run  # noqa: E402

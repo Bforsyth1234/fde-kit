@@ -10,7 +10,7 @@ knowing whether it works. Four pieces, nothing else:
 | Tracing | OpenTelemetry → Arize Phoenix (one container, no config). Token counts and tool I/O per span. | `src/fde_kit/tracing.py`, `docker-compose.yml` |
 | Eval harness | 20-case golden set, deterministic checks + optional LLM-as-judge, pass-rate gate wired into CI. | `evals/` |
 | Durable runtime | The same loop as a Temporal workflow. Kill the worker mid-run; the run finishes on the next one. Optional extra. | `src/fde_kit/durable/` |
-| Multi-tenant retrieval | Hybrid search (pgvector + BM25) with tenant isolation enforced by Postgres: forced RLS, a partition per tenant, locked-down catalogs, no parameter logging, redacted traces. 92 tests, including timing. Optional extra. | `src/fde_kit/rag/` |
+| Multi-tenant retrieval | Hybrid search (pgvector + BM25) with tenant isolation enforced by Postgres: forced RLS, a partition per tenant, no parameter logging, redacted traces. 76 tests, including timing. Optional extra. | `src/fde_kit/rag/` |
 
 Provider-agnostic behind a 30-line interface; Anthropic is the default, a deterministic mock is
 built in for tests and offline eval runs.
@@ -303,9 +303,10 @@ Agent(tenant_search_registry(store, tenant_id=request.tenant)).run(request.quest
 | Partition per tenant | Documents, chunks and cache are LIST-partitioned by tenant; `create_tenant` makes the partitions. Each tenant's B-trees, GIN and HNSW indexes are physically its own, so the work a query does can't depend on anyone else's data. |
 | Direct partition queries | The store names the tenant's partitions in every statement, so Postgres plans against one tenant's tables, not all of them. Each partition has its own forced policy, so a session pointed at the wrong partition still sees nothing. |
 | Random ids | Document and chunk ids are UUIDv4, not a shared sequence, so the gap between two of your ids says nothing about other tenants' inserts. |
-| Roles & catalogs | `fde_rag_owner` (NOLOGIN) owns the tables; the app connects as `fde_rag_app` with DML grants only. It can't create tenants, alter tables, or own anything. `migrate` also revokes access to `pg_class.relpartbound` (which holds `FOR VALUES IN ('<tenant_id>')`), `pg_class.reltuples`/`relpages`, `pg_description`, `pg_stat_*_tables`, and `pg_relation_size`/`pg_stat_get_*` functions so the app role cannot read other tenants' names, row counts, byte sizes, or write activity from system catalogs. |
+| Roles | `fde_rag_owner` (NOLOGIN) owns the tables; the app connects as `fde_rag_app` with DML grants only. It can't create tenants, alter tables, or own anything. |
+| Hidden tenant ids | Partition names are a hash of the tenant id; with `FDE_RAG_PARTITION_KEY` set they are an HMAC, so the catalog and the server log don't reveal tenant ids to anyone holding a candidate list. Partitions carry no comments. The key is fixed at first `migrate` (a fingerprint is stored, and a mismatched key is refused). |
 | No parameter logging | `migrate` pins `log_parameter_max_length` and `log_parameter_max_length_on_error` to 0 for the app role, and every session re-pins the second one. Slow-query and error logs show `$1`, never document text or questions. |
-| Posture check | `TenantStore` refuses to start unless: not a superuser, no BYPASSRLS, not an owner of any table or partition; RLS enabled and forced everywhere; the tables partitioned; **the only permissive policy on each table and partition is `tenant_isolation`, exactly as written** (permissive policies are OR-ed, so one extra `USING (true)` opens everything); parameter logging off; and catalog columns/views/functions that leak cross-tenant partition bounds, sizes or tuple counts revoked. `fde rag posture` runs the same check. |
+| Posture check | `TenantStore` refuses to start unless: not a superuser, no BYPASSRLS, not an owner of any table or partition; RLS enabled and forced everywhere; the tables partitioned; **the only permissive policy on each table and partition is `tenant_isolation`, exactly as written** (permissive policies are OR-ed, so one extra `USING (true)` opens everything); parameter logging off; the partition key matches the one the schema was migrated with. `fde rag posture` runs the same check. |
 | Transaction-local tenant | `session(tenant)` sets the tenant with `set_config(..., is_local => true)`. It ends with the transaction, so a pooled connection can't carry one request's tenant into the next. |
 | Composite foreign key | `rag_chunks (tenant_id, doc_id) → rag_documents (tenant_id, doc_id)`. A chunk can't point at another tenant's document. |
 | No tenant argument | The agent's `search_documents` tool has `query` and `k`. The tenant is bound when the registry is built per request. There is nothing for a prompt injection to fill in. |
@@ -317,7 +318,7 @@ pass every test.
 
 ### The attack suite
 
-`tests/test_rag_isolation.py` (83 tests) and `tests/test_tracing_tenants.py` (9), against a real
+`tests/test_rag_isolation.py` (67 tests) and `tests/test_tracing_tenants.py` (9), against a real
 Postgres + pgvector. The corpus is three property managers using the **same lease template**, so
 every leaked chunk reads like a correct answer with the wrong number in it: Summit's late fee is
 $50, Harbor's is $75, in the same sentence.
@@ -342,13 +343,13 @@ $50, Harbor's is $75, in the same sentence.
 | Connection pool reuse | next borrower has no tenant and sees nothing | `test_store_sessions_do_not_survive_the_transaction` |
 | Shared semantic cache | per-tenant cache: other tenant misses | `test_tenant_cache_is_per_tenant` |
 | Flood one tenant with matching documents | another tenant's BM25 scores unchanged, bit for bit | `test_bm25_statistics_are_per_tenant` |
-| **Catalogs**: read other tenants' names, row counts, sizes or activity from `pg_class`, `pg_description`, `pg_stat_*`, `pg_relation_size` | `InsufficientPrivilege`; partitions carry no comments | `test_app_role_cannot_read_other_tenants_names_or_counts_from_catalogs`, `test_partitions_carry_no_table_comments` |
+| **Catalogs**: tenant ids from partition names or comments | names are hashed (keyed HMAC when configured); no comments | `test_partitions_carry_no_table_comments`, `test_partition_key_comes_from_settings` |
 | **Timing**: vary tenant B's data, measure tenant A's query work | identical pages touched for vector, keyword and cache lookup, under both the default and at-scale plans | `test_query_work_does_not_depend_on_other_tenants_data` |
 | **Timing**: count tenants via planning time | every plan touches only the asking tenant's partitions | `test_plans_touch_only_the_tenants_own_partitions` |
 | **Ids**: count other tenants' inserts from id gaps | ids are random UUIDv4 | `test_ids_are_random_not_a_shared_counter` |
 | **Logs**: parameters in slow-query / error logs | pinned to 0; the app can't re-enable the superuser-only one; sessions re-pin the other | `test_app_role_never_logs_query_parameters`, `test_store_sessions_pin_error_parameter_logging_off` |
 | **Traces**: tenant data, content length or exception messages in the trace store | no span attribute, status or exception event contains the question, passage, answer or length; every span tagged | `test_tracing_tenants.py` |
-| Misconfiguration: extra permissive policy, weakened partition policy, unforced RLS, parameter logging on, catalog privileges granted | store refuses to start | `test_posture_check_*` |
+| Misconfiguration: extra permissive policy, weakened partition policy, unforced RLS, parameter logging on, wrong partition key | store refuses to start | `test_posture_check_*`, `test_store_refuses_a_mismatched_partition_key` |
 
 Five tests, and one assertion in a sixth, are **demonstrations**: each reproduces a real failure
 with a configuration the store refuses to use, and passes because the failure happens. If one starts failing, what it shows has
@@ -497,7 +498,10 @@ hash embedder (offline, no model download) and fails on any cross-tenant hit.
 ### What's not covered
 
 Per-tenant encryption (see Logs and backups), embedding inversion if vectors leave the database,
-and the authentication layer: RLS enforces whichever tenant the code sets, so the boundary is
+catalog metadata (anyone who can run SQL as the app role can count the partitions, read their
+row estimates and, with `pg_get_partition_constraintdef`, their tenant ids; that same role can
+also just set `app.tenant_id` and read the rows, so the boundary against a SQL-capable attacker
+is the role, not the catalog), and the authentication layer: RLS enforces whichever tenant the code sets, so the boundary is
 only as good as the line that maps a logged-in user to `tenant_id`. The model provider sees
 retrieved passages by design.
 
@@ -547,6 +551,7 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
 | `FDE_EVAL_PASS_THRESHOLD` | `0.85` | CI gate |
 | `FDE_RAG_URL` | derived from admin URL | App connection for retrieval, as `fde_rag_app`. Never a superuser. |
 | `FDE_RAG_ADMIN_URL` | `postgresql://fde:fde@localhost:5432/fde` | Used only by `fde rag migrate` / `seed-demo` |
+| `FDE_RAG_PARTITION_KEY` | unset | Optional secret; partition names become an HMAC of the tenant id. Fixed at first `migrate`. |
 | `FDE_RAG_EMBEDDER` | `bge` | `bge` (bge-small via fastembed) or `hash` (offline, tests) |
 
 ## Design notes

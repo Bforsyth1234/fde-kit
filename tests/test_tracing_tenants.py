@@ -151,4 +151,3 @@ def test_nested_scopes_restore_the_outer_tenant():
             assert trace_content("x") == "[redacted]"
         assert trace_content("x") == "[redacted]"
     assert trace_content("x") == "x"
-

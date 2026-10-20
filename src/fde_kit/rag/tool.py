@@ -52,4 +52,3 @@ def tenant_search_registry(
         return "\n\n---\n\n".join(f"[{h.source}]\n{h.content}" for h in hits)
 
     return out
-

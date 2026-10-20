@@ -77,7 +77,12 @@ def trace_content(value: Any, limit: int = 4000) -> str:
 
 class TenantSpanProcessor(SpanProcessor):
     """Stamps `tenant.id` on every span started inside a tenant scope, and scrubs exception
-    messages/stacktraces and error status descriptions on end unless tenant content is enabled."""
+    messages/stacktraces and error status descriptions on end unless tenant content is enabled.
+
+    on_end rewrites the SDK span's private `_events` and `_status`; there is no public API for
+    editing a finished span. It only works because init_tracing registers this processor
+    before the exporter's, so processors run in that order. A redacting SpanExporter wrapper
+    would be the sturdier shape if the SDK's internals move."""
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:
         tid = _tenant.get()

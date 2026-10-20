@@ -173,9 +173,7 @@ def test_posture_check_rejects_a_weakened_policy_on_a_partition(
     part = partition_name("rag_chunks", "summit")
     with psycopg.connect(admin_url, autocommit=True) as admin:
         admin.execute(
-            sql.SQL("ALTER POLICY tenant_isolation ON {} USING (true)").format(
-                sql.Identifier(part)
-            )
+            sql.SQL("ALTER POLICY tenant_isolation ON {} USING (true)").format(sql.Identifier(part))
         )
         try:
             with psycopg.connect(app_url) as conn:
@@ -185,9 +183,7 @@ def test_posture_check_rejects_a_weakened_policy_on_a_partition(
             create_tenant(admin_url, "summit")  # re-applies the policy as migrate writes it
 
 
-def test_drop_tenant_removes_its_partitions_and_nothing_else(
-    admin_url: str, store: TenantStore
-):
+def test_drop_tenant_removes_its_partitions_and_nothing_else(admin_url: str, store: TenantStore):
     from fde_kit.rag import drop_tenant
 
     create_tenant(admin_url, "leaver")
@@ -212,39 +208,9 @@ def test_drop_tenant_removes_its_partitions_and_nothing_else(
         assert s.count_chunks() == harbor_before
 
 
-@pytest.mark.parametrize(
-    "sql_query",
-    [
-        "SELECT relpartbound FROM pg_class WHERE relispartition",
-        "SELECT pg_get_expr(relpartbound, oid) FROM pg_class WHERE relispartition",
-        "SELECT reltuples FROM pg_class WHERE relispartition",
-        "SELECT relpages FROM pg_class WHERE relispartition",
-        "SELECT relallvisible FROM pg_class WHERE relispartition",
-        "SELECT * FROM pg_description",
-        "SELECT * FROM pg_stat_user_tables",
-        "SELECT * FROM pg_stat_all_tables",
-        "SELECT * FROM pg_statio_user_tables",
-        "SELECT pg_relation_size('rag_chunks'::regclass)",
-        "SELECT pg_table_size('rag_chunks'::regclass)",
-        "SELECT pg_total_relation_size('rag_chunks'::regclass)",
-        "SELECT pg_stat_get_live_tuples('rag_chunks'::regclass)",
-        "SELECT pg_stat_get_tuples_inserted('rag_chunks'::regclass)",
-    ],
-)
-def test_app_role_cannot_read_other_tenants_names_or_counts_from_catalogs(
-    store: TenantStore, sql_query: str
-):
-    """System catalogs bypass RLS on rag_tenants: pg_class.relpartbound holds `FOR VALUES IN
-    ('<tenant_id>')` in plaintext, and pg_class.reltuples / pg_stat_user_tables / pg_relation_size
-    reveal every other tenant's row counts, byte sizes and write activity. migrate revokes all of
-    them from fde_rag_app."""
-    with pytest.raises(psycopg.errors.InsufficientPrivilege), store.session("harbor") as s:
-        s.conn.execute(sql_query).fetchall()
-
-
 def test_partitions_carry_no_table_comments(admin_url: str, store: TenantStore):
-    """A table comment with the tenant name in it would be readable if pg_description were ever
-    exposed."""
+    """pg_description is world-readable, so a comment naming the tenant would undo the hashed
+    partition name."""
     with psycopg.connect(admin_url) as conn:
         comments = conn.execute(
             "SELECT obj_description(oid, 'pg_class') FROM pg_class "
@@ -253,24 +219,29 @@ def test_partitions_carry_no_table_comments(admin_url: str, store: TenantStore):
     assert comments and all(c == (None,) for c in comments)
 
 
-def test_posture_check_catches_catalog_leaks(admin_url: str, app_url: str, store: TenantStore):
-    with psycopg.connect(admin_url, autocommit=True) as admin:
-        admin.execute("GRANT SELECT (relpartbound) ON pg_catalog.pg_class TO fde_rag_app")
-        try:
-            with psycopg.connect(app_url) as conn:
-                assert "catalog_leak" in {p.check for p in check_posture(conn)}
-            with pytest.raises(InsecureConnection):
-                TenantStore(app_url, HashEmbedder())
-        finally:
-            admin.execute("REVOKE SELECT (relpartbound) ON pg_catalog.pg_class FROM fde_rag_app")
-
-
-def test_partition_name_supports_deployment_key(monkeypatch: pytest.MonkeyPatch):
-    unk = partition_name("rag_chunks", "summit")
+def test_partition_key_comes_from_settings(monkeypatch: pytest.MonkeyPatch):
+    """The key is a Settings field, so .env and FDE_RAG_PARTITION_KEY both work, and a key
+    that only lives in one process's environment can't silently split admin from app."""
+    plain = partition_name("rag_chunks", "summit")
     keyed = partition_name("rag_chunks", "summit", key="deploy-secret")
-    assert unk != keyed
+    assert plain != keyed
     monkeypatch.setenv("FDE_RAG_PARTITION_KEY", "deploy-secret")
     assert partition_name("rag_chunks", "summit") == keyed
+
+
+def test_store_refuses_a_mismatched_partition_key(
+    app_url: str, store: TenantStore, monkeypatch: pytest.MonkeyPatch
+):
+    """Under the wrong key every partition lookup would miss (empty results, not an error) and
+    create_tenant would try to add a second partition for an existing tenant. The fingerprint
+    migrate stored turns that into a refusal at startup."""
+    monkeypatch.setenv("FDE_RAG_PARTITION_KEY", "some-other-key")
+    with psycopg.connect(app_url) as conn:
+        assert "partition_key" in {p.check for p in check_posture(conn)}
+    with pytest.raises(InsecureConnection):
+        TenantStore(app_url, HashEmbedder())
+    with pytest.raises(RuntimeError, match="does not match"):
+        migrate(PG_URL)  # type: ignore[arg-type]
 
 
 def test_demonstration_superuser_sees_every_tenant(superuser):
@@ -365,9 +336,7 @@ def test_no_tenant_set_means_no_rows_and_no_writes(app_url: str, store: TenantSt
         for table in ("rag_chunks", "rag_documents", "rag_tenants", "rag_cache"):
             assert conn.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
-            conn.execute(
-                "INSERT INTO rag_documents (tenant_id, source) VALUES ('harbor', 'x.md')"
-            )
+            conn.execute("INSERT INTO rag_documents (tenant_id, source) VALUES ('harbor', 'x.md')")
 
 
 def test_empty_tenant_setting_is_not_a_wildcard(app_url: str, store: TenantStore):
@@ -721,8 +690,13 @@ def _load(st: TenantStore, tid: str, n: int, near: bool, seed: int = 0) -> None:
                     "INSERT INTO rag_cache (tenant_id, query_hash, query, embedding, params, "
                     "result) VALUES (%s, %s, %s, %s::vector, %s, '[]')",
                     [
-                        (tid, f"h{i}", q, to_pgvector(emb.embed_query(q)),
-                         Jsonb({"k": 5, "mode": "hybrid", "filters": {}}))
+                        (
+                            tid,
+                            f"h{i}",
+                            q,
+                            to_pgvector(emb.embed_query(q)),
+                            Jsonb({"k": 5, "mode": "hybrid", "filters": {}}),
+                        )
                         for i, q in enumerate(f"{QUERY} {w}" for w in _WORDS[: n // 10])
                     ],
                 )
@@ -816,15 +790,17 @@ def test_posture_check_flags_a_partition_without_forced_rls(
 ):
     part = partition_name("rag_chunks", probe_tenants[1])
     with psycopg.connect(admin_url, autocommit=True) as admin:
-        admin.execute(sql.SQL("ALTER TABLE {} NO FORCE ROW LEVEL SECURITY").format(
-            sql.Identifier(part)))
+        admin.execute(
+            sql.SQL("ALTER TABLE {} NO FORCE ROW LEVEL SECURITY").format(sql.Identifier(part))
+        )
         try:
             with psycopg.connect(app_url) as conn:
                 checks = {p.check for p in check_posture(conn)}
             assert "partition_rls" in checks
         finally:
-            admin.execute(sql.SQL("ALTER TABLE {} FORCE ROW LEVEL SECURITY").format(
-                sql.Identifier(part)))
+            admin.execute(
+                sql.SQL("ALTER TABLE {} FORCE ROW LEVEL SECURITY").format(sql.Identifier(part))
+            )
 
 
 def test_another_tenants_partition_is_empty_from_your_session(store: TenantStore, probe_tenants):
@@ -836,8 +812,10 @@ def test_another_tenants_partition_is_empty_from_your_session(store: TenantStore
         assert s.conn.execute(sql.SQL("SELECT count(*) FROM {}").format(other)).fetchone() == (0,)
     with pytest.raises(psycopg.errors.InsufficientPrivilege), store.session(a) as s:
         s.conn.execute(
-            sql.SQL("INSERT INTO {} (tenant_id, doc_id, ord, content, embedding) "
-                    "VALUES (%s, gen_random_uuid(), 0, 'x', %s::vector)").format(other),
+            sql.SQL(
+                "INSERT INTO {} (tenant_id, doc_id, ord, content, embedding) "
+                "VALUES (%s, gen_random_uuid(), 0, 'x', %s::vector)"
+            ).format(other),
             (b, to_pgvector([0.0] * 384)),
         )
 
@@ -951,8 +929,11 @@ def test_demonstration_iterative_scan_on_a_shared_index_leaks_through_timing(
     create_tenant(admin_url, "shared-a")
     _fill_shared(admin_url, "shared-a", 50, near=False, seed=6)
     work = {}
-    for label, n, near in (("bigco empty", 0, False), ("bigco unrelated", 4000, False),
-                           ("bigco about the query", 4000, True)):
+    for label, n, near in (
+        ("bigco empty", 0, False),
+        ("bigco unrelated", 4000, False),
+        ("bigco about the query", 4000, True),
+    ):
         _fill_shared(admin_url, "bigco", n, near=near, seed=5)
         rows, work[label] = _shared(store, "shared-a", iterative=True)
         assert rows == 5

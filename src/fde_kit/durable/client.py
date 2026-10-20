@@ -1,7 +1,7 @@
 """Client helpers: start a durable agent run, query it, wait for it.
 
-    from fde_kit.durable.client import run
-    result = asyncio.run(run("What is 17 * 23?"))
+from fde_kit.durable.client import run
+result = asyncio.run(run("What is 17 * 23?"))
 """
 
 from __future__ import annotations

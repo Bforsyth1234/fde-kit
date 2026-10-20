@@ -70,6 +70,14 @@ class Settings(BaseSettings):
         default="postgresql://fde:fde@localhost:5432/fde",
         description="Used only by `fde rag migrate` / `seed-demo` to create roles and tables.",
     )
+    rag_partition_key: str = Field(
+        default="",
+        description=(
+            "Optional secret. Partition names become an HMAC of the tenant id, so the catalog "
+            "doesn't reveal tenant ids to anyone with a candidate list. Set it before the first "
+            "migrate; it can't be changed afterwards without renaming partitions."
+        ),
+    )
     rag_embedder: str = Field(
         default="bge", description="'bge' (BAAI/bge-small-en-v1.5 via fastembed) or 'hash'"
     )
