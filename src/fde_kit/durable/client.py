@@ -12,6 +12,8 @@ from typing import Any
 from temporalio.api.enums.v1 import EventType
 from temporalio.client import Client, WorkflowHandle
 
+from ..config import get_settings
+from ..prompts import PromptRef, load_prompt
 from .models import AgentRunInput, AgentRunOutput, PendingApproval, RunStatus
 from .worker import DEFAULT_ADDRESS, DEFAULT_TASK_QUEUE
 from .workflow import AgentWorkflow
@@ -34,8 +36,20 @@ async def start_run(
     tenant_id: str | None = None,
 ) -> WorkflowHandle[Any, AgentRunOutput]:
     client = client or await connect()
+    settings = get_settings()
+    if system_prompt is not None:
+        ref = PromptRef.inline(system_prompt)
+    elif settings.system_prompt:
+        ref = PromptRef.inline(settings.system_prompt)
+    else:
+        ref = load_prompt(settings.prompt, settings.prompts_dir)
     inp = AgentRunInput(
-        prompt=prompt, max_turns=max_turns, system_prompt=system_prompt, tenant_id=tenant_id
+        prompt=prompt,
+        max_turns=max_turns,
+        system_prompt=ref.text,
+        tenant_id=tenant_id,
+        prompt_name=ref.name,
+        prompt_sha256=ref.sha256,
     )
     if approval_timeout_seconds is not None:
         inp.approval_timeout_seconds = approval_timeout_seconds

@@ -134,7 +134,11 @@ class AgentActivities:
             res = self._run_with_heartbeat(
                 lambda: self.registry.execute(inp.name, inp.input), f"tool {inp.name}"
             )
-        out = ToolCallOutput(content=res.content, is_error=res.is_error)
+        out = ToolCallOutput(
+            content=res.content,
+            is_error=res.is_error,
+            sources=[s.to_dict() for s in res.sources],
+        )
         # Record BEFORE returning. If the process dies between this line and Temporal recording
         # the completion, the retry is served from the journal and the tool does not run twice.
         self.journal.put(inp.idempotency_key, out, tool_name=inp.name, tenant_id=tid)

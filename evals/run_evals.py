@@ -49,6 +49,12 @@ class CaseResult:
     input_tokens: int
     output_tokens: int
     details: list[str]
+    model: str = ""
+    prompt_name: str = ""
+    prompt_sha256: str = ""
+    sources: int = 0
+    cited: int = 0
+    fabricated_citations: int = 0
 
 
 def load_cases(
@@ -106,6 +112,12 @@ def run_case(case: dict[str, Any], provider_name: str, judge: LLMProvider | None
         input_tokens=result.usage.input_tokens,
         output_tokens=result.usage.output_tokens,
         details=details,
+        model=result.model,
+        prompt_name=result.prompt_name,
+        prompt_sha256=result.prompt_sha256,
+        sources=len(result.sources),
+        cited=len(result.cited),
+        fabricated_citations=len(result.fabricated_citations),
     )
 
 
@@ -113,7 +125,16 @@ def summarise(results: list[CaseResult]) -> dict[str, Any]:
     by_cat: dict[str, list[CaseResult]] = defaultdict(list)
     for r in results:
         by_cat[r.category].append(r)
+    cited = sum(r.cited for r in results)
+    fabricated = sum(r.fabricated_citations for r in results)
     return {
+        "model": results[0].model if results else "",
+        "prompt_name": results[0].prompt_name if results else "",
+        "prompt_sha256": results[0].prompt_sha256 if results else "",
+        # Of the citations the answers made, how many pointed at a Source a tool returned.
+        # 1.0 or there is a fabricated citation somewhere; see fabricated_citations per case.
+        "citation_precision": (cited / (cited + fabricated)) if (cited + fabricated) else 1.0,
+        "fabricated_citations": fabricated,
         "total": len(results),
         "passed": sum(r.passed for r in results),
         "pass_rate": (sum(r.passed for r in results) / len(results)) if results else 0.0,
@@ -137,7 +158,13 @@ def _percentile(values: list[float], pct: float) -> float:
 
 
 def print_report(results: list[CaseResult], summary: dict[str, Any], threshold: float) -> None:
-    table = Table(title="eval results", show_lines=False)
+    title = "eval results"
+    if summary.get("prompt_sha256"):
+        title += (
+            f"  ·  model {summary['model']}  ·  prompt "
+            f"{summary['prompt_name']}@{summary['prompt_sha256'][:12]}"
+        )
+    table = Table(title=title, show_lines=False)
     table.add_column("id")
     table.add_column("cat")
     table.add_column("ok", justify="center")
@@ -170,6 +197,11 @@ def print_report(results: list[CaseResult], summary: dict[str, Any], threshold: 
         f"p50 {summary['p50_latency_ms']:.0f} ms, p95 {summary['p95_latency_ms']:.0f} ms | "
         f"tokens {summary['input_tokens']} in / {summary['output_tokens']} out"
     )
+    if summary["fabricated_citations"]:
+        console.print(
+            f"[red bold]fabricated citations: {summary['fabricated_citations']}[/] "
+            f"(citation precision {summary['citation_precision']:.2f})"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

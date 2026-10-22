@@ -42,6 +42,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+from ..tools import Source
 from .chunk import chunk_text
 from .embed import Embedder, to_pgvector
 from .schema import (
@@ -67,6 +68,18 @@ class Hit:
     score: float
     vector_rank: int | None = None
     keyword_rank: int | None = None
+    content_hash: str = ""
+    """sha256 of `content` as stored. Empty only for rows ingested before the column existed."""
+
+    def to_source(self, tenant_id: str | None = None) -> Source:
+        return Source(
+            source_id=self.chunk_id,
+            uri=self.source,
+            title=self.title,
+            doc_id=self.doc_id,
+            content_hash=self.content_hash or None,
+            tenant_id=tenant_id,
+        )
 
 
 @dataclass
@@ -74,6 +87,11 @@ class SearchResult:
     hits: list[Hit]
     cached: bool = False
     params: dict[str, Any] = field(default_factory=dict)
+
+
+def content_hash(text: str) -> str:
+    """sha256 hex of a chunk's text. What `Source.content_hash` carries."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def fuse(
@@ -207,11 +225,11 @@ class TenantSession:
         with self.conn.cursor() as cur:
             cur.executemany(
                 self.sql(
-                    "INSERT INTO @chunks (tenant_id, doc_id, ord, content, embedding) "
-                    "VALUES (%s, %s, %s, %s, %s::vector)"
+                    "INSERT INTO @chunks (tenant_id, doc_id, ord, content, content_hash, "
+                    "embedding) VALUES (%s, %s, %s, %s, %s, %s::vector)"
                 ),
                 [
-                    (self.tenant_id, doc_id, i, c, to_pgvector(v))
+                    (self.tenant_id, doc_id, i, c, content_hash(c), to_pgvector(v))
                     for i, (c, v) in enumerate(zip(chunks, vecs, strict=True))
                 ],
             )
@@ -384,7 +402,8 @@ _KW_CANDIDATES = f"""
 """
 
 _PROJECT = """
-SELECT c.chunk_id::text, c.doc_id::text, d.source, d.title, c.content, {score}::float8, {vr}, {tr}
+SELECT c.chunk_id::text, c.doc_id::text, d.source, d.title, c.content, {score}::float8, {vr}, {tr},
+       c.content_hash
 FROM {src}
 JOIN @chunks c ON c.chunk_id = x.chunk_id
 JOIN @docs d ON d.doc_id = c.doc_id

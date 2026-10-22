@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS tool_journal (
     recorded_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE tool_journal ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE tool_journal ADD COLUMN IF NOT EXISTS sources JSONB NOT NULL DEFAULT '[]'::jsonb;
 """
 
 
@@ -91,7 +92,12 @@ class FileJournal:
         recorded_tool = data.get("tool_name", "")
         if recorded_tool and tool_name and recorded_tool != tool_name:
             return None
-        return ToolCallOutput(content=data["content"], is_error=data["is_error"], from_journal=True)
+        return ToolCallOutput(
+            content=data["content"],
+            is_error=data["is_error"],
+            from_journal=True,
+            sources=list(data.get("sources") or []),
+        )
 
     def put(
         self,
@@ -145,16 +151,18 @@ class PostgresJournal:
         tid = tenant_id or ""
         with self._pool.connection() as conn:
             row = conn.execute(
-                "SELECT content, is_error, tool_name FROM tool_journal "
+                "SELECT content, is_error, tool_name, sources FROM tool_journal "
                 "WHERE idempotency_key = %s AND tenant_id = %s",
                 (scoped, tid),
             ).fetchone()
         if row is None:
             return None
-        content, is_error, recorded_tool = row
+        content, is_error, recorded_tool, sources = row
         if recorded_tool and tool_name and recorded_tool != tool_name:
             return None
-        return ToolCallOutput(content=content, is_error=is_error, from_journal=True)
+        return ToolCallOutput(
+            content=content, is_error=is_error, from_journal=True, sources=list(sources or [])
+        )
 
     def put(
         self,
@@ -164,13 +172,16 @@ class PostgresJournal:
         *,
         tenant_id: str | None = None,
     ) -> None:
+        from psycopg.types.json import Jsonb
+
         scoped = _scoped_key(key, tenant_id)
         tid = tenant_id or ""
         with self._pool.connection() as conn:
             conn.execute(
                 "INSERT INTO tool_journal (idempotency_key, tenant_id, tool_name, content, "
-                "is_error) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (idempotency_key) DO NOTHING",
-                (scoped, tid, tool_name, result.content, result.is_error),
+                "is_error, sources) VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (idempotency_key) DO NOTHING",
+                (scoped, tid, tool_name, result.content, result.is_error, Jsonb(result.sources)),
             )
             conn.commit()
 
