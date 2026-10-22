@@ -25,8 +25,9 @@ services:
     restart: unless-stopped
 
   postgres:
-    # Shared tool-idempotency journal for durable runs. Any number of workers, one journal.
-    image: postgres:16-alpine
+    # Shared tool-idempotency journal for durable runs, and the multi-tenant retrieval store
+    # (pgvector >= 0.8 for iterative index scans). `fde rag migrate` creates the RAG roles.
+    image: pgvector/pgvector:pg16
     container_name: fde-postgres
     environment:
       POSTGRES_USER: fde

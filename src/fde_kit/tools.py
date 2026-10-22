@@ -54,6 +54,9 @@ class ToolResult:
 @dataclass
 class ToolRegistry:
     _tools: dict[str, ToolSpec] = field(default_factory=dict)
+    tenant_id: str | None = None
+    """Set when every tool in this registry serves one tenant. An Agent using the registry then
+    runs inside `tracing.tenant_scope(tenant_id)`: spans tagged, content redacted."""
 
     def tool(
         self,

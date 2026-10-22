@@ -130,7 +130,11 @@ class AgentWorkflow:
             llm = await workflow.execute_activity(
                 AgentActivities.llm_call,
                 LLMCallInput(
-                    system=system, messages=messages, max_tokens=inp.max_tokens, turn=turn
+                    system=system,
+                    messages=messages,
+                    max_tokens=inp.max_tokens,
+                    turn=turn,
+                    tenant_id=inp.tenant_id,
                 ),
                 start_to_close_timeout=timedelta(minutes=3),
                 heartbeat_timeout=timedelta(seconds=20),
@@ -210,6 +214,7 @@ class AgentWorkflow:
                         input=call["input"],
                         idempotency_key=f"{wf_id}:{turn}:{call['id']}",
                         tool_use_id=call["id"],
+                        tenant_id=inp.tenant_id,
                     ),
                     start_to_close_timeout=timedelta(minutes=5),
                     heartbeat_timeout=timedelta(seconds=10),
@@ -230,6 +235,7 @@ class AgentWorkflow:
                                 tool_name=call["name"],
                                 content=content,
                                 max_chars=SUMMARIZE_TO_CHARS,
+                                tenant_id=inp.tenant_id,
                             ),
                             start_to_close_timeout=timedelta(minutes=2),
                             heartbeat_timeout=timedelta(seconds=20),

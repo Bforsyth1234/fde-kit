@@ -41,6 +41,13 @@ class Settings(BaseSettings):
         description="OTLP/HTTP endpoint. Default is a local Arize Phoenix instance.",
     )
     otel_service_name: str = "fde-kit"
+    otel_tenant_content: bool = Field(
+        default=False,
+        description=(
+            "Record prompts, tool I/O and answers on spans for tenant-scoped runs. Off by "
+            "default: a shared trace store would show every tenant's data to anyone with access."
+        ),
+    )
 
     # Durable runtime
     journal_url: str | None = Field(
@@ -49,6 +56,30 @@ class Settings(BaseSettings):
             "Tool idempotency journal: postgresql://user:pw@host/db for a shared journal, "
             "file:<dir> for local files. Default: .fde/journal on local disk."
         ),
+    )
+
+    # Multi-tenant retrieval
+    rag_url: str | None = Field(
+        default=None,
+        description=(
+            "App connection for retrieval: postgresql://fde_rag_app:...@host/db. Must not be "
+            "a superuser, BYPASSRLS, or table owner; the store checks and refuses."
+        ),
+    )
+    rag_admin_url: str = Field(
+        default="postgresql://fde:fde@localhost:5432/fde",
+        description="Used only by `fde rag migrate` / `seed-demo` to create roles and tables.",
+    )
+    rag_partition_key: str = Field(
+        default="",
+        description=(
+            "Optional secret. Partition names become an HMAC of the tenant id, so the catalog "
+            "doesn't reveal tenant ids to anyone with a candidate list. Set it before the first "
+            "migrate; it can't be changed afterwards without renaming partitions."
+        ),
+    )
+    rag_embedder: str = Field(
+        default="bge", description="'bge' (BAAI/bge-small-en-v1.5 via fastembed) or 'hash'"
     )
 
     # Evals

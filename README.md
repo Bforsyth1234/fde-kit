@@ -10,6 +10,7 @@ knowing whether it works. Four pieces, nothing else:
 | Tracing | OpenTelemetry → Arize Phoenix (one container, no config). Token counts and tool I/O per span. | `src/fde_kit/tracing.py`, `docker-compose.yml` |
 | Eval harness | 20-case golden set, deterministic checks + optional LLM-as-judge, pass-rate gate wired into CI. | `evals/` |
 | Durable runtime | The same loop as a Temporal workflow. Kill the worker mid-run; the run finishes on the next one. Optional extra. | `src/fde_kit/durable/` |
+| Multi-tenant retrieval | Hybrid search (pgvector + BM25) with tenant isolation enforced by Postgres: forced RLS, a partition per tenant, no parameter logging, redacted traces. 76 tests, including timing. Optional extra. | `src/fde_kit/rag/` |
 
 Provider-agnostic behind a 30-line interface; Anthropic is the default, a deterministic mock is
 built in for tests and offline eval runs.
@@ -262,6 +263,248 @@ The journal covers crash-after-complete. A crash *during* a non-idempotent tool,
 journal write, still re-runs the tool on retry. Closing that needs the tool to record intent
 before acting and reconcile on retry, which is the sandbox project, not this one.
 
+## Multi-tenant retrieval
+
+One retrieval store serving many customers. Isolation is enforced by Postgres, not by
+application `WHERE` clauses, and the test suite tries to break it: through the data, through
+timing, through the logs, and through the traces.
+
+```bash
+pip install -e ".[rag]"
+docker compose up -d postgres     # pgvector/pgvector:pg16
+fde rag seed-demo                 # migrate + three demo tenants
+fde rag search --tenant summit "How much extra do I owe if my rent is late?"
+fde rag ask --tenant summit "How much is the late fee?"        # agent, search bound to summit
+fde rag posture                   # would this connection let anything leak?
+make rag-demo                     # same question, three tenants, three answers
+make rag-test                     # the attack suite
+make rag-eval                     # retrieval numbers below
+```
+
+```python
+from fde_kit import Agent
+from fde_kit.rag import TenantStore, create_tenant, make_embedder, tenant_search_registry
+
+create_tenant(admin_url, "summit")                      # operator action: row + partitions
+store = TenantStore(app_url, make_embedder("bge"))      # refuses connections that could leak
+with store.session("summit") as s:
+    s.ingest("leases/101.md", text, title="Lease: Apartment 101", metadata={"unit": "101"})
+    hits = s.search("late fee?", k=5)                   # hybrid by default
+
+# Per request: the tenant comes from your auth layer, never from the model.
+Agent(tenant_search_registry(store, tenant_id=request.tenant)).run(request.question)
+```
+
+### How isolation works
+
+| Layer | What it does |
+| --- | --- |
+| Policy | Every tenant table and every partition has RLS **enabled and forced**, one policy: `tenant_id = current_setting('app.tenant_id', true)` for reads (`USING`) and writes (`WITH CHECK`). Unset or empty setting matches nothing: fail closed. |
+| Partition per tenant | Documents, chunks and cache are LIST-partitioned by tenant; `create_tenant` makes the partitions. Each tenant's B-trees, GIN and HNSW indexes are physically its own, so the work a query does can't depend on anyone else's data. |
+| Direct partition queries | The store names the tenant's partitions in every statement, so Postgres plans against one tenant's tables, not all of them. Each partition has its own forced policy, so a session pointed at the wrong partition still sees nothing. |
+| Random ids | Document and chunk ids are UUIDv4, not a shared sequence, so the gap between two of your ids says nothing about other tenants' inserts. |
+| Roles | `fde_rag_owner` (NOLOGIN) owns the tables; the app connects as `fde_rag_app` with DML grants only. It can't create tenants, alter tables, or own anything. |
+| Hidden tenant ids | Partition names are a hash of the tenant id; with `FDE_RAG_PARTITION_KEY` set they are an HMAC, so the catalog and the server log don't reveal tenant ids to anyone holding a candidate list. Partitions carry no comments. The key is fixed at first `migrate` (a fingerprint is stored, and a mismatched key is refused). |
+| No parameter logging | `migrate` pins `log_parameter_max_length` and `log_parameter_max_length_on_error` to 0 for the app role, and every session re-pins the second one. Slow-query and error logs show `$1`, never document text or questions. |
+| Posture check | `TenantStore` refuses to start unless: not a superuser, no BYPASSRLS, not an owner of any table or partition; RLS enabled and forced everywhere; the tables partitioned; **the only permissive policy on each table and partition is `tenant_isolation`, exactly as written** (permissive policies are OR-ed, so one extra `USING (true)` opens everything); parameter logging off; the partition key matches the one the schema was migrated with. `fde rag posture` runs the same check. |
+| Transaction-local tenant | `session(tenant)` sets the tenant with `set_config(..., is_local => true)`. It ends with the transaction, so a pooled connection can't carry one request's tenant into the next. |
+| Composite foreign key | `rag_chunks (tenant_id, doc_id) → rag_documents (tenant_id, doc_id)`. A chunk can't point at another tenant's document. |
+| No tenant argument | The agent's `search_documents` tool has `query` and `k`. The tenant is bound when the registry is built per request. There is nothing for a prompt injection to fill in. |
+| Per-tenant cache, statistics & journal | The semantic cache and BM25's document frequencies live in the tenant's own partitions; durable tool-journal keys are scoped by `tenant_id` and `tool_name`. |
+| Redacted traces | A run on a tenant-bound registry tags every span with `tenant.id`, replaces content (prompt, messages, tool I/O, answer) with a constant `[redacted]` marker (no character-length hint), and scrubs `exception.message`, `exception.stacktrace` and error status descriptions on span events before export. |
+
+No query in `store.py` filters on `tenant_id`. If the code also filtered, a broken policy would
+pass every test.
+
+### The attack suite
+
+`tests/test_rag_isolation.py` (67 tests) and `tests/test_tracing_tenants.py` (9), against a real
+Postgres + pgvector. The corpus is three property managers using the **same lease template**, so
+every leaked chunk reads like a correct answer with the wrong number in it: Summit's late fee is
+$50, Harbor's is $75, in the same sentence.
+
+| Attack | Result | Test |
+| --- | --- | --- |
+| Same question, every tenant, every search mode | only own chunks; counts partition the table exactly | `test_every_result_belongs_to_the_asking_tenant`, `test_counts_partition_the_table` |
+| Shared template: ask for "the late fee" | own number present, other tenants' numbers absent | `test_shared_template_returns_this_tenants_number` |
+| Plant the exact question text in another tenant (cosine similarity 1.0) | invisible; a superuser query shows it as the top hit, proving the plant works | `test_exact_duplicate_in_another_tenant_is_invisible` |
+| Same document ingested by two tenants | two documents, two ids, each sees one | `test_same_document_in_two_tenants_stays_two_documents` |
+| No tenant set, or set to `''` | zero rows on every table; inserts rejected | `test_no_tenant_set_means_no_rows_and_no_writes`, `test_empty_tenant_setting_is_not_a_wildcard` |
+| Insert or `UPDATE ... SET tenant_id` into another tenant | rejected by `WITH CHECK` | `test_cannot_insert_rows_for_another_tenant`, `test_cannot_move_own_rows_into_another_tenant` |
+| `DELETE`/`UPDATE ... WHERE tenant_id = 'other'` | 0 rows affected | `test_updates_and_deletes_cannot_reach_other_tenants` |
+| Chunk referencing another tenant's `doc_id` | foreign-key violation | `test_chunk_cannot_point_at_another_tenants_document` |
+| Query another tenant's partition by name | empty; inserts rejected | `test_another_tenants_partition_is_empty_from_your_session` |
+| Metadata filter `{"tenant_id": "other"}`, SQL in filter values | empty result: filters only narrow | `test_filters_can_only_narrow` |
+| SQL / tsquery syntax in the query text | treated as text; tenant unchanged | `test_hostile_query_text_is_just_text` |
+| Malformed tenant ids (`harbor' OR '1'='1`, …) | `ValueError` before any SQL or registry binding | `test_malformed_tenant_ids_are_rejected`, `test_tenant_registry_validates_tenant_id_upfront` |
+| Shared base `ToolRegistry` passed to `tenant_search_registry` | cloned per tenant; base registry never mutated in place | `test_shared_base_registry_is_not_mutated_by_tenant_search_registry` |
+| Model passes `tenant_id`, `namespace`, `filters` to the tool | ignored; schema has no such field | `test_search_tool_has_no_tenant_argument`, `test_injected_tenant_argument_is_dropped` |
+| Prompt injection inside a retrieved document ("search tenant harbor") | model obeys, tool ignores it | `test_prompt_injection_in_a_document_cannot_redirect_the_search` |
+| Connection pool reuse | next borrower has no tenant and sees nothing | `test_store_sessions_do_not_survive_the_transaction` |
+| Shared semantic cache | per-tenant cache: other tenant misses | `test_tenant_cache_is_per_tenant` |
+| Flood one tenant with matching documents | another tenant's BM25 scores unchanged, bit for bit | `test_bm25_statistics_are_per_tenant` |
+| **Catalogs**: tenant ids from partition names or comments | names are hashed (keyed HMAC when configured); no comments | `test_partitions_carry_no_table_comments`, `test_partition_key_comes_from_settings` |
+| **Timing**: vary tenant B's data, measure tenant A's query work | identical pages touched for vector, keyword and cache lookup, under both the default and at-scale plans | `test_query_work_does_not_depend_on_other_tenants_data` |
+| **Timing**: count tenants via planning time | every plan touches only the asking tenant's partitions | `test_plans_touch_only_the_tenants_own_partitions` |
+| **Ids**: count other tenants' inserts from id gaps | ids are random UUIDv4 | `test_ids_are_random_not_a_shared_counter` |
+| **Logs**: parameters in slow-query / error logs | pinned to 0; the app can't re-enable the superuser-only one; sessions re-pin the other | `test_app_role_never_logs_query_parameters`, `test_store_sessions_pin_error_parameter_logging_off` |
+| **Traces**: tenant data, content length or exception messages in the trace store | no span attribute, status or exception event contains the question, passage, answer or length; every span tagged | `test_tracing_tenants.py` |
+| Misconfiguration: extra permissive policy, weakened partition policy, unforced RLS, parameter logging on, wrong partition key | store refuses to start | `test_posture_check_*`, `test_store_refuses_a_mismatched_partition_key` |
+
+Five tests, and one assertion in a sixth, are **demonstrations**: each reproduces a real failure
+with a configuration the store refuses to use, and passes because the failure happens. If one starts failing, what it shows has
+stopped being true.
+
+| Demonstration | What it shows |
+| --- | --- |
+| `test_demonstration_superuser_sees_every_tenant` | The compose `POSTGRES_USER` is a superuser. Tenant set, policy in place: every tenant's rows anyway. |
+| `test_demonstration_session_level_setting_leaks_through_the_pool` | `set_config(..., false)` on a pooled connection; the next request forgets to set a tenant and reads the previous tenant's data. |
+| `test_demonstration_shared_semantic_cache_leaks` | A process-wide cache keyed on the query embedding. Summit asks Harbor's question and gets Harbor's $75. |
+| `test_bm25_statistics_are_per_tenant` (second assertion) | With global corpus statistics, another tenant's documents shift your scores. |
+| `test_demonstration_shared_hnsw_starves_a_small_tenant` | One HNSW index for all tenants: a 5-chunk tenant next to a 3,000-chunk tenant gets 0 of 5 results. |
+| `test_demonstration_iterative_scan_on_a_shared_index_leaks_through_timing` | The usual fix for that (pgvector's iterative scan) makes the query's work grow with what the *other* tenant has written about your query. |
+
+**Mutation check.** I broke each defence on purpose and reran. Every policy set to `USING
+(true)`: the store refuses to start (posture). With the posture check bypassed as well, 20 of the
+58 isolation tests at the time failed; fewer than before partitioning, because the store's own
+reads now only reach the tenant's partition even with the policy broken. A session-level
+`set_config`: the pool test fails. Trace redaction off: 2 tracing tests fail. Removing `WITH CHECK` changes nothing,
+correctly: Postgres applies `USING` to writes when `WITH CHECK` is absent.
+
+One mutation taught me something the suite now covers: after a broken-policy run, the database
+kept the `USING (true)` policies while the code had been restored, and the old posture check,
+which only checked that *a* policy existed, let the store start on them. It now compares every
+policy's condition to the one `migrate` writes.
+
+### The timing leak, measured
+
+Tenant A runs the same vector search on the same 50 chunks of its own. Only tenant B's data
+changes. Same query, same plan (forced to the one Postgres picks when tenants are large):
+
+| Tenant B holds | Shared index: pages | Shared index: p50 | Partitioned: pages | Partitioned: execution |
+| --- | --- | --- | --- | --- |
+| nothing | 123 | 0.11 ms | 97 | 0.107 ms |
+| 4,000 unrelated chunks | 4,467 | 4.78 ms | 97 | 0.075 ms |
+| 4,000 chunks about A's query | **16,760** | **15.46 ms** | 97 | 0.095 ms |
+
+On the shared index, iterative scan keeps walking past other tenants' vectors until it has enough
+of A's, and how far it walks depends on how close B's data is to A's question. A competitor
+asking "merger acquisition target valuation" could tell, from latency alone, whether another
+customer had documents about that. Partitioned, A's partition is the only thing scanned: the page
+count is identical, and execution time moves with noise, not with B (a repeat of the empty-B run
+measured 0.077 ms, between the other two).
+
+Planning had its own channel. Through the parent tables, Postgres considers every partition
+before pruning: planning took **0.20 ms at 8 tenants and 6.4 ms at 208**, roughly linear, which
+both slows every query and lets anyone estimate the customer count. Naming the tenant's own
+partitions keeps it at **0.05 ms at 8 and at 208**.
+
+**What's left.** A cache hit is faster than a miss, so a user can tell whether *their own
+tenant* asked something similar before. That stays inside the tenant by construction, but it is
+a channel between users of one tenant, if that matters to a customer. Network-level timing (a
+shared CPU, a noisy neighbour) is outside what a database layout can fix.
+
+### Logs and backups
+
+**Logs (fixed).** With slow-query logging turned on, a routine production setting, Postgres
+defaults to logging every bound parameter in full. Measured on this setup: one ingest and one
+search wrote the whole confidential document, its embedding, and the user's question into the
+server log, which usually ships to a shared log system far more people can read than the
+database. `migrate` now pins parameter logging to 0 for the app role; the same experiment after
+the fix: **0** log lines mention the document. What still reaches the log: statement text (with
+`$1` placeholders), partition names (a hash of the tenant id, so someone with a list of
+candidate tenant ids could match them), durations, and error messages.
+
+**Backups and the write-ahead log (explained, not fixed).** Deleting a tenant's data doesn't
+delete every copy of it:
+
+- *The write-ahead log.* Every insert is written to the WAL before the table. With WAL archiving
+  (point-in-time recovery) or streaming replicas, those segments are kept for the retention
+  window, readable by anyone with access to the archive.
+- *Backups.* A base backup or `pg_dump` is a snapshot. `drop_tenant` removes the partitions'
+  files from the live database immediately (`test_drop_tenant_removes_its_partitions_and_nothing_else`), but every backup taken before still has them, and a
+  restore, even a partial one to debug something, brings them back.
+- *Dead rows.* A plain `DELETE` marks rows dead; the bytes stay in the data files until `VACUUM`
+  reuses the space. Dropping a partition avoids that; deleting rows doesn't.
+
+This matters when a customer leaves or asks for erasure: "deleted" has to mean "unrecoverable",
+and with backups it doesn't, until every backup containing them has expired. The standard fix is
+**crypto-shredding**: encrypt each tenant's content with its own key held in a KMS, and destroy
+the key on offboarding, so every copy everywhere becomes unreadable at once. It has a real cost
+here: Postgres can't run full-text search over ciphertext, so the keyword index and the
+embeddings would stay plaintext, and both leak content to anyone holding a backup (lexemes
+directly, embeddings through inversion attacks). The honest options are crypto-shredding plus
+accepting that, or a backup retention period no longer than the contractual deletion window.
+
+### Two things I didn't expect
+
+**The planner can't see the tenant.** `current_setting('app.tenant_id')` isn't known at plan
+time, so on a shared table Postgres plans every tenant with the same estimate: table rows ÷
+distinct tenants. With a few large tenants it orders by the HNSW index for everyone, HNSW
+returns its 40 nearest rows across *all* tenants, and RLS filters afterwards: a 5-chunk tenant
+gets 0 of 5 results. pgvector 0.8's iterative scan fixes the recall and creates the timing leak
+above. Partitioning fixes both.
+
+**Fusion only works when the scores mean something.** Two fusion methods, fixed in advance and
+not tuned: reciprocal rank fusion (k=60) and relative score fusion (min-max normalise each list,
+average, alpha 0.5). bge-small, hit@1:
+
+| Keyword arm | alone | + RRF | + relative score |
+| --- | --- | --- | --- |
+| Postgres `ts_rank_cd` (no IDF) | 0.69 | 0.70 | 0.63 |
+| BM25 (per-tenant statistics) | 0.69 | 0.83 | **0.96** |
+
+RRF keeps only rank, so a chunk that is mediocre in both lists beats one that is first in one.
+Relative fusion keeps the margin, which helps only if the margin is real: BM25 has IDF, so an
+exact lease-reference match scores far above everything else; `ts_rank_cd` weighs "rent" and
+"lease", which are in every chunk, as much as the reference number. RRF is also the least stable
+method here: pgvector builds HNSW graphs with random level assignment, and RRF's hit@1 ranged
+from 0.74 to 0.83 across index rebuilds while relative fusion was 0.96 every time.
+
+### Retrieval numbers
+
+`make rag-eval`: 54 questions over the demo corpus (18 per tenant, 99 chunks each), k=5,
+BAAI/bge-small-en-v1.5, CPU, 2026-10-19.
+
+| Question type | n | vector | keyword (BM25) | **hybrid (default)** |
+| --- | --- | --- | --- | --- |
+| Policy, paraphrased ("how much extra if rent is late?") | 15 | 1.00 | 0.87 | **1.00** |
+| Unit-specific ("when does Dana Whitfield's lease run out?") | 24 | 1.00 | 0.42 | **1.00** |
+| Identifier ("who is on lease SR-26-6977?") | 12 | 0.08 | 1.00 | **0.83** |
+| Tenant-only document | 3 | 1.00 | 0.67 | **1.00** |
+| **All, hit@1** | 54 | 0.80 | 0.69 | **0.96** |
+| All, hit@5 | 54 | 0.87 | 0.93 | **0.98** |
+| Cross-tenant hits, incl. probes (each tenant asked the other two tenants' document-only questions) | | 0 | 0 | **0** |
+
+Hybrid with RRF instead: 0.74–0.83 hit@1, 0.96–0.98 hit@5 across rebuilds. p50 latency per
+query: ~3 ms keyword, ~55 ms vector or hybrid, almost all of it embedding the query on CPU.
+
+**Read these as directional.** The corpus is synthetic, small, and written by the same person who
+wrote the questions. What it is good for is comparing methods on the same data, and the
+cross-tenant row, which is measured on every run rather than assumed. CI runs the eval with the
+hash embedder (offline, no model download) and fails on any cross-tenant hit.
+
+### Costs of this design
+
+- One partition per tenant per table means three tables and their indexes per customer.
+  Postgres copes with thousands of partitions, and planning stays flat because the store names
+  the tenant's own (measured flat from 8 to 208 tenants); tens of thousands of tiny tenants would want a different layout (a database or
+  schema per cohort), and pooling small tenants into a shared partition brings the timing
+  channel back between them.
+- Onboarding a tenant is DDL (`create_tenant`), run by an operator connection, not the app.
+- BM25's document frequencies are recomputed from the tenant's chunks on every keyword query.
+  Fine at this size; a large tenant would want a maintained term-stats table.
+
+### What's not covered
+
+Per-tenant encryption (see Logs and backups), embedding inversion if vectors leave the database,
+catalog metadata (anyone who can run SQL as the app role can count the partitions, read their
+row estimates and, with `pg_get_partition_constraintdef`, their tenant ids; that same role can
+also just set `app.tenant_id` and read the rows, so the boundary against a SQL-capable attacker
+is the role, not the catalog), and the authentication layer: RLS enforces whichever tenant the code sets, so the boundary is
+only as good as the line that maps a logged-in user to `tenant_id`. The model provider sees
+retrieved passages by design.
+
 ## Baseline results
 
 Golden set against `claude-sonnet-5-5`, single run, 2026-10-18:
@@ -286,7 +529,9 @@ that class of bug before the full eval does.
 
 ## CI
 
-`.github/workflows/ci.yml` runs lint, tests and the offline eval on every push and PR. On pushes
+`.github/workflows/ci.yml` runs lint, tests (Postgres + pgvector service container), the
+offline retrieval eval with its cross-tenant gate, and the offline agent eval on every push and
+PR. On pushes
 to `main` it also runs the golden set against the real model **if** an `ANTHROPIC_API_KEY`
 repository secret is set, and fails the build below the threshold. The results JSON is uploaded
 as a build artifact.
@@ -302,7 +547,12 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
 | `FDE_MAX_TURNS` | `10` | Hard cap on LLM round-trips per run |
 | `FDE_OTEL_ENABLED` | `true` | Export spans |
 | `FDE_OTEL_ENDPOINT` | `http://localhost:6006/v1/traces` | OTLP/HTTP collector |
+| `FDE_OTEL_TENANT_CONTENT` | `false` | Record prompts and tool I/O on spans for tenant-bound runs. Only with a per-tenant access-controlled trace store. |
 | `FDE_EVAL_PASS_THRESHOLD` | `0.85` | CI gate |
+| `FDE_RAG_URL` | derived from admin URL | App connection for retrieval, as `fde_rag_app`. Never a superuser. |
+| `FDE_RAG_ADMIN_URL` | `postgresql://fde:fde@localhost:5432/fde` | Used only by `fde rag migrate` / `seed-demo` |
+| `FDE_RAG_PARTITION_KEY` | unset | Optional secret; partition names become an HMAC of the tenant id. Fixed at first `migrate`. |
+| `FDE_RAG_EMBEDDER` | `bge` | `bge` (bge-small via fastembed) or `hash` (offline, tests) |
 
 ## Design notes
 
@@ -320,7 +570,7 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
 
 ## What's not here yet
 
-Retrieval, prompt versioning, pairwise/A-B eval mode, a customers/ onboarding directory, and a
+Prompt versioning, pairwise/A-B eval mode, a customers/ onboarding directory, and a
 one-command cloud deploy. Those are v1.
 
 ## License
