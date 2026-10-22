@@ -176,6 +176,31 @@ def cmd_durable_run(args: argparse.Namespace) -> int:
     return asyncio.run(go())
 
 
+# --- durable export (1-B)
+def cmd_durable_export(args: argparse.Namespace) -> int:
+    try:
+        import asyncio
+        from pathlib import Path
+
+        from .durable.client import connect, handle_for
+        from .durable.export import export_run
+    except ModuleNotFoundError:
+        console.print("[red]temporalio not installed[/]: pip install 'fde-kit[durable]'")
+        return 2
+
+    async def go() -> int:
+        client = await connect(args.address)
+        h = handle_for(client, args.workflow_id)
+        path = await export_run(h, out=Path(args.out) if args.out else None)
+        console.print(f"exported {h.id} to {path}")
+        return 0
+
+    return asyncio.run(go())
+
+
+# --- end durable export (1-B)
+
+
 def _cmd_decide(args: argparse.Namespace, approved: bool) -> int:
     try:
         import asyncio
@@ -354,6 +379,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     d.add_argument("--no-prompt", action="store_true", help="print instructions instead of asking")
     d.set_defaults(fn=cmd_durable_run)
+
+    # --- durable export (1-B)
+    de = sub.add_parser(
+        "durable-export", help="write a finished durable run's history to runs/<run_id>.jsonl"
+    )
+    de.add_argument("workflow_id")
+    de.add_argument("--out", help="write the record to this path instead of runs/")
+    de.add_argument("--address", default="localhost:7233")
+    de.set_defaults(fn=cmd_durable_export)
+    # --- end durable export (1-B)
 
     r = sub.add_parser("run", help="run one prompt through the agent")
     r.add_argument("prompt")

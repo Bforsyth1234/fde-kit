@@ -407,3 +407,72 @@ def test_parked_run_survives_worker_restart_then_approved(env, tmp_path: Path):
     assert out.output == "Done: the email went out."
     assert out.steps[0].approvals[0]["by"] == "reviewer-from-phone"
     assert out.steps[0].tool_results[0]["content"].startswith("email queued")
+
+
+# ---------------------------------------------------------------------- record export (1-B)
+
+from fde_kit.durable.export import export_run, run_id_for  # noqa: E402
+
+
+def test_export_then_replay(env, tmp_path: Path):
+    """The standard two-tool mock run exports to a section-2 record file.
+
+    TODO(integrator): replay via fde_kit.record.replay_session once record.py lands, and assert
+    the replayed output equals the result row's output with stopped_reason == "end_turn".
+    """
+    e, loop = env
+
+    async def go():
+        stop = asyncio.Event()
+        worker = asyncio.create_task(
+            run_worker(
+                client=e.client,
+                task_queue="t-export",
+                provider=MockProvider(TWO_TOOL_SCRIPT),
+                registry=registry,
+                journal_dir=tempfile.mkdtemp(),
+                stop=stop,
+            )
+        )
+        await asyncio.sleep(0.3)
+        h = await start_run("refund doubled?", client=e.client, task_queue="t-export")
+        out = await h.result()
+        path = await export_run(h, runs_dir=tmp_path / "runs")
+        stop.set()
+        await worker
+        return h.id, out, path
+
+    wf_id, out, path = loop.run_until_complete(go())
+
+    assert path.exists() and path == tmp_path / "runs" / f"{run_id_for(wf_id)}.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    header, body = rows[0], rows[1:]
+    assert header["kind"] == "header"
+    assert header["version"] == 1 and header["runtime"] == "durable"
+    assert header["run_id"] == run_id_for(wf_id) and header["workflow_id"] == wf_id
+    assert header["model"] == "mock" and header["tools"] == ["lookup_policy", "calculator"]
+    assert header["prompt_sha256"] and header["prompt_text"]
+
+    kinds = [r["kind"] for r in body]
+    assert kinds[0] == "user" and body[0]["text"] == "refund doubled?"
+    assert kinds.count("result") == 1 and kinds[-1] == "result"
+    assert kinds.count("llm") == out.turns
+    assert kinds.count("tool") == len(out.tools_called)
+    # Each turn's tool rows follow that turn's llm row, in tool_calls order.
+    assert kinds[1:] == ["llm", "tool", "llm", "tool", "llm", "result"]
+
+    llm1 = body[1]
+    assert llm1["turn"] == 1 and llm1["stop_reason"] == "tool_use"
+    assert llm1["tool_calls"][0]["name"] == "lookup_policy"
+    assert set(llm1["usage"]) == {"input_tokens", "output_tokens"}
+    tool1 = body[2]
+    assert tool1["turn"] == 1 and tool1["tool_use_id"] == llm1["tool_calls"][0]["id"]
+    tool2 = body[4]
+    assert tool2["turn"] == 2 and tool2["name"] == "calculator"
+    assert tool2["input"] == {"expression": "30 * 2"} and tool2["content"] == "60"
+    assert tool2["is_error"] is False and tool2["approval"] is None
+
+    result = body[-1]
+    assert result["output"] == out.output
+    assert result["stopped_reason"] == "end_turn" and result["turns"] == out.turns
+    assert result["cited"] == [] and result["fabricated_citations"] == []
