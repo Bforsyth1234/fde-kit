@@ -45,6 +45,9 @@ class ToolCallOutput:
     content: str
     is_error: bool = False
     from_journal: bool = False  # True when served from the idempotency journal
+    sources: list[dict[str, Any]] = field(default_factory=list)
+    """`Source.to_dict()` per record the tool drew on. Content may carry local `[#i]` markers
+    that the workflow rewrites to run-wide `[n]` numbers (see citations.py)."""
 
 
 @dataclass
@@ -74,6 +77,10 @@ class AgentRunInput:
     """Extra tool names to gate for this run, on top of tools registered with
     requires_approval=True."""
     tenant_id: str | None = None
+    prompt_name: str = ""
+    prompt_sha256: str = ""
+    """Set by the client from the resolved PromptRef so the history records which prompt ran.
+    Empty on histories from before prompt versioning; the workflow fills `inline` + hash."""
 
 
 @dataclass
@@ -113,10 +120,22 @@ class AgentRunOutput:
     output_tokens: int
     code_version: int = 1
     """Version of the workflow code that completed the run."""
+    sources: list[dict[str, Any]] = field(default_factory=list)
+    """Every Source any tool returned, in citation order: `sources[n-1]` is [n]."""
+    prompt_name: str = ""
+    prompt_sha256: str = ""
 
     @property
     def turns(self) -> int:
         return len(self.steps)
+
+    @property
+    def cited(self) -> list[dict[str, Any]]:
+        from ..citations import cited
+        from ..tools import Source
+
+        srcs = [Source.from_dict(d) for d in self.sources]
+        return [s.to_dict() for s in cited(self.output, srcs)]
 
     @property
     def tools_called(self) -> list[str]:

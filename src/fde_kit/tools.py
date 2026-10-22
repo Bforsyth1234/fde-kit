@@ -20,7 +20,7 @@ from __future__ import annotations
 import inspect
 import traceback
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from pydantic import BaseModel, ValidationError, create_model
@@ -45,10 +45,44 @@ class ToolSpec:
         }
 
 
+@dataclass(frozen=True)
+class Source:
+    """One record a tool drew on. The unit of citation.
+
+    A tool that returns `ToolResult(content, sources=(...))` is saying: this content came from
+    these records. The agent loop numbers every Source it sees across a run (`[1]`, `[2]`, ...),
+    the model cites by that number, and `AgentResult.cited` resolves the numbers back to Sources.
+    The citation is therefore produced by the tool layer and checked by the loop, never asserted
+    by the model. See citations.py.
+    """
+
+    source_id: str
+    """Stable id of the record: a chunk id, a fact id, a row key."""
+    uri: str
+    """Where a person can look it up: a file path, a URL, a document reference."""
+    title: str = ""
+    doc_id: str | None = None
+    content_hash: str | None = None
+    """sha256 of the record body at ingest, so a citation can prove what text it pointed at."""
+    span: str | None = None
+    """Location inside the document, e.g. "chars:1200-1850" or "rows:14-19"."""
+    tenant_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {k: v for k, v in asdict(self).items() if v is not None and v != ""}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Source:
+        return cls(**{k: d.get(k) for k in cls.__dataclass_fields__ if k in d})
+
+
 @dataclass
 class ToolResult:
     content: str
     is_error: bool = False
+    sources: tuple[Source, ...] = ()
+    """Records the content came from. Content may refer to them with local markers `[#1]`,
+    `[#2]`, ... (1-based into `sources`); the loop rewrites those to run-wide `[n]` numbers."""
 
 
 @dataclass
@@ -110,6 +144,8 @@ class ToolRegistry:
         except Exception as exc:
             tb = traceback.format_exc(limit=3)
             return ToolResult(f"{type(exc).__name__}: {exc}\n{tb}", is_error=True)
+        if isinstance(out, ToolResult):
+            return out
         return ToolResult(_stringify(out))
 
 

@@ -71,6 +71,30 @@ def no_tool(result: AgentResult, _v: Any, _: JudgeContext) -> CheckOutcome:
     return CheckOutcome(ok, f"no_tool: called {result.tools_called}")
 
 
+def cites(result: AgentResult, value: str, _: JudgeContext) -> CheckOutcome:
+    """The answer cites a Source whose `source_id`, `doc_id` or `uri` equals `value`.
+
+    Resolved through `AgentResult.cited`: the [n] numbers in the answer, mapped back to the
+    Sources tools actually returned. Prose that names the document without a number does not
+    count; neither does a number that no tool produced.
+    """
+    hit = [s for s in result.cited if value in (s.source_id, s.doc_id, s.uri)]
+    seen = [s.uri for s in result.sources]
+    got = [s.uri for s in result.cited]
+    return CheckOutcome(bool(hit), f"cites {value}: cited {got} of {seen}")
+
+
+def cites_only(result: AgentResult, _v: Any, _: JudgeContext) -> CheckOutcome:
+    """Every citation in the answer points at a Source a tool returned: nothing fabricated."""
+    bad = result.fabricated_citations
+    return CheckOutcome(not bad, f"cites_only: fabricated {bad}, sources {len(result.sources)}")
+
+
+def cites_any(result: AgentResult, _v: Any, _: JudgeContext) -> CheckOutcome:
+    """The answer cites at least one real Source. For cases where which one is not fixed."""
+    return CheckOutcome(bool(result.cited), f"cites_any: cited {len(result.cited)}")
+
+
 _JUDGE_SYSTEM = (
     "You are a strict grader. You will be given a task prompt, a model's answer, and a rubric. "
     "Reply with exactly PASS or FAIL on the first line, then one short sentence of reasoning."
@@ -102,5 +126,8 @@ SCORERS: dict[str, Scorer] = {
     "regex": regex,
     "tool_called": tool_called,
     "no_tool": no_tool,
+    "cites": cites,
+    "cites_only": cites_only,
+    "cites_any": cites_any,
     "judge": judge,
 }

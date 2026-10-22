@@ -1,16 +1,24 @@
 # fde-kit
 
-**v0.** A slim, opinionated starter kit for putting an LLM agent in front of a customer and
-knowing whether it works. Four pieces, nothing else:
+**v1.** A slim, opinionated starter kit for putting an LLM agent in front of a customer and
+knowing whether it works, with every answer traceable to the records and the prompt behind it.
+
+**Core** (installed by `pip install fde-kit`):
 
 | Piece | What it is | Where |
 | --- | --- | --- |
-| Agent loop | ~150 lines. Prompt → LLM → tools → … → answer. Every step is a span. | `src/fde_kit/agent.py` |
-| Tool registry | `@registry.tool` on a typed Python function. Schema derived from the signature. Errors returned to the model, not raised. | `src/fde_kit/tools.py` |
-| Tracing | OpenTelemetry → Arize Phoenix (one container, no config). Token counts and tool I/O per span. | `src/fde_kit/tracing.py`, `docker-compose.yml` |
-| Eval harness | 20-case golden set, deterministic checks + optional LLM-as-judge, pass-rate gate wired into CI. | `evals/` |
-| Durable runtime | The same loop as a Temporal workflow. Kill the worker mid-run; the run finishes on the next one. Optional extra. | `src/fde_kit/durable/` |
-| Multi-tenant retrieval | Hybrid search (pgvector + BM25) with tenant isolation enforced by Postgres: forced RLS, a partition per tenant, no parameter logging, redacted traces. 76 tests, including timing. Optional extra. | `src/fde_kit/rag/` |
+| Agent loop | ~200 lines. Prompt → LLM → tools → … → answer. Every step is a span. Numbers every source a tool returns and resolves the `[n]` citations in the answer back to them. | `src/fde_kit/agent.py`, `citations.py` |
+| Tool registry | `@registry.tool` on a typed Python function. Schema derived from the signature. Errors returned to the model, not raised. A tool may return `ToolResult(content, sources=...)` to say what records its content came from. | `src/fde_kit/tools.py` |
+| Prompts | Markdown files, Git-tracked, hashed. Every run records `prompt_name` and `prompt_sha256` on the result, the spans and the eval JSON. | `src/fde_kit/prompts/` |
+| Tracing | OpenTelemetry → Arize Phoenix (one container, no config). Token counts, tool I/O, source ids and prompt hash per span. | `src/fde_kit/tracing.py`, `docker-compose.yml` |
+| Eval harness | 22-case golden set, deterministic checks (incl. `cites` / `cites_only`) + optional LLM-as-judge, pass-rate and citation-precision gates wired into CI. | `evals/` |
+
+**Optional extras** (`pip install "fde-kit[durable]"`, `"fde-kit[rag]"`):
+
+| Piece | What it is | Where |
+| --- | --- | --- |
+| Durable runtime | The same loop as a Temporal workflow. Kill the worker mid-run; the run finishes on the next one. | `src/fde_kit/durable/` |
+| Multi-tenant retrieval | Hybrid search (pgvector + BM25) with tenant isolation enforced by Postgres: forced RLS, a partition per tenant, no parameter logging, redacted traces. 76 tests, including timing. Returns cited passages. | `src/fde_kit/rag/` |
 
 Provider-agnostic behind a 30-line interface; Anthropic is the default, a deterministic mock is
 built in for tests and offline eval runs.
@@ -48,6 +56,59 @@ print(result.output, result.tools_called, result.usage)
 The docstring becomes the tool description the model reads; the type hints become the JSON
 schema. There is no second place to keep them in sync. See `examples/demo.py`.
 
+## Citations
+
+A citation is produced by the tool layer and checked by the loop. The model's prose is never
+the source of truth for what was cited.
+
+```python
+from fde_kit import Source, ToolResult
+
+@registry.tool
+def lookup_policy(topic: str) -> ToolResult:
+    """Look up a policy. Returns a numbered passage; cite its number."""
+    text = kb[topic]
+    src = Source(source_id=f"policy:{topic}", uri=f"policies/{topic}.md", title=topic.title(),
+                 content_hash=hashlib.sha256(text.encode()).hexdigest())
+    return ToolResult(f"[#1] {src.title} ({src.uri})\n{text}", sources=(src,))
+
+result = Agent(registry).run("What is the uptime SLA? Cite your source.")
+result.output                 # "The uptime SLA is 99.9% monthly [1]."
+result.sources                # every Source any tool returned, in citation order
+result.cited                  # the subset the answer cites by number: [Source(policy:sla, ...)]
+result.fabricated_citations   # numbers in the answer no tool returned: [] or there is a bug
+```
+
+How it works: a tool marks its own passages `[#1]`, `[#2]`, … (local to that call). The loop
+keeps one ledger per run, gives each new `Source` the next run-wide number, rewrites the local
+markers before the content reaches the model, and records `citations: [n, ...]` on every tool
+result in `result.steps`. The packaged system prompt asks the model to cite by `[n]`.
+`result.cited` parses the answer's `[n]` tokens and resolves them through the ledger; a number
+the ledger does not have is a fabricated citation, which the `cites_only` eval check fails and
+`fde run` prints in red.
+
+Why a ledger and not the model's own numbering: two searches in one run both return a `[1]`.
+The tool cannot know what the run has already seen; the loop can. Why `Source.content_hash`:
+the citation can prove what text it pointed at after the document is re-ingested. `fde rag ask`
+prints the table of sources seen and which the answer cited.
+
+## Prompt versioning
+
+The system prompt is a Markdown file, and every run records which one it used.
+
+```
+prompts/default.md             # your project's prompt, if the directory exists
+src/fde_kit/prompts/default.md # packaged fallback
+```
+
+`FDE_PROMPT=<name>` picks `prompts/<name>.md` (or a path to any `.md`); `FDE_SYSTEM_PROMPT` or
+`Agent(system_prompt=...)` passes raw text, recorded as `inline`. In all cases the run carries
+`prompt_name` and `prompt_sha256`: on `AgentResult`, on the `agent.run` and `llm.call` spans,
+in each case of `fde eval --json` and in the report header, and in a durable run's workflow
+history (`AgentRunInput` / `AgentRunOutput`). Two eval files with different hashes are two
+experiments; Git is the version store and the hash is how a trace points at a commit of the
+prompt without needing Git at runtime.
+
 ## Evals
 
 `evals/golden.jsonl` has one case per line:
@@ -61,10 +122,15 @@ schema. There is no second place to keep them in sync. See `examples/demo.py`.
           "Doubled, the refund window would be 60 days."]}
 ```
 
-Check types: `exact`, `contains`, `any_of`, `regex`, `tool_called`, `no_tool`, `judge`. A case
-passes only if every check passes. The report shows pass rate overall and per category, p50/p95
-latency, and token totals; `--json` writes the full per-case record for diffing between model
-versions.
+Check types: `exact`, `contains`, `any_of`, `regex`, `tool_called`, `no_tool`, `cites`,
+`cites_only`, `cites_any`, `judge`. A case passes only if every check passes. `cites <id>`
+passes when the answer cites, by `[n]`, a Source whose `source_id`, `doc_id` or `uri` is `<id>`;
+naming the document in prose does not count. `cites_only` passes when no citation in the answer
+is fabricated. The report shows pass rate overall and per category, p50/p95 latency, token
+totals and, when any citation was fabricated, citation precision in red; the header carries
+the model and the prompt hash. `--json` writes the full per-case record, including
+`prompt_sha256`, `sources`, `cited` and `fabricated_citations`, for diffing between model or
+prompt versions.
 
 Every case carries a `mock` script. `--provider mock` replays it, which tests the harness and the
 tools rather than the model. If a case passes in mock mode and fails against the real model, the
@@ -507,7 +573,8 @@ retrieved passages by design.
 
 ## Baseline results
 
-Golden set against `claude-sonnet-5-5`, single run, 2026-10-18:
+Golden set (20 cases at the time; the two `citation` cases were added later and have no live
+baseline yet) against `claude-sonnet-5-5`, single run, 2026-10-18:
 
 | Metric | Value |
 | --- | --- |
@@ -545,6 +612,9 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
 | `FDE_PROVIDER` | `anthropic` | `anthropic` or `mock` |
 | `FDE_MODEL` | `claude-sonnet-5-5` | Model id |
 | `FDE_MAX_TURNS` | `10` | Hard cap on LLM round-trips per run |
+| `FDE_PROMPT` | `default` | System prompt: `prompts/<name>.md`, else the packaged one, or a path to a `.md` file |
+| `FDE_PROMPTS_DIR` | `./prompts` | Where named prompts are looked up before the packaged ones |
+| `FDE_SYSTEM_PROMPT` | unset | Raw prompt text; overrides `FDE_PROMPT`, recorded as `inline` + hash |
 | `FDE_OTEL_ENABLED` | `true` | Export spans |
 | `FDE_OTEL_ENDPOINT` | `http://localhost:6006/v1/traces` | OTLP/HTTP collector |
 | `FDE_OTEL_TENANT_CONTENT` | `false` | Record prompts and tool I/O on spans for tenant-bound runs. Only with a per-tenant access-controlled trace store. |
@@ -567,11 +637,17 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
   `output.value`) so Phoenix renders them without extra setup. Any OTLP backend works.
 - **Mock scripts live next to the cases they test.** Offline runs are a harness self-check, and
   they are labelled as such; they are never presented as a model score.
+- **Citations are data, not prose.** Tools return `Source`s, the loop numbers them, the answer
+  cites numbers, and the check resolves numbers back to `Source`s. There is no step where the
+  model's description of its source is trusted.
+- **Trace attributes for citations are ids only.** `tool.source_ids` and `tool.citations` go on
+  spans even for tenant-bound runs; content stays `[redacted]` there.
 
 ## What's not here yet
 
-Prompt versioning, pairwise/A-B eval mode, a customers/ onboarding directory, and a
-one-command cloud deploy. Those are v1.
+Record/replay/fork of a finished run, structured facts with a `query_table` tool, source
+adapters for public data (EDGAR), pairwise/A-B eval mode, a customers/ onboarding directory,
+and a one-command cloud deploy.
 
 ## License
 

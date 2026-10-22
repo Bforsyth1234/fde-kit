@@ -40,6 +40,9 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
+    from ..citations import CitationLedger
+    from ..prompts import prompt_hash
+    from ..tools import Source
     from .activities import AgentActivities
     from .models import (
         AgentRunInput,
@@ -118,11 +121,16 @@ class AgentWorkflow:
     @workflow.run
     async def run(self, inp: AgentRunInput) -> AgentRunOutput:
         system = inp.system_prompt or DEFAULT_SYSTEM
+        # sha256 of a string is deterministic, so this is safe inside the workflow and lets a
+        # history that predates prompt versioning still report what prompt it ran.
+        prompt_name = inp.prompt_name or "inline"
+        prompt_sha = inp.prompt_sha256 or prompt_hash(system)
         messages: list[dict] = [{"role": "user", "content": inp.prompt}]
         steps: list[StepRecord] = []
         in_tok = out_tok = 0
         wf_id = workflow.info().workflow_id
         extra_gated = set(inp.require_approval_for)
+        ledger = CitationLedger()
 
         for turn in range(1, inp.max_turns + 1):
             self._turn, self._phase = turn, "llm"
@@ -156,6 +164,9 @@ class AgentWorkflow:
                     input_tokens=in_tok,
                     output_tokens=out_tok,
                     code_version=CODE_VERSION,
+                    sources=[s.to_dict() for s in ledger.sources],
+                    prompt_name=prompt_name,
+                    prompt_sha256=prompt_sha,
                 )
 
             self._phase = "tools"
@@ -220,7 +231,11 @@ class AgentWorkflow:
                     heartbeat_timeout=timedelta(seconds=10),
                     retry_policy=TOOL_RETRY,
                 )
-                content = res.content
+                # Pure string rewrite of local `[#i]` markers to run-wide `[n]`; deterministic,
+                # and a no-op on histories whose tool outputs carry no sources.
+                content, numbers = ledger.add(
+                    res.content, [Source.from_dict(d) for d in res.sources]
+                )
                 summarized_from: int | None = None
                 # v2: condense long results. `patched` is sticky per run: a run that first
                 # evaluates it while replaying a history with no marker is pinned to the
@@ -256,6 +271,8 @@ class AgentWorkflow:
                     "content": content,
                     "is_error": res.is_error,
                     "from_journal": res.from_journal,
+                    "sources": res.sources,
+                    "citations": numbers,
                 }
                 if summarized_from is not None:
                     rec["summarized_from_chars"] = summarized_from
@@ -281,6 +298,9 @@ class AgentWorkflow:
             input_tokens=in_tok,
             output_tokens=out_tok,
             code_version=CODE_VERSION,
+            sources=[s.to_dict() for s in ledger.sources],
+            prompt_name=prompt_name,
+            prompt_sha256=prompt_sha,
         )
 
     # ------------------------------------------------------------------ helpers

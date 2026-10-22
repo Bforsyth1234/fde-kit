@@ -50,6 +50,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         f"stopped: {result.stopped_reason}  tokens: {result.usage.input_tokens} in / "
         f"{result.usage.output_tokens} out  total: {result.total_ms:.0f} ms"
     )
+    _print_sources(result)
     return 0
 
 
@@ -289,8 +290,32 @@ def cmd_rag(args: argparse.Namespace) -> int:
             result = Agent(reg, settings=settings).run(args.question)
             console.rule(f"[bold]{args.tenant}")
             console.print(result.output)
+            _print_sources(result)
             return 0
     return 2
+
+
+def _print_sources(result) -> None:
+    """Evidence the run saw, marking what the answer actually cited."""
+    if not result.sources:
+        return
+    cited = {s.source_id for s in result.cited}
+    console.rule("[bold]sources")
+    table = Table(show_header=True)
+    table.add_column("#", justify="right")
+    table.add_column("cited")
+    table.add_column("source")
+    table.add_column("title")
+    table.add_column("hash")
+    for n, s in enumerate(result.sources, 1):
+        mark = "[green]yes[/]" if s.source_id in cited else "-"
+        table.add_row(str(n), mark, s.uri, s.title, (s.content_hash or "")[:12])
+    console.print(table)
+    if result.fabricated_citations:
+        console.print(
+            f"[red]fabricated citations[/]: {result.fabricated_citations} "
+            "(numbers in the answer that no tool returned)"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

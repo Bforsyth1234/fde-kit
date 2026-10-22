@@ -3,7 +3,7 @@
 from .agent import Agent, AgentResult, Step
 from .config import Settings, get_settings
 from .llm import AnthropicProvider, LLMResponse, MockProvider, ToolCall, Usage, make_provider
-from .tools import ToolRegistry, ToolResult, ToolSpec
+from .tools import Source, ToolRegistry, ToolResult, ToolSpec
 from .tracing import init_tracing
 
 __all__ = [
@@ -13,6 +13,7 @@ __all__ = [
     "LLMResponse",
     "MockProvider",
     "Settings",
+    "Source",
     "Step",
     "ToolCall",
     "ToolRegistry",

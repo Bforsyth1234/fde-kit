@@ -29,9 +29,22 @@ class Settings(BaseSettings):
 
     # Agent loop
     max_turns: int = Field(default=10, description="Hard cap on LLM round-trips per run")
-    system_prompt: str = (
-        "You are a careful assistant. Use the provided tools when they help answer "
-        "precisely. When you have the answer, reply with it directly and concisely."
+    prompt: str = Field(
+        default="default",
+        description=(
+            "Name of the system prompt (prompts/<name>.md, else the packaged one) or a path to "
+            "a .md file. Its name and sha256 are recorded on every run."
+        ),
+    )
+    prompts_dir: str | None = Field(
+        default=None, description="Directory of prompt files; default ./prompts if it exists"
+    )
+    system_prompt: str | None = Field(
+        default=None,
+        description=(
+            "Raw system prompt text. Overrides `prompt` when set; recorded as prompt "
+            "'inline' with the hash of the text."
+        ),
     )
 
     # Tracing

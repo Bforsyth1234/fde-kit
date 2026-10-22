@@ -6,10 +6,10 @@ import pytest
 from evals.run_evals import GOLDEN, load_cases, main, run_case, summarise
 
 
-def test_golden_set_has_twenty_valid_cases():
+def test_golden_set_has_twenty_two_valid_cases():
     cases = load_cases(GOLDEN)
-    assert len(cases) == 20
-    assert len({c["id"] for c in cases}) == 20, "duplicate ids"
+    assert len(cases) == 22
+    assert len({c["id"] for c in cases}) == 22, "duplicate ids"
     for c in cases:
         assert "mock" in c, f"{c['id']} has no mock script; offline eval would be vacuous"
 
@@ -29,7 +29,7 @@ def test_gate_exit_codes(monkeypatch, tmp_path: Path):
     out = tmp_path / "r.json"
     assert main(["--provider", "mock", "--json", str(out)]) == 0
     data = json.loads(out.read_text())
-    assert data["summary"]["total"] == 20
+    assert data["summary"]["total"] == 22
 
     # Flip one case's mock to a wrong answer -> below a 100% threshold -> exit 1.
     cases = load_cases(GOLDEN)

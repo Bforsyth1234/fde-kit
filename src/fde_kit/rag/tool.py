@@ -13,9 +13,9 @@ Build a fresh registry per request:
 
 from __future__ import annotations
 
-from ..tools import ToolRegistry
+from ..tools import ToolRegistry, ToolResult
 from .schema import validate_tenant_id
-from .store import TenantStore
+from .store import Hit, TenantStore
 
 MAX_K = 10
 
@@ -40,15 +40,31 @@ def tenant_search_registry(
         out = registry
 
     @out.tool(name="search_documents")
-    def search_documents(query: str, k: int = 5) -> str:
+    def search_documents(query: str, k: int = 5) -> ToolResult:
         """Search this customer's documents (leases, policies, addenda) and return the most
-        relevant passages with their source. Use it for any question about terms, amounts,
-        dates or rules; quote the source you used."""
+        relevant passages, each numbered like [1], [2]. Use it for any question about terms,
+        amounts, dates or rules, and cite the passage number you relied on in your answer."""
         k = max(1, min(int(k), MAX_K))
         with store.session(tenant_id) as s:
             hits = s.cached_search(query, k=k).hits if cached else s.search(query, k=k)
         if not hits:
-            return "No matching passages."
-        return "\n\n---\n\n".join(f"[{h.source}]\n{h.content}" for h in hits)
+            return ToolResult("No matching passages.")
+        return format_passages(hits, tenant_id=tenant_id)
 
     return out
+
+
+def format_passages(hits: list[Hit], *, tenant_id: str | None = None) -> ToolResult:
+    """Number the hits with local markers `[#i]` and attach one Source per hit.
+
+    The agent loop rewrites `[#i]` to run-wide `[n]` so numbers never collide across tool
+    calls; the model only ever sees `[n]`. The Source carries chunk id, document, source URI
+    and the chunk's content hash, which is what `AgentResult.cited` and the `cites` eval
+    check resolve against. Nothing about the citation depends on the model's prose.
+    """
+    parts = [
+        f"[#{i}] {h.title or h.source} ({h.source})\n{h.content}" for i, h in enumerate(hits, 1)
+    ]
+    return ToolResult(
+        "\n\n".join(parts), sources=tuple(h.to_source(tenant_id) for h in hits)
+    )

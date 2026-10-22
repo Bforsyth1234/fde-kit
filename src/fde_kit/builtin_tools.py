@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
+import hashlib
 import operator
 
-from .tools import ToolRegistry
+from .tools import Source, ToolRegistry, ToolResult
 
 registry = ToolRegistry()
 
@@ -61,14 +62,28 @@ _KB = {
 }
 
 
+def _policy_result(key: str) -> ToolResult:
+    """The policy text as a numbered passage with its Source, so answers can cite it."""
+    text = _KB[key]
+    slug = key.replace(" ", "-")
+    src = Source(
+        source_id=f"policy:{slug}",
+        uri=f"policies/{slug}.md",
+        title=key.title(),
+        content_hash=hashlib.sha256(text.encode()).hexdigest(),
+    )
+    return ToolResult(f"[#1] {src.title} ({src.uri})\n{text}", sources=(src,))
+
+
 @registry.tool
-def lookup_policy(topic: str) -> str:
+def lookup_policy(topic: str) -> ToolResult:
     """Look up an internal policy by topic. Known topics: warranty, support hours,
-    refund policy, data retention, sla. Returns the policy text or a not-found message."""
+    refund policy, data retention, sla. Returns the policy as a numbered passage, e.g. [1],
+    or a not-found message. Cite the passage number when you use it."""
     key = topic.strip().lower()
     if key in _KB:
-        return _KB[key]
+        return _policy_result(key)
     matches = [k for k in _KB if key in k or k in key]
     if len(matches) == 1:
-        return _KB[matches[0]]
-    return f"No policy found for '{topic}'. Known topics: {', '.join(_KB)}"
+        return _policy_result(matches[0])
+    return ToolResult(f"No policy found for '{topic}'. Known topics: {', '.join(_KB)}")

@@ -106,6 +106,9 @@ CREATE TABLE IF NOT EXISTS rag_chunks (
     doc_id      UUID NOT NULL,
     ord         INT NOT NULL,
     content     TEXT NOT NULL,
+    -- sha256 of `content` at ingest, computed by the store. A citation carries it, so a reader
+    -- can prove what text a Source pointed at even after the document is re-ingested.
+    content_hash TEXT NOT NULL DEFAULT '',
     embedding   vector({EMBED_DIM}) NOT NULL,
     tsv         tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
     n_tokens    INT GENERATED ALWAYS AS (rag_token_count(content)) STORED,
@@ -126,6 +129,9 @@ CREATE TABLE IF NOT EXISTS rag_cache (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, query_hash)
 ) PARTITION BY LIST (tenant_id);
+
+-- Older schemas predate content_hash; adding on the parent cascades to every partition.
+ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS content_hash TEXT NOT NULL DEFAULT '';
 
 -- Defined on the parents, built per partition.
 CREATE INDEX IF NOT EXISTS rag_chunks_doc_idx ON rag_chunks (tenant_id, doc_id);
