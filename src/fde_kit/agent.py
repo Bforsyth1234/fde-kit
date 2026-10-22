@@ -17,12 +17,24 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .citations import CitationLedger, cited, unresolved_citations
 from .config import Settings, get_settings
 from .llm import LLMProvider, Usage, make_provider
 from .prompts import PromptRef, load_prompt
+from .record import (
+    ReplayDiverged,
+    ReplaySession,
+    RunRecorder,
+    llm_row,
+    new_run_id,
+    result_row,
+    tool_row,
+    user_row,
+    utc_now,
+)
 from .tools import Source, ToolRegistry
 from .tracing import get_tracer, tenant_scope, trace_content
 
@@ -33,9 +45,15 @@ class Step:
     assistant_text: str
     tool_calls: list[dict[str, Any]]
     tool_results: list[dict[str, Any]]
-    """Per tool call: {name, content, is_error, sources: [Source dicts], citations: [n, ...]}.
-    `citations` are the run-wide numbers assigned to that call's sources."""
+    """Per tool call: {name, content, raw_content, is_error, sources: [Source dicts],
+    citations: [n, ...]}. `content` is what the model saw (run-wide `[n]` numbers);
+    `raw_content` is the tool's own output; `citations` are the run-wide numbers assigned to
+    that call's sources."""
     latency_ms: float
+    stop_reason: str = ""
+    raw_content: list[dict[str, Any]] = field(default_factory=list)
+    """The vendor-shaped assistant content for this turn, as recorded in a run file."""
+    usage: Usage = field(default_factory=Usage)
 
 
 @dataclass
@@ -44,6 +62,7 @@ class AgentResult:
     steps: list[Step] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
     stopped_reason: str = "end_turn"
+    """"end_turn" | "max_turns" | "replay_diverged"."""
     total_ms: float = 0.0
     sources: list[Source] = field(default_factory=list)
     """Every Source any tool returned during the run, in citation order: `sources[n-1]` is [n]."""
@@ -51,6 +70,14 @@ class AgentResult:
     prompt_name: str = ""
     prompt_sha256: str = ""
     """Which model and which prompt produced this output. See fde_kit.prompts."""
+    prompt: str = ""
+    """The opening user prompt."""
+    run_id: str = ""
+    """Set when the run was recorded. See fde_kit.record."""
+    record_path: str = ""
+    diverged_at: int | None = None
+    divergence: dict[str, Any] | None = None
+    """On `stopped_reason="replay_diverged"`: the turn and {"expected", "got"} tool calls."""
 
     @property
     def tools_called(self) -> list[str]:
@@ -87,6 +114,7 @@ class Agent:
         provider: LLMProvider | None = None,
         settings: Settings | None = None,
         system_prompt: str | None = None,
+        recorder: RunRecorder | None = None,
     ):
         self.settings = settings or get_settings()
         self.registry = registry
@@ -98,32 +126,84 @@ class Agent:
         )
         self.prompt: PromptRef = resolve_prompt(self.settings, system_prompt)
         self.system_prompt = self.prompt.text
+        self.recorder = recorder
+        """An open RunRecorder every run of this agent writes to. Usually None: pass
+        `record=path` to `run` instead, which opens one per run."""
         self._tracer = get_tracer()
 
-    def run(self, prompt: str, *, max_turns: int | None = None) -> AgentResult:
+    def run(
+        self,
+        prompt: str,
+        *,
+        max_turns: int | None = None,
+        session: ReplaySession | None = None,
+        record: str | Path | None = None,
+    ) -> AgentResult:
+        """Run the loop on `prompt`.
+
+        `session` (see `fde_kit.record`) swaps in a replaying provider/registry for this run and
+        may inject a user message before a given turn (a fork). `record` opens a `RunRecorder`
+        at that path and streams every row of this run to it; replaying and recording in one
+        run is how a fork writes its own file while reading its parent's.
+        """
         max_turns = max_turns or self.settings.max_turns
+        provider = session.provider if session is not None else self.provider
+        registry = session.registry if session is not None else self.registry
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         result = AgentResult(
             output="",
-            model=self.provider.model,
+            model=provider.model,
             prompt_name=self.prompt.name,
             prompt_sha256=self.prompt.sha256,
+            prompt=prompt,
         )
         ledger = CitationLedger()
         t0 = time.perf_counter()
 
+        recorder = self.recorder
+        if record is not None:
+            recorder = RunRecorder(record, self.build_header(prompt, max_turns, session))
+        if recorder is not None:
+            result.run_id = recorder.run_id
+            result.record_path = str(recorder.path)
+        rec = _Rec(recorder)
+
         with (
-            tenant_scope(self.registry.tenant_id),
+            tenant_scope(registry.tenant_id),
             self._tracer.start_as_current_span("agent.run") as run_span,
+            rec,
         ):
             run_span.set_attribute("input.value", trace_content(prompt))
-            run_span.set_attribute("llm.model_name", self.provider.model)
+            run_span.set_attribute("llm.model_name", provider.model)
             run_span.set_attribute("llm.prompt_name", self.prompt.name)
             run_span.set_attribute("llm.prompt_sha256", self.prompt.sha256)
             run_span.set_attribute("agent.max_turns", max_turns)
+            run_span.set_attribute("agent.replay", session is not None)
+            if result.run_id:
+                run_span.set_attribute("agent.run_id", result.run_id)
+            if session is not None and session.parent_run_id:
+                run_span.set_attribute("agent.parent_run_id", session.parent_run_id)
+            rec.write(user_row(1, prompt))
 
             for turn in range(1, max_turns + 1):
-                step, final_text, usage = self._step(turn, messages, ledger)
+                if session is not None and session.inject and session.inject[0] == turn:
+                    text = session.inject[1]
+                    messages.append({"role": "user", "content": text})
+                    rec.write(user_row(turn, text))
+                set_turn = getattr(registry, "set_turn", None)
+                if callable(set_turn):
+                    set_turn(turn)
+                try:
+                    step, final_text, usage = self._step(
+                        turn, messages, ledger, provider=provider, registry=registry, rec=rec
+                    )
+                except ReplayDiverged as exc:
+                    result.stopped_reason = "replay_diverged"
+                    result.diverged_at = exc.turn
+                    result.divergence = {"expected": exc.expected, "got": exc.got}
+                    result.output = result.steps[-1].assistant_text if result.steps else ""
+                    run_span.set_attribute("agent.diverged_at", exc.turn)
+                    break
                 result.steps.append(step)
                 result.usage = result.usage + usage
                 if final_text is not None:
@@ -144,12 +224,45 @@ class Agent:
             run_span.set_attribute("agent.fabricated_citations", len(result.fabricated_citations))
             run_span.set_attribute("llm.token_count.prompt", result.usage.input_tokens)
             run_span.set_attribute("llm.token_count.completion", result.usage.output_tokens)
+            rec.close(result_row(result))
         return result
+
+    def build_header(
+        self, prompt: str, max_turns: int | None = None, session: ReplaySession | None = None
+    ) -> dict[str, Any]:
+        """The `header` row for a run of this agent (see the record format in fde_kit.record)."""
+        provider = session.provider if session is not None else self.provider
+        registry = session.registry if session is not None else self.registry
+        return {
+            "kind": "header",
+            "version": 1,
+            "run_id": new_run_id(),
+            "created_at": utc_now(),
+            "runtime": "agent",
+            "tenant_id": registry.tenant_id,
+            "model": provider.model,
+            "prompt_name": self.prompt.name,
+            "prompt_sha256": self.prompt.sha256,
+            "prompt_text": self.prompt.text,
+            "max_turns": max_turns or self.settings.max_turns,
+            "max_tokens": self.settings.max_tokens,
+            "tools": registry.names(),
+            "parent_run_id": session.parent_run_id if session is not None else None,
+            "fork_at": session.fork_at if session is not None else None,
+            "workflow_id": None,
+        }
 
     # ------------------------------------------------------------------ internals
 
     def _step(
-        self, turn: int, messages: list[dict[str, Any]], ledger: CitationLedger | None = None
+        self,
+        turn: int,
+        messages: list[dict[str, Any]],
+        ledger: CitationLedger | None = None,
+        *,
+        provider: LLMProvider | None = None,
+        registry: ToolRegistry | None = None,
+        rec: _Rec | None = None,
     ) -> tuple[Step, str | None, Usage]:
         """One LLM round-trip plus any tool executions it requested.
 
@@ -157,25 +270,38 @@ class Agent:
         """
         t0 = time.perf_counter()
         ledger = ledger if ledger is not None else CitationLedger()
+        provider = provider or self.provider
+        registry = registry or self.registry
+        rec = rec or _Rec(None)
         with self._tracer.start_as_current_span("llm.call") as span:
             span.set_attribute("llm.turn", turn)
             span.set_attribute("llm.prompt_sha256", self.prompt.sha256)
             span.set_attribute("input.value", trace_content(messages[-1]))
-            resp = self.provider.complete(
+            resp = provider.complete(
                 system=self.system_prompt,
                 messages=messages,
-                tools=self.registry.api_schemas(),
+                tools=registry.api_schemas(),
                 max_tokens=self.settings.max_tokens,
             )
             span.set_attribute("output.value", trace_content(resp.raw_content))
             span.set_attribute("llm.stop_reason", resp.stop_reason)
             span.set_attribute("llm.token_count.prompt", resp.usage.input_tokens)
             span.set_attribute("llm.token_count.completion", resp.usage.output_tokens)
+        rec.write(llm_row(turn, resp))
 
         messages.append({"role": "assistant", "content": resp.raw_content})
 
         if not resp.tool_calls:
-            step = Step(turn, resp.text, [], [], (time.perf_counter() - t0) * 1000)
+            step = Step(
+                turn,
+                resp.text,
+                [],
+                [],
+                (time.perf_counter() - t0) * 1000,
+                stop_reason=resp.stop_reason,
+                raw_content=resp.raw_content,
+                usage=resp.usage,
+            )
             return step, resp.text, resp.usage
 
         tool_result_blocks: list[dict[str, Any]] = []
@@ -184,7 +310,8 @@ class Agent:
             with self._tracer.start_as_current_span(f"tool.{call.name}") as tspan:
                 tspan.set_attribute("tool.name", call.name)
                 tspan.set_attribute("input.value", trace_content(call.input))
-                res = self.registry.execute(call.name, call.input)
+                res = registry.execute(call.name, call.input)
+                rec.write(tool_row(turn, call, res))
                 content, numbers = ledger.add(res.content, res.sources)
                 tspan.set_attribute("output.value", trace_content(content))
                 tspan.set_attribute("tool.is_error", res.is_error)
@@ -204,6 +331,7 @@ class Agent:
                 {
                     "name": call.name,
                     "content": content,
+                    "raw_content": res.content,
                     "is_error": res.is_error,
                     "sources": [s.to_dict() for s in res.sources],
                     "citations": numbers,
@@ -217,5 +345,34 @@ class Agent:
             [{"id": c.id, "name": c.name, "input": c.input} for c in resp.tool_calls],
             recorded_results,
             (time.perf_counter() - t0) * 1000,
+            stop_reason=resp.stop_reason,
+            raw_content=resp.raw_content,
+            usage=resp.usage,
         )
         return step, None, resp.usage
+
+
+class _Rec:
+    """A RunRecorder or nothing, with the same surface, so the loop has no `if recorder` noise.
+
+    Used as a context manager: on an exception inside the run it writes the error result row.
+    Closing is idempotent, so a normal exit after `close(result_row)` writes nothing more.
+    """
+
+    def __init__(self, recorder: RunRecorder | None):
+        self.recorder = recorder
+
+    def write(self, row: dict[str, Any]) -> None:
+        if self.recorder is not None:
+            self.recorder.write(row)
+
+    def close(self, row: dict[str, Any]) -> None:
+        if self.recorder is not None:
+            self.recorder.close(row)
+
+    def __enter__(self) -> _Rec:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.recorder is not None:
+            self.recorder.__exit__(exc_type, exc, tb)
