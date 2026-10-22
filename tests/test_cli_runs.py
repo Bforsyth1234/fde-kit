@@ -205,7 +205,7 @@ def test_loader_rejects_bad_files(tmp_path):
         cli._load_run_file(bad_version)
     bad_json = tmp_path / "j.jsonl"
     bad_json.write_text(json.dumps(_header("r-1", "x")) + "\n{oops\n")
-    with pytest.raises(cli.RunFileError, match="invalid JSON"):
+    with pytest.raises(cli.RunFileError, match="not JSON"):
         cli._load_run_file(bad_json)
 
 
