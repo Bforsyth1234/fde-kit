@@ -30,11 +30,26 @@ console = Console()
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    _check_run_flags(args)
     settings = get_settings()
     init_tracing(settings)
-    agent = Agent(registry, settings=settings)
-    result = agent.run(args.prompt)
+    if args.replay or args.fork:
+        return _cmd_run_from_record(args, settings)
 
+    agent = Agent(registry, settings=settings)
+    if args.record:
+        result = agent.run(args.prompt, record=Path(args.record))
+    else:
+        if settings.record_runs:
+            _attach_recorder(agent, args.prompt, settings)
+        result = agent.run(args.prompt)
+    _print_run(result)
+    if result.record_path:
+        console.print(f"run_id {result.run_id} saved to {result.record_path}")
+    return 0
+
+
+def _print_run(result) -> None:
     console.rule("[bold]answer")
     console.print(result.output)
     console.rule("[bold]run")
@@ -53,7 +68,137 @@ def cmd_run(args: argparse.Namespace) -> int:
         f"{result.usage.output_tokens} out  total: {result.total_ms:.0f} ms"
     )
     _print_sources(result)
+
+
+# --- run/replay flags (2-D)
+def _check_run_flags(args: argparse.Namespace) -> None:
+    """Argparse-level errors (exit 2) for flag combinations the parser cannot express."""
+    parser: argparse.ArgumentParser = args.parser
+    if args.record and (args.replay or args.fork):
+        parser.error("--record cannot be combined with --replay or --fork")
+    if args.replay and args.fork:
+        parser.error("--replay and --fork are mutually exclusive")
+    if args.at is not None and not args.fork:
+        parser.error("--at only makes sense with --fork")
+    if args.live_llm and not args.replay:
+        parser.error("--live-llm only makes sense with --replay")
+    if args.fork and args.at is None:
+        parser.error("--fork requires --at N")
+    if args.fork and not args.prompt:
+        parser.error("--fork requires an instruction (the positional prompt)")
+    if not args.replay and not args.fork and not args.prompt:
+        parser.error("a prompt is required (or --replay PATH / --fork PATH)")
+
+
+def _attach_recorder(agent: Agent, prompt: str, settings, session=None) -> Path:
+    """Open a RunRecorder at `<runs_dir>/<run_id>.jsonl` on `agent` for its next run.
+
+    The run_id comes from the header, so the file is named before the run starts and no rename
+    is needed afterwards.
+    """
+    from .record import RunRecorder, default_runs_dir
+
+    header = agent.build_header(prompt, None, session)
+    path = default_runs_dir(settings) / f"{header['run_id']}.jsonl"
+    agent.recorder = RunRecorder(path, header)
+    return path
+
+
+def _live_provider(settings):
+    from .llm import make_provider
+
+    return make_provider(
+        settings.provider,
+        settings.model,
+        api_key=settings.anthropic_api_key,
+        workspace_id=settings.anthropic_workspace_id,
+    )
+
+
+def _divergence_line(result) -> str:
+    from .record import ReplayDiverged
+
+    div = result.divergence or {}
+    return str(ReplayDiverged(result.diverged_at or 0, div.get("expected"), div.get("got")))
+
+
+def _print_divergence(result) -> int:
+    from rich.markup import escape
+
+    console.print(f"[red]{escape(_divergence_line(result))}[/]")
+    return 3
+
+
+def _first_difference(recorded: str, replayed: str) -> str:
+    """`identical`, or `differs` plus the first line that is not the same."""
+    if recorded == replayed:
+        return "identical"
+    a, b = recorded.splitlines(), replayed.splitlines()
+    for n, (x, y) in enumerate(zip(a, b, strict=False), 1):
+        if x != y:
+            return f"differs at line {n}:\n  recorded: {x}\n  replayed: {y}"
+    n = min(len(a), len(b)) + 1
+    extra = (a if len(a) > len(b) else b)[n - 1] if max(len(a), len(b)) >= n else ""
+    which = "recorded" if len(a) > len(b) else "replayed"
+    return f"differs at line {n}:\n  only in {which}: {extra}"
+
+
+def _cmd_run_from_record(args: argparse.Namespace, settings) -> int:
+    from rich.markup import escape
+
+    from .record import (
+        RunRecord,
+        fork_session,
+        live_llm_session,
+        recorded_prompt,
+        replay_session,
+    )
+
+    path = Path(args.replay or args.fork)
+    try:
+        record = RunRecord.load(path)
+    except (ValueError, OSError) as exc:
+        console.print(f"[red]{escape(str(exc))}[/]")
+        return 2
+    prompt = recorded_prompt(record)
+    pinned = record.header.get("prompt_text")
+
+    if args.fork:
+        live = _live_provider(settings)
+        session = fork_session(record, registry, live, at=args.at, instruction=args.prompt)
+        agent = Agent(registry, provider=live, settings=settings, system_prompt=pinned)
+        _attach_recorder(agent, prompt, settings, session)
+        result = agent.run(prompt, session=session)
+        _print_run(result)
+        if result.stopped_reason == "replay_diverged":
+            return _print_divergence(result)
+        console.print(f"forked {record.run_id} at turn {args.at} -> {result.record_path}")
+        return 0
+
+    if args.live_llm:
+        session = live_llm_session(record, registry, _live_provider(settings))
+    else:
+        session = replay_session(record, registry)
+    agent = Agent(registry, provider=session.provider, settings=settings, system_prompt=pinned)
+    result = agent.run(prompt, session=session)
+    if result.stopped_reason == "replay_diverged":
+        return _print_divergence(result)
+    recorded_out = (record.result or {}).get("output", "")
+    console.rule("[bold]recorded")
+    console.print(recorded_out, markup=False)
+    console.rule("[bold]replayed" + (" (live llm)" if args.live_llm else ""))
+    console.print(result.output, markup=False)
+    console.rule("[bold]run")
+    console.print(
+        f"stopped: {result.stopped_reason}  turns: {result.turns}  "
+        f"total: {result.total_ms:.0f} ms"
+    )
+    _print_sources(result)
+    console.print(_first_difference(recorded_out, result.output), markup=False)
     return 0
+
+
+# --- end run/replay flags (2-D)
 
 
 def cmd_tools(_: argparse.Namespace) -> int:
@@ -314,10 +459,13 @@ def cmd_rag(args: argparse.Namespace) -> int:
         if args.rag_cmd == "ask":
             init_tracing(settings)
             reg = rag.tenant_search_registry(store, args.tenant)
-            result = Agent(reg, settings=settings).run(args.question)
+            agent = Agent(reg, settings=settings)
+            _attach_recorder(agent, args.question, settings)  # always records (design doc)
+            result = agent.run(args.question)
             console.rule(f"[bold]{args.tenant}")
             console.print(result.output)
             _print_sources(result)
+            console.print(f"recorded {result.record_path}")
             return 0
     return 2
 
@@ -586,8 +734,17 @@ def main(argv: list[str] | None = None) -> int:
     # --- end durable export (1-B)
 
     r = sub.add_parser("run", help="run one prompt through the agent")
-    r.add_argument("prompt")
-    r.set_defaults(fn=cmd_run)
+    r.add_argument("prompt", nargs="?", help="the prompt; the fork instruction with --fork")
+    # --- run/replay flags (2-D)
+    r.add_argument("--record", metavar="PATH", help="record this run to PATH")
+    r.add_argument("--replay", metavar="PATH", help="replay a recorded run exactly")
+    r.add_argument(
+        "--live-llm", action="store_true", help="with --replay: tools from the record, model live"
+    )
+    r.add_argument("--fork", metavar="PATH", help="fork a recorded run after turn --at")
+    r.add_argument("--at", type=int, metavar="N", help="with --fork: replay turns 1..N exactly")
+    r.set_defaults(fn=cmd_run, parser=r)
+    # --- end run/replay flags (2-D)
 
     t = sub.add_parser("tools", help="list registered tools")
     t.set_defaults(fn=cmd_tools)
