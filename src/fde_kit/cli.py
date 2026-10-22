@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.table import Table
@@ -318,6 +321,221 @@ def _print_sources(result) -> None:
         )
 
 
+# --- runs (1-C)
+
+
+class RunFileError(ValueError):
+    """A run file that is not the §2 format (missing/invalid header, bad JSON)."""
+
+
+def _load_run_file(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Read one `runs/<run_id>.jsonl` file: header first, then every other row in order.
+
+    Blank lines are skipped. Raises RunFileError if the first row is not a valid header.
+    """
+    # TODO(integrator): swap for RunRecord.load once record.py lands.
+    header: dict[str, Any] | None = None
+    rows: list[dict[str, Any]] = []
+    with open(path, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RunFileError(f"{path}:{lineno}: invalid JSON ({exc.msg})") from exc
+            if not isinstance(obj, dict):
+                raise RunFileError(f"{path}:{lineno}: expected a JSON object")
+            if header is None:
+                if obj.get("kind") != "header" or not obj.get("run_id"):
+                    raise RunFileError(f"{path}: first line must be a header row with a run_id")
+                if obj.get("version") != 1:
+                    raise RunFileError(f"{path}: unsupported record version {obj.get('version')!r}")
+                header = obj
+            else:
+                rows.append(obj)
+    if header is None:
+        raise RunFileError(f"{path}: empty file (no header row)")
+    return header, rows
+
+
+def _runs_dir(args: argparse.Namespace) -> Path:
+    if getattr(args, "dir", None):
+        return Path(args.dir)
+    # TODO(integrator): settings.runs_dir
+    return Path(os.environ.get("FDE_RUNS_DIR", "runs"))
+
+
+def _scan_runs(dir_: Path) -> tuple[list[tuple[Path, dict, list[dict]]], list[tuple[Path, str]]]:
+    """Every *.jsonl in `dir_`: (path, header, rows) when readable, else (path, why)."""
+    good: list[tuple[Path, dict, list[dict]]] = []
+    bad: list[tuple[Path, str]] = []
+    if not dir_.is_dir():
+        return good, bad
+    for path in sorted(dir_.glob("*.jsonl")):
+        try:
+            header, rows = _load_run_file(path)
+        except (RunFileError, OSError, UnicodeDecodeError) as exc:
+            bad.append((path, str(exc)))
+            continue
+        good.append((path, header, rows))
+    return good, bad
+
+
+def _result_row(rows: list[dict]) -> dict | None:
+    for row in reversed(rows):
+        if row.get("kind") == "result":
+            return row
+    return None
+
+
+def _parent_label(header: dict) -> str:
+    parent = header.get("parent_run_id")
+    if not parent:
+        return "-"
+    return f"{parent}@{header.get('fork_at')}"
+
+
+def _prompt_label(header: dict) -> str:
+    sha = str(header.get("prompt_sha256") or "")
+    return f"{header.get('prompt_name') or '-'}@{sha[:12]}"
+
+
+def _find_run(
+    runs: list[tuple[Path, dict, list[dict]]], run_id: str
+) -> tuple[Path, dict, list[dict]] | None:
+    for entry in runs:
+        path, header, _ = entry
+        if header.get("run_id") == run_id or path.stem == run_id:
+            return entry
+    return None
+
+
+def cmd_runs(args: argparse.Namespace) -> int:
+    dir_ = _runs_dir(args)
+    runs, bad = _scan_runs(dir_)
+
+    if args.runs_cmd == "list":
+        if not runs and not bad:
+            console.print(f"no runs in {dir_}")
+            return 0
+        runs.sort(key=lambda e: str(e[1].get("created_at") or ""), reverse=True)
+        table = Table(title=f"runs in {dir_}", show_header=True)
+        for col in (
+            "run_id", "created_at", "runtime", "tenant", "model", "prompt", "turns",
+            "stopped", "parent",
+        ):
+            table.add_column(col)
+        for _, header, rows in runs:
+            result = _result_row(rows)
+            turns = str(result.get("turns", "-")) if result else "-"
+            stopped = str(result.get("stopped_reason") or "-") if result else "incomplete"
+            table.add_row(
+                str(header.get("run_id")),
+                str(header.get("created_at") or "-"),
+                str(header.get("runtime") or "-"),
+                str(header.get("tenant_id") or "-"),
+                str(header.get("model") or "-"),
+                _prompt_label(header),
+                turns,
+                stopped,
+                _parent_label(header),
+            )
+        for path, _why in bad:
+            table.add_row(path.stem, "-", "-", "-", "-", "-", "-", "[red]unreadable[/]", "-")
+        console.print(table)
+        return 0
+
+    if args.runs_cmd == "tree":
+        target = _find_run(runs, args.run_id)
+        if target is None:
+            console.print(f"[red]unknown run[/] {args.run_id} (looked in {dir_})")
+            return 1
+        by_id = {h["run_id"]: (p, h, r) for p, h, r in runs}
+        children: dict[str, list[str]] = {}
+        for _, h, _ in runs:
+            parent = h.get("parent_run_id")
+            if parent:
+                children.setdefault(parent, []).append(h["run_id"])
+
+        # Walk up to the root (stop on a missing parent or a cycle).
+        chain: list[str] = []
+        cur: str | None = target[1]["run_id"]
+        seen: set[str] = set()
+        while cur and cur in by_id and cur not in seen:
+            seen.add(cur)
+            chain.append(cur)
+            cur = by_id[cur][1].get("parent_run_id")
+        chain.reverse()
+        missing_parent = cur if cur and cur not in by_id else None
+
+        def label(rid: str) -> str:
+            h = by_id[rid][1]
+            at = h.get("fork_at")
+            mark = "  [bold]<-- this run[/]" if rid == target[1]["run_id"] else ""
+            fork = f" (fork of {h.get('parent_run_id')} at turn {at})" if at is not None else ""
+            return f"{rid}  {h.get('created_at') or ''}{fork}{mark}"
+
+        depth = 0
+        if missing_parent:
+            console.print(f"{missing_parent}  [dim](parent not in {dir_})[/]")
+            depth = 1
+        for rid in chain:
+            console.print("  " * depth + label(rid), soft_wrap=True)
+            depth += 1
+
+        def walk(rid: str, d: int) -> None:
+            for child in sorted(
+                children.get(rid, []), key=lambda c: str(by_id[c][1].get("created_at") or "")
+            ):
+                if child in seen:
+                    continue
+                seen.add(child)
+                console.print("  " * d + label(child), soft_wrap=True)
+                walk(child, d + 1)
+
+        walk(target[1]["run_id"], depth)
+        return 0
+
+    if args.runs_cmd == "show":
+        target = _find_run(runs, args.run_id)
+        if target is None:
+            console.print(f"[red]unknown run[/] {args.run_id} (looked in {dir_})")
+            return 1
+        path, header, rows = target
+        console.rule(f"[bold]{header['run_id']}  ({path})")
+        for key, value in header.items():
+            if key == "prompt_text":
+                continue
+            console.print(f"{key}: {json.dumps(value) if not isinstance(value, str) else value}")
+        console.rule("[bold]rows")
+        for row in rows:
+            console.print(_describe_row(row))
+        return 0
+    return 2
+
+
+def _describe_row(row: dict) -> str:
+    kind = row.get("kind", "?")
+    turn = row.get("turn", "-")
+    head = f"{turn!s:>4}  {kind:<6} "
+    if kind == "llm":
+        names = ", ".join(tc.get("name", "?") for tc in row.get("tool_calls") or []) or "-"
+        return head + f"stop_reason={row.get('stop_reason')}  tools: {names}"
+    if kind == "tool":
+        n = len(row.get("sources") or [])
+        return head + f"{row.get('name')}  is_error={row.get('is_error')}  sources={n}"
+    if kind == "user":
+        text = " ".join(str(row.get("text", "")).split())[:60]
+        return head + f"{row.get('actor', 'user')}: {text}"
+    if kind == "result":
+        out = " ".join(str(row.get("output", "")).split())[:80]
+        n = len(row.get("cited") or [])
+        return f"   -  result stopped={row.get('stopped_reason')}  cited={n}  {out}"
+    return head + json.dumps({k: v for k, v in row.items() if k not in ("kind", "turn")})[:80]
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="fde", description="fde-kit command line")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -398,6 +616,19 @@ def main(argv: list[str] | None = None) -> int:
     ra.add_argument("--url")
     ra.add_argument("--embedder")
     rg.set_defaults(fn=cmd_rag)
+
+    # --- runs (1-C)
+    ru = sub.add_parser("runs", help="inspect recorded runs (runs/*.jsonl)")
+    rusub = ru.add_subparsers(dest="runs_cmd", required=True)
+    rl = rusub.add_parser("list", help="table of every recorded run, newest first")
+    rl.add_argument("--dir", help="runs directory (default: $FDE_RUNS_DIR or ./runs)")
+    rt = rusub.add_parser("tree", help="lineage of one run: parents above, forks below")
+    rt.add_argument("run_id")
+    rt.add_argument("--dir")
+    rsh = rusub.add_parser("show", help="header and one line per recorded row")
+    rsh.add_argument("run_id")
+    rsh.add_argument("--dir")
+    ru.set_defaults(fn=cmd_runs)
 
     args = p.parse_args(argv)
     return args.fn(args)
