@@ -33,10 +33,9 @@ import pytest
 
 temporalio = pytest.importorskip("temporalio")
 from temporalio.testing import WorkflowEnvironment  # noqa: E402
-from temporalio.worker import Replayer  # noqa: E402
 
 from fde_kit.durable.client import history_summary, start_run, status  # noqa: E402
-from fde_kit.durable.worker import run_worker  # noqa: E402
+from fde_kit.durable.worker import replayer, run_worker  # noqa: E402
 from fde_kit.durable.workflow import CODE_VERSION, AgentWorkflow  # noqa: E402
 from fde_kit.llm import MockProvider  # noqa: E402
 from tests.fixtures.workflow_v1 import AgentWorkflow as AgentWorkflowV1  # noqa: E402
@@ -194,8 +193,7 @@ def test_v1_histories_replay_through_v2_code(env, tmp_path: Path):
         await w
 
         # Replay that history through the live (v2) workflow class.
-        replayer = Replayer(workflows=[AgentWorkflow])
-        await replayer.replay_workflow(hist)  # raises on non-determinism
+        await replayer([AgentWorkflow]).replay_workflow(hist)  # raises on non-determinism
         return hist
 
     hist = loop.run_until_complete(go())

@@ -58,6 +58,22 @@ class Settings(BaseSettings):
         ),
     )
 
+    payload_key: str | None = Field(
+        default=None,
+        description=(
+            "Base64 32-byte key. Encrypts every Temporal payload (prompts, tool I/O, results) "
+            "and the journal's content column with AES-256-GCM, so the Temporal server, its "
+            "UI, and the journal table hold ciphertext. Generate one with `fde keygen`."
+        ),
+    )
+    payload_keys: str | None = Field(
+        default=None,
+        description=(
+            "Rotation form: 'id=base64,id=base64,...', first is current. Overrides "
+            "FDE_PAYLOAD_KEY. Keep old ids until every run encrypted under them is gone."
+        ),
+    )
+
     # Multi-tenant retrieval
     rag_url: str | None = Field(
         default=None,
