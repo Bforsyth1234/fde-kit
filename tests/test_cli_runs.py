@@ -193,7 +193,7 @@ def test_show_unknown_id_exits_1(runs_dir, capsys):
 def test_loader_rejects_bad_files(tmp_path):
     empty = tmp_path / "empty.jsonl"
     empty.write_text("\n\n")
-    with pytest.raises(cli.RunFileError, match="empty file"):
+    with pytest.raises(cli.RunFileError, match="empty"):
         cli._load_run_file(empty)
     no_header = tmp_path / "nh.jsonl"
     no_header.write_text('{"kind":"user","turn":1}\n')

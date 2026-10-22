@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -354,42 +353,20 @@ class RunFileError(ValueError):
 
 
 def _load_run_file(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Read one `runs/<run_id>.jsonl` file: header first, then every other row in order.
+    """Read one `runs/<run_id>.jsonl` file via `RunRecord.load`; RunFileError on a bad file."""
+    from .record import RunRecord
 
-    Blank lines are skipped. Raises RunFileError if the first row is not a valid header.
-    """
-    # TODO(integrator): swap for RunRecord.load once record.py lands.
-    header: dict[str, Any] | None = None
-    rows: list[dict[str, Any]] = []
-    with open(path, encoding="utf-8") as f:
-        for lineno, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise RunFileError(f"{path}:{lineno}: invalid JSON ({exc.msg})") from exc
-            if not isinstance(obj, dict):
-                raise RunFileError(f"{path}:{lineno}: expected a JSON object")
-            if header is None:
-                if obj.get("kind") != "header" or not obj.get("run_id"):
-                    raise RunFileError(f"{path}: first line must be a header row with a run_id")
-                if obj.get("version") != 1:
-                    raise RunFileError(f"{path}: unsupported record version {obj.get('version')!r}")
-                header = obj
-            else:
-                rows.append(obj)
-    if header is None:
-        raise RunFileError(f"{path}: empty file (no header row)")
-    return header, rows
+    try:
+        rec = RunRecord.load(path)
+    except ValueError as exc:
+        raise RunFileError(str(exc)) from exc
+    return rec.header, rec.rows
 
 
 def _runs_dir(args: argparse.Namespace) -> Path:
     if getattr(args, "dir", None):
         return Path(args.dir)
-    # TODO(integrator): settings.runs_dir
-    return Path(os.environ.get("FDE_RUNS_DIR", "runs"))
+    return Path(get_settings().runs_dir)
 
 
 def _scan_runs(dir_: Path) -> tuple[list[tuple[Path, dict, list[dict]]], list[tuple[Path, str]]]:

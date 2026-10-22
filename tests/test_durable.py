@@ -415,11 +415,8 @@ from fde_kit.durable.export import export_run, run_id_for  # noqa: E402
 
 
 def test_export_then_replay(env, tmp_path: Path):
-    """The standard two-tool mock run exports to a section-2 record file.
-
-    TODO(integrator): replay via fde_kit.record.replay_session once record.py lands, and assert
-    the replayed output equals the result row's output with stopped_reason == "end_turn".
-    """
+    """The standard two-tool mock run exports to a section-2 record file, and that file
+    replays byte-identical through the in-process Agent: both runtimes, one record."""
     e, loop = env
 
     async def go():
@@ -476,3 +473,18 @@ def test_export_then_replay(env, tmp_path: Path):
     assert result["output"] == out.output
     assert result["stopped_reason"] == "end_turn" and result["turns"] == out.turns
     assert result["cited"] == [] and result["fabricated_citations"] == []
+
+    # Round trip: the exported durable run replays through the in-process Agent, byte-identical,
+    # with no worker, no dev server and no real tool execution.
+    from fde_kit import Agent, Settings
+    from fde_kit.builtin_tools import registry as builtin
+    from fde_kit.record import RunRecord, recorded_prompt, replay_session
+
+    rec = RunRecord.load(path)
+    session = replay_session(rec, builtin)
+    replayed = Agent(
+        builtin, provider=session.provider, settings=Settings(provider="mock", otel_enabled=False)
+    ).run(recorded_prompt(rec), session=session)
+    assert replayed.stopped_reason == "end_turn"
+    assert replayed.output == out.output
+    assert replayed.tools_called == out.tools_called

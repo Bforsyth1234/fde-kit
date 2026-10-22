@@ -18,7 +18,6 @@ Rows are plain dicts written by a local `_write_jsonl`; the integrator swaps in
 from __future__ import annotations
 
 import hashlib
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -47,10 +46,14 @@ def run_id_for(workflow_id: str) -> str:
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> Path:
+    """Write header + rows with the same serializer `RunRecorder` uses, so an exported file and
+    a recorded one are byte-compatible line for line."""
+    from ..record import _dumps
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+            f.write(_dumps(row) + "\n")
     return path
 
 
@@ -241,6 +244,6 @@ async def export_run(
     )
 
     if out is None:
-        base = runs_dir or Path(getattr(get_settings(), "runs_dir", "runs") or "runs")
+        base = runs_dir or Path(get_settings().runs_dir)
         out = Path(base) / f"{run_id}.jsonl"
     return _write_jsonl(Path(out), rows)
