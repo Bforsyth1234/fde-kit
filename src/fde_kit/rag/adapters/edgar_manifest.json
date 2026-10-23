@@ -1,0 +1,218 @@
+{
+  "description": "Pinned EDGAR corpus for fde-kit PR 4. documents: url -> sha256 of the full extracted text (html_to_text). Written by python -m fde_kit.rag.adapters.capture.",
+  "captured": "2026-10-23",
+  "fixture_chars": 40000,
+  "filings": [
+    {
+      "tenant": "pharma-a",
+      "ticker": "PFE",
+      "cik": "0000078003",
+      "company": "PFIZER INC",
+      "accession": "0000078003-20-000014",
+      "form": "10-K",
+      "fiscal_year": 2019,
+      "period_end": "2019-12-31",
+      "filed": "2020-02-27",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/78003/000007800320000014/pfe-12312019x10kshell.htm": "a0aae5ce60c06326fa2068436ad870ebc6750b33e1947fb9523fe16d9f4e1299",
+        "https://www.sec.gov/Archives/edgar/data/78003/000007800320000014/pfe-exhibit13x12312019.htm": "019f166c89d43f9cab3c48a7e0647f123fd4654fe67d0a2b976a2dd8d1220dcc"
+      }
+    },
+    {
+      "tenant": "pharma-a",
+      "ticker": "PFE",
+      "cik": "0000078003",
+      "company": "PFIZER INC",
+      "accession": "0000078003-21-000038",
+      "form": "10-K",
+      "fiscal_year": 2020,
+      "period_end": "2020-12-31",
+      "filed": "2021-02-25",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/78003/000007800321000038/pfe-20201231.htm": "66338a16e2a769ffb9b6b45c732723c0826aa1271aa92d55128c7d05c1ef48bd"
+      }
+    },
+    {
+      "tenant": "pharma-a",
+      "ticker": "PFE",
+      "cik": "0000078003",
+      "company": "PFIZER INC",
+      "accession": "0000078003-22-000027",
+      "form": "10-K",
+      "fiscal_year": 2021,
+      "period_end": "2021-12-31",
+      "filed": "2022-02-24",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/78003/000007800322000027/pfe-20211231.htm": "a504194534cde40866843d4dcf94be1f60f64313cf3a5a967fea934771d15906"
+      }
+    },
+    {
+      "tenant": "pharma-a",
+      "ticker": "GILD",
+      "cik": "0000882095",
+      "company": "GILEAD SCIENCES, INC.",
+      "accession": "0000882095-20-000006",
+      "form": "10-K",
+      "fiscal_year": 2019,
+      "period_end": "2019-12-31",
+      "filed": "2020-02-25",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/882095/000088209520000006/a2019form10-k.htm": "a30733fa7d8a8a72f428de58a86a40ed730c30e3260f44c9a66e39eb0ed8713c"
+      }
+    },
+    {
+      "tenant": "pharma-a",
+      "ticker": "GILD",
+      "cik": "0000882095",
+      "company": "GILEAD SCIENCES, INC.",
+      "accession": "0000882095-21-000008",
+      "form": "10-K",
+      "fiscal_year": 2020,
+      "period_end": "2020-12-31",
+      "filed": "2021-02-25",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/882095/000088209521000008/gild-20201231.htm": "bc62bf8ef7700245568db78d3403b96056b39588e7905645c9fa6161b1c88504"
+      }
+    },
+    {
+      "tenant": "pharma-a",
+      "ticker": "GILD",
+      "cik": "0000882095",
+      "company": "GILEAD SCIENCES, INC.",
+      "accession": "0000882095-22-000007",
+      "form": "10-K",
+      "fiscal_year": 2021,
+      "period_end": "2021-12-31",
+      "filed": "2022-02-23",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/882095/000088209522000007/gild-20211231.htm": "3df7e2ed7206f6a1d131b13ba445f28515c156de5b33d6b1d456bae50bff19ff"
+      }
+    },
+    {
+      "tenant": "pharma-a",
+      "ticker": "VRTX",
+      "cik": "0000875320",
+      "company": "VERTEX PHARMACEUTICALS INC / MA",
+      "accession": "0000875320-20-000007",
+      "form": "10-K",
+      "fiscal_year": 2019,
+      "period_end": "2019-12-31",
+      "filed": "2020-02-13",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/875320/000087532020000007/a201910k-main.htm": "b5025f01d94145dfdeddf957c37c3a30242766467a3cb725d8e0a5c7c5b55c8a"
+      }
+    },
+    {
+      "tenant": "pharma-a",
+      "ticker": "VRTX",
+      "cik": "0000875320",
+      "company": "VERTEX PHARMACEUTICALS INC / MA",
+      "accession": "0000875320-21-000006",
+      "form": "10-K",
+      "fiscal_year": 2020,
+      "period_end": "2020-12-31",
+      "filed": "2021-02-11",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/875320/000087532021000006/vrtx-20201231.htm": "0e02ddc86ab47409061235d226b9e246cb4f73df8aa091980204881fe12445fc"
+      }
+    },
+    {
+      "tenant": "pharma-a",
+      "ticker": "VRTX",
+      "cik": "0000875320",
+      "company": "VERTEX PHARMACEUTICALS INC / MA",
+      "accession": "0000875320-22-000007",
+      "form": "10-K",
+      "fiscal_year": 2021,
+      "period_end": "2021-12-31",
+      "filed": "2022-02-09",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/875320/000087532022000007/vrtx-20211231.htm": "0d8ea756457eb4c9fb25e0233b077a12815ee82c1f4abdbb39b3b14ad4b5ee74"
+      }
+    },
+    {
+      "tenant": "pharma-b",
+      "ticker": "MRNA",
+      "cik": "0001682852",
+      "company": "Moderna, Inc.",
+      "accession": "0001682852-20-000006",
+      "form": "10-K",
+      "fiscal_year": 2019,
+      "period_end": "2019-12-31",
+      "filed": "2020-02-27",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/1682852/000168285220000006/moderna10-k12312019.htm": "3c9bd006b772ceea7c17d9aa4f1884b907eccc2d2ae365e7d64e262f4f1c8a3a"
+      }
+    },
+    {
+      "tenant": "pharma-b",
+      "ticker": "MRNA",
+      "cik": "0001682852",
+      "company": "Moderna, Inc.",
+      "accession": "0001682852-21-000006",
+      "form": "10-K",
+      "fiscal_year": 2020,
+      "period_end": "2020-12-31",
+      "filed": "2021-02-26",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/1682852/000168285221000006/mrna-20201231.htm": "b1df1e0df09a0c76f48987d046d098c4485be9272a1f2f7c2dbde4355336b147"
+      }
+    },
+    {
+      "tenant": "pharma-b",
+      "ticker": "MRNA",
+      "cik": "0001682852",
+      "company": "Moderna, Inc.",
+      "accession": "0001682852-22-000012",
+      "form": "10-K",
+      "fiscal_year": 2021,
+      "period_end": "2021-12-31",
+      "filed": "2022-02-25",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/1682852/000168285222000012/mrna-20211231.htm": "afffb2ec1787bec2d15e401452a343b44061067298f788daa675d6580a9cf2de"
+      }
+    },
+    {
+      "tenant": "pharma-b",
+      "ticker": "REGN",
+      "cik": "0000872589",
+      "company": "REGENERON PHARMACEUTICALS, INC.",
+      "accession": "0001532176-20-000008",
+      "form": "10-K",
+      "fiscal_year": 2019,
+      "period_end": "2019-12-31",
+      "filed": "2020-02-07",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/872589/000153217620000008/regn-123119x10k.htm": "15c6db6c6e9495b57a1c2fc1cc910f4ab6367d97e056059b0dd3df1b058cfc12"
+      }
+    },
+    {
+      "tenant": "pharma-b",
+      "ticker": "REGN",
+      "cik": "0000872589",
+      "company": "REGENERON PHARMACEUTICALS, INC.",
+      "accession": "0001804220-21-000008",
+      "form": "10-K",
+      "fiscal_year": 2020,
+      "period_end": "2020-12-31",
+      "filed": "2021-02-08",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/872589/000180422021000008/regn-20201231.htm": "ce1924437461c3f5143db83afaef238feabf0658687a8f70571f341ebe157af8"
+      }
+    },
+    {
+      "tenant": "pharma-b",
+      "ticker": "REGN",
+      "cik": "0000872589",
+      "company": "REGENERON PHARMACEUTICALS, INC.",
+      "accession": "0001804220-22-000007",
+      "form": "10-K",
+      "fiscal_year": 2021,
+      "period_end": "2021-12-31",
+      "filed": "2022-02-07",
+      "documents": {
+        "https://www.sec.gov/Archives/edgar/data/872589/000180422022000007/regn-20211231.htm": "4ebff3820c77252e40fed7167830792bdf7b5b45440995937029945514b2675c"
+      }
+    }
+  ]
+}
