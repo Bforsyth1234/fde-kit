@@ -108,6 +108,18 @@ class Settings(BaseSettings):
         default="bge", description="'bge' (BAAI/bge-small-en-v1.5 via fastembed) or 'hash'"
     )
 
+    # Source adapters (PR 4)
+    edgar_user_agent: str = Field(
+        default="",
+        description=(
+            "Contact SEC requires in the User-Agent for sec.gov requests, e.g. "
+            "'my-app you@example.com'. Required online; never logged or written to disk."
+        ),
+    )
+    edgar_cache_dir: str = Field(
+        default=".fde/edgar-cache", description="On-disk cache of sec.gov GET responses"
+    )
+
     # Evals
     eval_pass_threshold: float = Field(
         default=0.85, description="CI fails if pass rate drops below this"
