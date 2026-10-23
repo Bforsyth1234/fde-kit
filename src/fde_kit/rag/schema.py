@@ -19,9 +19,9 @@ silently runs as a superuser would pass every functional test and isolate nothin
 
 Beyond row visibility:
 
-- Documents, chunks and cache are partitioned by tenant, one partition each, created by
-  `create_tenant`. Shared indexes make a query's cost depend on other tenants' data, which is
-  observable as latency; tests/test_rag_isolation.py measures it.
+- Documents, chunks, cache and the fact tables are partitioned by tenant, one partition each,
+  created by `create_tenant`. Shared indexes make a query's cost depend on other tenants' data,
+  which is observable as latency; tests/test_rag_isolation.py measures it.
 - Ids are random UUIDs, not shared sequences.
 - The app role never logs bound parameters (document text, questions) to the server log.
 - `check_posture` also rejects any permissive policy other than tenant_isolation as written
@@ -48,7 +48,16 @@ OWNER_ROLE = "fde_rag_owner"
 APP_ROLE = "fde_rag_app"
 TENANT_SETTING = "app.tenant_id"
 
-TENANT_TABLES = ("rag_tenants", "rag_documents", "rag_chunks", "rag_cache")
+TENANT_TABLES = (
+    "rag_tenants",
+    "rag_documents",
+    "rag_chunks",
+    "rag_cache",
+    "rag_entities",
+    "rag_extraction_jobs",
+    "rag_facts",
+    "rag_dictionary",
+)
 META_TABLE = "rag_meta"
 
 _TENANT_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
@@ -89,9 +98,26 @@ CREATE TABLE IF NOT EXISTS rag_documents (
     title       TEXT NOT NULL DEFAULT '',
     metadata    JSONB NOT NULL DEFAULT '{{}}'::jsonb,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Provenance (PR 3). A source is versioned: a re-ingest with a different sha256 inserts
+    -- version max+1 and points the old row's superseded_by at it. Old rows stay so that an old
+    -- citation's doc_id + content_hash still resolves; their chunks do not (see store.py).
+    content_hash  TEXT NOT NULL DEFAULT '',
+    version       INT NOT NULL DEFAULT 1,
+    fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    superseded_by UUID,
+    body          TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (tenant_id, doc_id),
-    UNIQUE (tenant_id, source)
+    CONSTRAINT rag_documents_source_version_key UNIQUE (tenant_id, source, version)
 ) PARTITION BY LIST (tenant_id);
+
+-- Older schemas predate the provenance columns; adding on the parent cascades to every
+-- partition. The unique-constraint swap (tenant_id, source) -> (tenant_id, source, version)
+-- is done in `migrate`, which looks the old constraint's name up rather than guessing it.
+ALTER TABLE rag_documents ADD COLUMN IF NOT EXISTS content_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE rag_documents ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 1;
+ALTER TABLE rag_documents ADD COLUMN IF NOT EXISTS fetched_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE rag_documents ADD COLUMN IF NOT EXISTS superseded_by UUID;
+ALTER TABLE rag_documents ADD COLUMN IF NOT EXISTS body TEXT NOT NULL DEFAULT '';
 
 -- Token count for BM25 length normalisation. IMMUTABLE so it can back a generated column.
 CREATE OR REPLACE FUNCTION rag_token_count(content TEXT) RETURNS INT
@@ -109,6 +135,10 @@ CREATE TABLE IF NOT EXISTS rag_chunks (
     -- sha256 of `content` at ingest, computed by the store. A citation carries it, so a reader
     -- can prove what text a Source pointed at even after the document is re-ingested.
     content_hash TEXT NOT NULL DEFAULT '',
+    -- Offsets of the chunk body inside rag_documents.body (NULL when not locatable; a
+    -- title-prefixed chunk is located by its body after the title line).
+    char_start  INT,
+    char_end    INT,
     embedding   vector({EMBED_DIM}) NOT NULL,
     tsv         tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
     n_tokens    INT GENERATED ALWAYS AS (rag_token_count(content)) STORED,
@@ -132,6 +162,73 @@ CREATE TABLE IF NOT EXISTS rag_cache (
 
 -- Older schemas predate content_hash; adding on the parent cascades to every partition.
 ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS content_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS char_start INT;
+ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS char_end INT;
+
+-- The fact layer (PR 3): harmonised numbers extracted from the documents, with provenance.
+-- Composite foreign keys everywhere: a fact can only point at its own tenant's entity, document
+-- and chunk, exactly as rag_chunks -> rag_documents. The constraint, not the policy, enforces it.
+CREATE TABLE IF NOT EXISTS rag_entities (
+    entity_id       UUID NOT NULL DEFAULT gen_random_uuid(),
+    tenant_id       TEXT NOT NULL REFERENCES rag_tenants (tenant_id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL,                  -- 'company', 'property', 'drug', ...
+    canonical_name  TEXT NOT NULL,
+    aliases         TEXT[] NOT NULL DEFAULT '{{}}',
+    PRIMARY KEY (tenant_id, entity_id),
+    UNIQUE (tenant_id, kind, canonical_name)
+) PARTITION BY LIST (tenant_id);
+
+CREATE TABLE IF NOT EXISTS rag_extraction_jobs (
+    extraction_job_id UUID NOT NULL DEFAULT gen_random_uuid(),
+    tenant_id       TEXT NOT NULL REFERENCES rag_tenants (tenant_id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL,                  -- 'seed', 'adapter:edgar', 'llm'
+    model           TEXT NOT NULL DEFAULT '',
+    prompt_sha256   TEXT NOT NULL DEFAULT '',
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, extraction_job_id)
+) PARTITION BY LIST (tenant_id);
+
+CREATE TABLE IF NOT EXISTS rag_facts (
+    fact_id         UUID NOT NULL DEFAULT gen_random_uuid(),
+    tenant_id       TEXT NOT NULL,
+    entity_id       UUID NOT NULL,
+    field           TEXT NOT NULL,                  -- key into rag_dictionary
+    period_start    DATE,
+    period_end      DATE,
+    value_num       NUMERIC,                        -- exactly one of value_num / value_text
+    value_text      TEXT,
+    unit            TEXT NOT NULL DEFAULT '',
+    doc_id          UUID,                           -- provenance: the document it came from
+    chunk_id        UUID,                           -- and the chunk, when known
+    conflict_group_id UUID,                         -- NULL = no disagreement on record
+    extraction_job_id UUID,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, fact_id),
+    FOREIGN KEY (tenant_id, entity_id)
+        REFERENCES rag_entities (tenant_id, entity_id) ON DELETE CASCADE,
+    -- SET NULL names the column (PG 15+): a plain SET NULL would also null tenant_id, which is
+    -- NOT NULL and the partition key, so deleting a cited document would fail instead.
+    FOREIGN KEY (tenant_id, doc_id)
+        REFERENCES rag_documents (tenant_id, doc_id) ON DELETE SET NULL (doc_id),
+    FOREIGN KEY (tenant_id, chunk_id)
+        REFERENCES rag_chunks (tenant_id, chunk_id) ON DELETE SET NULL (chunk_id),
+    FOREIGN KEY (tenant_id, extraction_job_id)
+        REFERENCES rag_extraction_jobs (tenant_id, extraction_job_id)
+        ON DELETE SET NULL (extraction_job_id),
+    CHECK ((value_num IS NULL) <> (value_text IS NULL))
+) PARTITION BY LIST (tenant_id);
+CREATE INDEX IF NOT EXISTS rag_facts_lookup_idx
+    ON rag_facts (tenant_id, entity_id, field, period_start, period_end);
+
+CREATE TABLE IF NOT EXISTS rag_dictionary (
+    tenant_id       TEXT NOT NULL REFERENCES rag_tenants (tenant_id) ON DELETE CASCADE,
+    field           TEXT NOT NULL,
+    definition      TEXT NOT NULL,
+    unit            TEXT NOT NULL DEFAULT '',
+    allowed_values  TEXT[] NOT NULL DEFAULT '{{}}',
+    notes           TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (tenant_id, field)
+) PARTITION BY LIST (tenant_id);
 
 -- Defined on the parents, built per partition.
 CREATE INDEX IF NOT EXISTS rag_chunks_doc_idx ON rag_chunks (tenant_id, doc_id);
@@ -142,7 +239,26 @@ CREATE INDEX IF NOT EXISTS rag_cache_embedding_idx
     ON rag_cache USING hnsw (embedding vector_cosine_ops);
 """
 
-PARTITIONED_TABLES = ("rag_documents", "rag_chunks", "rag_cache")
+PARTITIONED_TABLES = (
+    "rag_documents",
+    "rag_chunks",
+    "rag_cache",
+    "rag_entities",
+    "rag_extraction_jobs",
+    "rag_facts",
+    "rag_dictionary",
+)
+# Referencing side first, so partitions can be detached and dropped in this order.
+_DROP_ORDER = (
+    "rag_facts",
+    "rag_dictionary",
+    "rag_extraction_jobs",
+    "rag_entities",
+    "rag_cache",
+    "rag_chunks",
+    "rag_documents",
+)
+DOC_SOURCE_VERSION_KEY = "rag_documents_source_version_key"
 LOG_PARAM_SETTINGS = ("log_parameter_max_length", "log_parameter_max_length_on_error")
 # How Postgres deparses the policy condition; posture compares the live policies against it.
 EXPECTED_QUAL = f"(tenant_id = current_setting('{TENANT_SETTING}'::text, true))"
@@ -228,6 +344,7 @@ END $$;
             )
         with conn.transaction():
             conn.execute(DDL)
+            _swap_document_unique(conn)
             for table in TENANT_TABLES:
                 conn.execute(f"ALTER TABLE {table} OWNER TO {OWNER_ROLE}")
                 conn.execute(_policy_sql(table))
@@ -250,6 +367,36 @@ END $$;
                 "ON CONFLICT (key) DO NOTHING",
                 (fp,),
             )
+
+
+def _swap_document_unique(conn: psycopg.Connection) -> None:
+    """UNIQUE (tenant_id, source) -> UNIQUE (tenant_id, source, version) on rag_documents.
+
+    Schemas from before PR 3 carry the two-column constraint under whatever name Postgres gave
+    it; look it up by definition instead of guessing. Fresh schemas get the three-column
+    constraint from the DDL, under its explicit name, and this is a no-op."""
+    old = conn.execute(
+        """
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = 'rag_documents'::regclass AND contype = 'u'
+          AND pg_get_constraintdef(oid) = 'UNIQUE (tenant_id, source)'
+        """
+    ).fetchall()
+    for (name,) in old:
+        conn.execute(
+            sql.SQL("ALTER TABLE rag_documents DROP CONSTRAINT IF EXISTS {}").format(
+                sql.Identifier(name)
+            )
+        )
+    have_new = conn.execute(
+        "SELECT 1 FROM pg_constraint WHERE conrelid = 'rag_documents'::regclass AND conname = %s",
+        (DOC_SOURCE_VERSION_KEY,),
+    ).fetchone()
+    if have_new is None:
+        conn.execute(
+            f"ALTER TABLE rag_documents ADD CONSTRAINT {DOC_SOURCE_VERSION_KEY} "
+            "UNIQUE (tenant_id, source, version)"
+        )
 
 
 def create_tenant(admin_url: str, tenant_id: str, name: str = "") -> None:
@@ -288,7 +435,7 @@ def drop_tenant(admin_url: str, tenant_id: str) -> None:
     archives, and backups. See README "Backups and logs"."""
     validate_tenant_id(tenant_id)
     with psycopg.connect(admin_url, autocommit=True) as conn, conn.transaction():
-        for table in ("rag_cache", "rag_chunks", "rag_documents"):  # referencing side first
+        for table in _DROP_ORDER:
             part = partition_name(table, tenant_id)
             exists = conn.execute("SELECT to_regclass(%s)", (part,)).fetchone()
             if exists and exists[0]:
@@ -305,8 +452,9 @@ def drop_all(admin_url: str) -> None:
     """Tests only: remove every rag_* table (roles are left in place)."""
     with psycopg.connect(admin_url, autocommit=True) as conn:
         conn.execute(
-            "DROP TABLE IF EXISTS rag_cache, rag_chunks, rag_documents, rag_tenants, rag_meta "
-            "CASCADE"
+            "DROP TABLE IF EXISTS "
+            + ", ".join((*_DROP_ORDER, "rag_tenants", META_TABLE))
+            + " CASCADE"
         )
 
 

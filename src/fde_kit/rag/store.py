@@ -33,12 +33,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterator
+import time
+import uuid
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+from datetime import date
+from decimal import Decimal
 from typing import Any, Literal
 
 import psycopg
+from psycopg import sql as pgsql
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
@@ -52,6 +57,24 @@ from .schema import (
     partition_name,
     validate_tenant_id,
 )
+from .sqlguard import SqlRejected, check_select
+
+__all__ = [
+    "DictEntry",
+    "DocSlice",
+    "Fact",
+    "FactRow",
+    "Hit",
+    "IngestOutcome",
+    "QueryResult",
+    "SearchResult",
+    "SqlRejected",
+    "TenantSession",
+    "TenantStore",
+    "chunk_spans",
+    "content_hash",
+    "fuse",
+]
 
 SearchMode = Literal["vector", "keyword", "hybrid"]
 Fusion = Literal["relative", "rrf"]
@@ -89,9 +112,129 @@ class SearchResult:
     params: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class IngestOutcome:
+    doc_id: str
+    version: int
+    changed: bool
+    """False = identical hash, nothing written."""
+    content_hash: str
+
+
+@dataclass
+class DocSlice:
+    doc_id: str
+    source: str
+    title: str
+    version: int
+    content_hash: str
+    superseded_by: str | None
+    char_start: int
+    char_end: int
+    text: str
+    total_chars: int
+    next: int | None
+    """Char offset to continue from, None at end."""
+
+
+@dataclass
+class DictEntry:
+    field: str
+    definition: str
+    unit: str = ""
+    allowed_values: tuple[str, ...] = ()
+    notes: str = ""
+
+
+@dataclass
+class FactRow:
+    """INPUT shape for `add_facts`."""
+
+    entity: str
+    """Canonical name or alias; resolved to entity_id (error if unknown)."""
+    field: str
+    value: float | int | str
+    """A number goes to value_num, a str to value_text."""
+    unit: str = ""
+    period_start: date | None = None
+    period_end: date | None = None
+    doc_id: str | None = None
+    chunk_id: str | None = None
+
+
+@dataclass
+class Fact:
+    """OUTPUT shape of `facts`."""
+
+    fact_id: str
+    entity_id: str
+    entity: str
+    field: str
+    period_start: date | None
+    period_end: date | None
+    value: float | str
+    unit: str
+    doc_id: str | None
+    chunk_id: str | None
+    doc_source: str | None
+    doc_hash: str | None
+    conflict_group_id: str | None
+    extraction_job_id: str | None
+
+    def to_source(self, tenant_id: str | None = None) -> Source:
+        return Source(
+            source_id=self.fact_id,
+            uri=self.doc_source or f"fact:{self.fact_id}",
+            title=f"{self.entity} {self.field}",
+            doc_id=self.doc_id,
+            content_hash=self.doc_hash,
+            span=f"fact:{self.fact_id}",
+            tenant_id=tenant_id,
+        )
+
+
+@dataclass
+class QueryResult:
+    columns: list[str]
+    rows: list[tuple]
+    truncated: bool
+    """More than max_rows existed."""
+    elapsed_ms: float
+
+
 def content_hash(text: str) -> str:
     """sha256 hex of a chunk's text. What `Source.content_hash` carries."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def chunk_spans(
+    text: str, chunks: list[str], title: str = ""
+) -> list[tuple[int | None, int | None]]:
+    """(char_start, char_end) of each chunk's body inside `text`, or (None, None) when the body
+    can't be found verbatim from the previous chunk's end (chunk_text re-joins paragraphs with
+    a fixed separator, so a document with unusual blank lines may not locate). Title-prefixed
+    chunks are located by their body, after the title line."""
+    prefix = f"{title}\n\n" if title else ""
+    spans: list[tuple[int | None, int | None]] = []
+    pos = 0
+    for c in chunks:
+        body = c[len(prefix) :] if prefix and c.startswith(prefix) else c
+        at = text.find(body, pos) if body else -1
+        if at < 0:
+            spans.append((None, None))
+        else:
+            spans.append((at, at + len(body)))
+            pos = at + len(body)
+    return spans
+
+
+def _plain(v: Any) -> Any:
+    """Row values as plain Python: UUIDs as str, NUMERIC as int or float."""
+    if isinstance(v, uuid.UUID):
+        return str(v)
+    if isinstance(v, Decimal):
+        return int(v) if v == v.to_integral_value() else float(v)
+    return v
 
 
 def fuse(
@@ -187,10 +330,16 @@ class TenantSession:
             "@chunks": f'"{partition_name("rag_chunks", tenant_id)}"',
             "@docs": f'"{partition_name("rag_documents", tenant_id)}"',
             "@cache": f'"{partition_name("rag_cache", tenant_id)}"',
+            "@entities": f'"{partition_name("rag_entities", tenant_id)}"',
+            "@facts": f'"{partition_name("rag_facts", tenant_id)}"',
+            "@dictionary": f'"{partition_name("rag_dictionary", tenant_id)}"',
+            "@jobs": f'"{partition_name("rag_extraction_jobs", tenant_id)}"',
         }
+        self.last_ingest: IngestOutcome | None = None
 
     def sql(self, template: str) -> str:
-        """Fill a template's @chunks / @docs / @cache with this tenant's partitions."""
+        """Fill a template's @chunks / @docs / @cache / @entities / @facts / @dictionary /
+        @jobs with this tenant's partitions."""
         for token, name in self._tables.items():
             template = template.replace(token, name)
         return template
@@ -206,42 +355,369 @@ class TenantSession:
         metadata: dict[str, Any] | None = None,
         max_chars: int = 900,
     ) -> str:
-        """Replace-or-insert one document and its chunks. Returns doc_id (a UUID string)."""
+        """Ingest one document (versioned; see `ingest_versioned`). Returns the current doc_id;
+        the full outcome is on `self.last_ingest`."""
+        outcome = self.ingest_versioned(
+            source, text, title=title, metadata=metadata, max_chars=max_chars
+        )
+        return outcome.doc_id
+
+    def ingest_versioned(
+        self,
+        source: str,
+        text: str,
+        *,
+        title: str = "",
+        metadata: dict[str, Any] | None = None,
+        max_chars: int = 900,
+    ) -> IngestOutcome:
+        """Idempotent by sha256 of `text`.
+
+        - same source, same hash: nothing written; the current doc_id with `changed=False`.
+        - same source, new hash: a new row at version max+1 with the body, the previous current
+          row's `superseded_by` pointed at it, the previous version's chunks deleted (search
+          only ever sees current chunks) and this tenant's cache cleared. The old row stays as
+          provenance, so an old citation's doc_id + content_hash still resolves.
+        """
+        digest = content_hash(text)
+        current = self.conn.execute(
+            self.sql(
+                "SELECT doc_id::text, version, content_hash FROM @docs "
+                "WHERE source = %s AND superseded_by IS NULL ORDER BY version DESC LIMIT 1"
+            ),
+            (source,),
+        ).fetchone()
+        if current is not None and current[2] == digest:
+            outcome = IngestOutcome(current[0], int(current[1]), False, digest)
+            self.last_ingest = outcome
+            return outcome
+
         chunks = chunk_text(text, title=title, max_chars=max_chars)
         vecs = self.embedder.embed_documents(chunks) if chunks else []
         row = self.conn.execute(
             self.sql("""
-            INSERT INTO @docs (tenant_id, source, title, metadata)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (tenant_id, source)
-            DO UPDATE SET title = EXCLUDED.title, metadata = EXCLUDED.metadata
-            RETURNING doc_id::text
+            INSERT INTO @docs (tenant_id, source, title, metadata, content_hash, version, body)
+            VALUES (%(t)s, %(s)s, %(title)s, %(m)s, %(h)s,
+                    (SELECT COALESCE(max(version), 0) + 1 FROM @docs WHERE source = %(s)s),
+                    %(body)s)
+            RETURNING doc_id::text, version
             """),
-            (self.tenant_id, source, title, Jsonb(metadata or {})),
+            {
+                "t": self.tenant_id,
+                "s": source,
+                "title": title,
+                "m": Jsonb(metadata or {}),
+                "h": digest,
+                "body": text,
+            },
         ).fetchone()
         assert row is not None
-        doc_id = row[0]
-        self.conn.execute(self.sql("DELETE FROM @chunks WHERE doc_id = %s"), (doc_id,))
+        doc_id, version = row[0], int(row[1])
+        if current is not None:
+            self.conn.execute(
+                self.sql("UPDATE @docs SET superseded_by = %s WHERE doc_id = %s"),
+                (doc_id, current[0]),
+            )
+            self.conn.execute(self.sql("DELETE FROM @chunks WHERE doc_id = %s"), (current[0],))
+        spans = chunk_spans(text, chunks, title)
         with self.conn.cursor() as cur:
             cur.executemany(
                 self.sql(
                     "INSERT INTO @chunks (tenant_id, doc_id, ord, content, content_hash, "
-                    "embedding) VALUES (%s, %s, %s, %s, %s, %s::vector)"
+                    "char_start, char_end, embedding) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::vector)"
                 ),
                 [
-                    (self.tenant_id, doc_id, i, c, content_hash(c), to_pgvector(v))
-                    for i, (c, v) in enumerate(zip(chunks, vecs, strict=True))
+                    (self.tenant_id, doc_id, i, c, content_hash(c), cs, ce, to_pgvector(v))
+                    for i, (c, v, (cs, ce)) in enumerate(zip(chunks, vecs, spans, strict=True))
                 ],
             )
         # Anything cached for this tenant may now be stale.
         self.conn.execute(self.sql("DELETE FROM @cache"))
-        return doc_id
+        outcome = IngestOutcome(doc_id, version, True, digest)
+        self.last_ingest = outcome
+        return outcome
+
+    # ------------------------------------------------------------------ entities / facts
+
+    def upsert_entity(self, kind: str, canonical_name: str, aliases: Iterable[str] = ()) -> str:
+        """Insert or update (by kind + canonical name; aliases are replaced). Returns entity_id."""
+        row = self.conn.execute(
+            self.sql("""
+            INSERT INTO @entities (tenant_id, kind, canonical_name, aliases)
+            VALUES (%s, %s, %s, %s::text[])
+            ON CONFLICT (tenant_id, kind, canonical_name) DO UPDATE SET aliases = EXCLUDED.aliases
+            RETURNING entity_id::text
+            """),
+            (self.tenant_id, kind, canonical_name, list(dict.fromkeys(aliases))),
+        ).fetchone()
+        assert row is not None
+        return row[0]
+
+    def resolve_entity(self, name: str) -> str | None:
+        """entity_id for a canonical name or alias, case-insensitive; None when unknown. A
+        canonical match wins over an alias match."""
+        row = self.conn.execute(
+            self.sql("""
+            SELECT entity_id::text FROM @entities
+            WHERE lower(canonical_name) = lower(%(n)s::text)
+               OR EXISTS (SELECT 1 FROM unnest(aliases) AS al(a)
+                          WHERE lower(al.a) = lower(%(n)s::text))
+            ORDER BY (lower(canonical_name) = lower(%(n)s::text)) DESC, canonical_name
+            LIMIT 1
+            """),
+            {"n": name},
+        ).fetchone()
+        return row[0] if row else None
+
+    def start_extraction_job(self, kind: str, *, model: str = "", prompt_sha256: str = "") -> str:
+        row = self.conn.execute(
+            self.sql(
+                "INSERT INTO @jobs (tenant_id, kind, model, prompt_sha256) "
+                "VALUES (%s, %s, %s, %s) RETURNING extraction_job_id::text"
+            ),
+            (self.tenant_id, kind, model, prompt_sha256),
+        ).fetchone()
+        assert row is not None
+        return row[0]
+
+    def add_facts(self, rows: list[FactRow], *, extraction_job_id: str | None = None) -> list[str]:
+        """Insert facts; returns their fact_ids in order.
+
+        Conflict rule: existing facts with the same (entity_id, field, period_start,
+        period_end) and a *different* value share one conflict_group_id with the new row (the
+        existing group's id if any of them has one, else a new uuid). An existing fact with the
+        same value is left alone and the new row is still inserted: two sources agreeing is
+        evidence, not a duplicate, and not a conflict."""
+        out: list[str] = []
+        for r in rows:
+            entity_id = self.resolve_entity(r.entity)
+            if entity_id is None:
+                raise ValueError(f"unknown entity {r.entity!r} for tenant {self.tenant_id}")
+            if isinstance(r.value, bool) or not isinstance(r.value, int | float | str):
+                raise ValueError(f"fact value must be a number or a string, got {r.value!r}")
+            num = r.value if isinstance(r.value, int | float) else None
+            txt = r.value if isinstance(r.value, str) else None
+            existing = self.conn.execute(
+                self.sql("""
+                SELECT fact_id::text, conflict_group_id::text,
+                       (value_num IS NOT DISTINCT FROM %(num)s::numeric
+                        AND value_text IS NOT DISTINCT FROM %(txt)s::text) AS same
+                FROM @facts
+                WHERE entity_id = %(e)s::uuid AND field = %(f)s::text
+                  AND period_start IS NOT DISTINCT FROM %(ps)s::date
+                  AND period_end IS NOT DISTINCT FROM %(pe)s::date
+                """),
+                {
+                    "e": entity_id,
+                    "f": r.field,
+                    "ps": r.period_start,
+                    "pe": r.period_end,
+                    "num": num,
+                    "txt": txt,
+                },
+            ).fetchall()
+            differing = [row for row in existing if not row[2]]
+            group: str | None = None
+            if differing:
+                group = next((g for _, g, _ in differing if g), None) or str(uuid.uuid4())
+                self.conn.execute(
+                    self.sql(
+                        "UPDATE @facts SET conflict_group_id = %s::uuid "
+                        "WHERE fact_id = ANY(%s::uuid[]) "
+                        "AND conflict_group_id IS DISTINCT FROM %s::uuid"
+                    ),
+                    (group, [f for f, _, _ in differing], group),
+                )
+            row = self.conn.execute(
+                self.sql("""
+                INSERT INTO @facts (tenant_id, entity_id, field, period_start, period_end,
+                                    value_num, value_text, unit, doc_id, chunk_id,
+                                    conflict_group_id, extraction_job_id)
+                VALUES (%s, %s::uuid, %s, %s::date, %s::date, %s::numeric, %s::text, %s,
+                        %s::uuid, %s::uuid, %s::uuid, %s::uuid)
+                RETURNING fact_id::text
+                """),
+                (
+                    self.tenant_id,
+                    entity_id,
+                    r.field,
+                    r.period_start,
+                    r.period_end,
+                    num,
+                    txt,
+                    r.unit,
+                    r.doc_id,
+                    r.chunk_id,
+                    group,
+                    extraction_job_id,
+                ),
+            ).fetchone()
+            assert row is not None
+            out.append(row[0])
+        return out
+
+    def facts(self, entity: str | None = None, field: str | None = None) -> list[Fact]:
+        """This tenant's facts, optionally for one entity (canonical name or alias) and/or one
+        field. An unknown entity name yields an empty list."""
+        entity_id: str | None = None
+        if entity is not None:
+            entity_id = self.resolve_entity(entity)
+            if entity_id is None:
+                return []
+        rows = self.conn.execute(
+            self.sql("""
+            SELECT f.fact_id::text, f.entity_id::text, e.canonical_name, f.field,
+                   f.period_start, f.period_end, f.value_num, f.value_text, f.unit,
+                   f.doc_id::text, f.chunk_id::text, d.source, d.content_hash,
+                   f.conflict_group_id::text, f.extraction_job_id::text
+            FROM @facts f
+            JOIN @entities e ON e.entity_id = f.entity_id
+            LEFT JOIN @docs d ON d.doc_id = f.doc_id
+            WHERE (%(e)s::uuid IS NULL OR f.entity_id = %(e)s::uuid)
+              AND (%(f)s::text IS NULL OR f.field = %(f)s::text)
+            ORDER BY e.canonical_name, f.field, f.period_start NULLS FIRST, f.created_at, f.fact_id
+            """),
+            {"e": entity_id, "f": field},
+        ).fetchall()
+        return [
+            Fact(
+                fact_id=r[0],
+                entity_id=r[1],
+                entity=r[2],
+                field=r[3],
+                period_start=r[4],
+                period_end=r[5],
+                value=_plain(r[6]) if r[6] is not None else r[7],
+                unit=r[8],
+                doc_id=r[9],
+                chunk_id=r[10],
+                doc_source=r[11],
+                doc_hash=r[12] or None,
+                conflict_group_id=r[13],
+                extraction_job_id=r[14],
+            )
+            for r in rows
+        ]
+
+    def set_dictionary(self, entries: Iterable[DictEntry]) -> None:
+        """Upsert by field."""
+        params = [
+            (self.tenant_id, e.field, e.definition, e.unit, list(e.allowed_values), e.notes)
+            for e in entries
+        ]
+        if not params:
+            return
+        with self.conn.cursor() as cur:
+            cur.executemany(
+                self.sql("""
+                INSERT INTO @dictionary (tenant_id, field, definition, unit, allowed_values, notes)
+                VALUES (%s, %s, %s, %s, %s::text[], %s)
+                ON CONFLICT (tenant_id, field) DO UPDATE SET
+                    definition = EXCLUDED.definition, unit = EXCLUDED.unit,
+                    allowed_values = EXCLUDED.allowed_values, notes = EXCLUDED.notes
+                """),
+                params,
+            )
+
+    def dictionary(self) -> list[DictEntry]:
+        rows = self.conn.execute(
+            self.sql(
+                "SELECT field, definition, unit, allowed_values, notes FROM @dictionary "
+                "ORDER BY field"
+            )
+        ).fetchall()
+        return [DictEntry(r[0], r[1], r[2], tuple(r[3]), r[4]) for r in rows]
 
     # ------------------------------------------------------------------ reads
 
     def count_chunks(self) -> int:
         row = self.conn.execute(self.sql("SELECT count(*) FROM @chunks")).fetchone()
         return int(row[0]) if row else 0
+
+    def fetch(self, doc_id: str, char_start: int = 0, char_end: int = 6000) -> DocSlice:
+        """A slice of one document's stored body; the range is clamped to the body.
+
+        Raises KeyError for an unknown doc_id. Under RLS another tenant's doc_id is unknown, so
+        the error is identical for "no such document" and "not yours"."""
+        try:
+            key = str(uuid.UUID(str(doc_id)))
+        except ValueError:
+            raise KeyError(doc_id) from None
+        row = self.conn.execute(
+            self.sql(
+                "SELECT source, title, version, content_hash, superseded_by::text, body "
+                "FROM @docs WHERE doc_id = %s::uuid"
+            ),
+            (key,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(doc_id)
+        source, title, version, digest, superseded_by, body = row
+        total = len(body)
+        start = max(0, min(int(char_start), total))
+        end = max(start, min(int(char_end), total))
+        return DocSlice(
+            doc_id=key,
+            source=source,
+            title=title,
+            version=int(version),
+            content_hash=digest,
+            superseded_by=superseded_by,
+            char_start=start,
+            char_end=end,
+            text=body[start:end],
+            total_chars=total,
+            next=end if end < total else None,
+        )
+
+    def query(self, sql: str, *, max_rows: int = 200, timeout_ms: int = 5000) -> QueryResult:
+        """Run one read-only SELECT under this tenant's RLS session.
+
+        The statement first passes `check_select` (a keyword filter), then runs after
+        `SET LOCAL transaction_read_only = on` and a statement timeout, wrapped in
+        `SELECT * FROM (<sql>) AS q LIMIT max_rows + 1`. The model writes against the parent
+        tables (`rag_facts`, `rag_entities`, `rag_documents`, `rag_dictionary`); the policy
+        applies through them. Any psycopg error comes back as `SqlRejected` carrying the first
+        line of the server's message.
+
+        The statement runs inside a savepoint, so a rejected one doesn't poison the session's
+        transaction. The read-only switch is made *outside* the savepoint: Postgres saves and
+        restores transaction_read_only around every subtransaction, so set inside it would be
+        undone by RELEASE. Set at the top level it holds, and Postgres allows switching a
+        transaction to read-only but never back, so once query() has run the rest of this
+        session is read-only: use a fresh session to write. The statement timeout is set
+        inside the savepoint and put back afterwards.
+        """
+        cleaned = check_select(sql)
+        max_rows = max(1, int(max_rows))
+        prev = self.conn.execute("SHOW statement_timeout").fetchone()
+        t0 = time.perf_counter()
+        try:
+            self.conn.execute("SET LOCAL transaction_read_only = on")
+            with self.conn.transaction():  # SAVEPOINT; an error rolls it back
+                self.conn.execute(f"SET LOCAL statement_timeout = {int(timeout_ms)}")
+                # No parameters on purpose: the model's SQL may contain '%' (LIKE patterns)
+                # and must not be parsed for placeholders.
+                cur = self.conn.execute(f"SELECT * FROM ({cleaned}) AS q LIMIT {max_rows + 1}")
+                columns = [d.name for d in cur.description or ()]
+                rows = cur.fetchall()
+        except psycopg.Error as exc:
+            primary = getattr(exc.diag, "message_primary", None) if hasattr(exc, "diag") else None
+            reason = primary or (str(exc).strip().splitlines() or ["query failed"])[0]
+            raise SqlRejected(reason) from exc
+        elapsed = (time.perf_counter() - t0) * 1000
+        self.conn.execute(
+            pgsql.SQL("SET LOCAL statement_timeout = {}").format(
+                pgsql.Literal(prev[0] if prev else 0)
+            )
+        )
+        return QueryResult(
+            columns=columns,
+            rows=[tuple(_plain(v) for v in r) for r in rows[:max_rows]],
+            truncated=len(rows) > max_rows,
+            elapsed_ms=elapsed,
+        )
 
     def search(
         self,
