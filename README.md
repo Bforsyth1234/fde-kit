@@ -19,7 +19,7 @@ knowing whether it works, with every answer traceable to the records and the pro
 | Piece | What it is | Where |
 | --- | --- | --- |
 | Durable runtime | The same loop as a Temporal workflow. Kill the worker mid-run; the run finishes on the next one. | `src/fde_kit/durable/` |
-| Multi-tenant retrieval | Hybrid search (pgvector + BM25) over versioned documents, plus a fact table with provenance, with tenant isolation enforced by Postgres: forced RLS, a partition per tenant, no parameter logging, redacted traces. Three cited tools: `search_documents`, `fetch_document`, `query_table` (read-only SQL). 100+ tests, including timing. | `src/fde_kit/rag/` |
+| Multi-tenant retrieval | Hybrid search (pgvector + BM25) over versioned documents, plus a fact table with provenance and precision-aware conflicts, with tenant isolation enforced by Postgres: forced RLS, a partition per tenant, no parameter logging, redacted traces. Three cited tools: `search_documents`, `fetch_document`, `query_table` (read-only SQL). Source adapters load SEC EDGAR filings and local files. 100+ tests, including timing. | `src/fde_kit/rag/`, `rag/adapters/` |
 
 Provider-agnostic behind a 30-line interface; Anthropic is the default, a deterministic mock is
 built in for tests and offline eval runs.
@@ -261,6 +261,18 @@ fact's document), two hit the late-fee conflict (`conflict_reported` both values
 documents), and two ask one tenant for another tenant's unit (`cites_only`; the answer says not
 found). CI seeds the demo and runs it in mock mode with a pass threshold of 1.0.
 
+`fde eval --set edgar` runs a third set, `evals/golden_edgar.jsonl`: 12 cases over the pinned
+EDGAR corpus (see Source adapters and SEC EDGAR), seeded offline from the committed fixtures.
+Three `table-fact` cases reach one number through `query_table` (Moderna FY2021 revenue,
+Gilead FY2021 net income, Regeneron FY2021 revenue) and cite the filing. Three
+`table-conflict` cases hit a real restatement (Pfizer FY2019 revenue, Gilead FY2019 R&D,
+Regeneron FY2019 revenue): `conflict_reported` every value, `cites` every filing. Two
+`precision` cases (Vertex FY2019 revenue, Moderna FY2020 net loss) assert the opposite: no
+`conflict=true` in the tool output, one value in the answer, no conflict wording. Two
+`doc-lookup` cases answer from the first 40,000 characters of a filing, and two `cross-tenant`
+cases ask `pharma-b` for Pfizer and `pharma-a` for Moderna and expect not found. CI runs it in
+mock mode with a pass threshold of 1.0; no network, no SEC contact.
+
 ## Durable runs (Temporal)
 
 The in-process loop above dies with its process. `fde_kit.durable` is the same loop as a Temporal
@@ -470,6 +482,10 @@ fde rag query --tenant summit "SELECT field, value_num, unit FROM rag_facts"   #
 fde rag fetch --tenant summit DOC_ID [--start 0 --end 6000]   # a slice of one stored document body
 fde rag dictionary --tenant summit                            # the field definitions query_table sees
 fde rag posture                   # would this connection let anything leak?
+fde rag seed-edgar [--offline]    # pharma-a / pharma-b from the pinned EDGAR corpus
+fde rag ingest --tenant T --adapter edgar [--ticker PFE] [--offline]   # some or all pinned filers
+fde rag ingest --tenant T --adapter local_files --dir PATH [--entity NAME]
+fde rag edgar-drift               # live re-fetch of the pinned filings; exit 1 if SEC's copy changed
 make rag-demo                     # same question, three tenants, three answers
 make rag-test                     # the attack suite
 make rag-eval                     # retrieval numbers below
@@ -587,7 +603,8 @@ naming `rag_facts`, `rag_entities` and `rag_documents` with their columns, then 
    tool returns as `Query rejected: ...` with `is_error=True`, and the run goes on.
 
 **Conflicts are kept, not averaged.** `add_facts` inserts every row. When an existing fact has
-the same `(entity_id, field, period_start, period_end)` and a different value, all of them and
+the same `(entity_id, field, period_start, period_end)` and a different value (compared at the
+facts' precision since PR 4; see below), all of them and
 the new row share one `conflict_group_id` (the existing group's, else a new one). The same
 value from a second source is inserted too, with no group: two sources agreeing is evidence,
 not a duplicate. The demo corpus has one deliberate conflict per tenant: the lease's late fee
@@ -616,6 +633,135 @@ registry = tenant_search_registry(store, tenant_id=request.tenant,
                                   tools=("search_documents", "fetch_document", "query_table"))
 Agent(registry).run("What is the late fee, and does any document disagree?")
 ```
+
+### Source adapters and SEC EDGAR
+
+An adapter turns an external source into documents and facts with provenance; the store does
+the rest (versioning, chunking, embedding, conflict groups, RLS). Two ship: `edgar`, for SEC
+10-K filings and their XBRL financials, and `local_files`, for a directory a tenant supplies.
+
+```python
+# rag/adapters/base.py
+@dataclass
+class AdapterBatch:                 # one unit of ingest, e.g. one company
+    entities: list[RawEntity]       # kind, canonical_name, aliases
+    documents: list[RawDocument]    # source (stable URI), title, text, metadata
+    facts: list[RawFact]            # document_source + a FactRow with doc_id left None
+    dictionary: list[DictEntry] = field(default_factory=list)
+
+class Adapter(Protocol):
+    name: str                       # "edgar", "local_files"
+    def batches(self) -> Iterator[AdapterBatch]: ...
+
+def ingest(session: TenantSession, adapter: Adapter, *, max_chars: int = 900) -> IngestReport
+```
+
+`ingest` upserts the entities, runs `ingest_versioned` on every document, fills each fact's
+`doc_id` from its `document_source`, and writes the dictionary. A fact citing a document that
+is not in its batch is an error. Idempotency follows the documents: facts are written only for
+documents whose ingest changed, under one extraction job (`kind="adapter:<name>"`) created on
+the first batch that has any. Re-running on unchanged input writes nothing: no documents, no
+facts, no job.
+
+**The pinned corpus.** Five life-sciences filers, their FY2019–FY2021 10-Ks, 15 filings, in
+two tenants. Each filing is pinned by accession number in
+`src/fde_kit/rag/adapters/edgar_manifest.json`. Every company yields 18 facts (revenue, net
+income and R&D, for each year each 10-K reports).
+
+| Tenant | Companies | Filings |
+| --- | --- | --- |
+| `pharma-a` | Pfizer (PFE), Gilead (GILD), Vertex (VRTX) | 9 10-Ks; Pfizer's FY2019 one has an Exhibit 13 |
+| `pharma-b` | Moderna (MRNA), Regeneron (REGN) | 6 10-Ks |
+
+```python
+from pathlib import Path
+from fde_kit.rag.adapters import EdgarAdapter, EdgarClient, filings_for, ingest
+
+client = EdgarClient("", cache_dir=Path("evals/fixtures/edgar/cache"), offline=True)
+with store.session("pharma-a") as s:
+    report = ingest(s, EdgarAdapter(client, filings_for("pharma-a")))
+report.documents, report.facts, report.conflict_groups
+```
+
+#### What the real data taught us
+
+**Restatements are real, and sometimes happen twice.** Pfizer's FY2019 revenue is $51,750M in
+its FY2019 10-K, $41,172M in the FY2020 10-K (recast after the Upjohn separation) and $40,905M
+in the FY2021 10-K. Three filings, three values, one conflict group, every filing cited.
+Regeneron's FY2019 revenue goes from $7,863.4M to $6,557.6M between its FY2019 and FY2020
+10-Ks. Gilead's FY2019 R&D is a different kind of change: $9,106M as
+`ResearchAndDevelopmentExpense` in the FY2019 10-K, $4,055M as
+`ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost` in the two later ones, because
+acquired in-process R&D moved to a line of its own. Same field, same period, two definitions.
+It still forms a conflict group, and that is right: neither number is wrong, and only a person
+reading the filings can say which one their question means.
+
+**Precision is not disagreement.** Later filings repeat prior years rounded coarser. Vertex's
+FY2019 revenue is 4,162,821,000 in two 10-Ks and 4,162,800,000 in the FY2021 one; Moderna's
+FY2020 net loss is −747,064,000, then −747,000,000. PR 3's exact rule would call both
+conflicts. So each fact carries a `precision`, and two numbers agree when
+`round_half_up(a/p) == round_half_up(b/p)`, with `p` the coarser of the two precisions
+(`values_agree` in `rag/store.py`). Vertex at p = 100,000: 41,628.21 and 41,628 both round to
+41,628. A blanket tolerance would be the wrong fix: it guesses at rounding for every field of
+every tenant, and a 3% one makes an $1,800 rent and an $1,850 rent agree. Facts with no
+precision on either side compare by exact equality, so the lease demo is unchanged. One
+honest caveat: companyfacts rows don't say how the filer rounded, so the adapter infers
+precision from trailing zeros (`infer_precision`, capped at 10^6), and that can be coarser
+than the truth. Vertex's FY2019 net income, 1,176,810,000, is reported in thousands but infers
+a precision of 10,000. A coarser precision only ever makes agreement looser, so the failure
+mode is a small real restatement read as rounding, never a rounding read as a conflict.
+
+**The number isn't always in the 10-K document.** Pfizer's FY2019 10-K is a shell that
+incorporates its financial statements by reference from Exhibit 13; "Total revenues" appears
+only there. From FY2020 the statements are in the 10-K itself. The adapter ingests the primary
+document and any EX-13, and cites a filing's facts to the EX-13 when there is one (Pfizer: 4
+documents for 3 filings). Finding the filings had its own trap: the `submissions` API's
+"recent" list had already dropped Pfizer's 2020 10-K, so filings are discovered from the
+accession numbers in the company's XBRL data and resolved through the archive index for that
+accession, never by "most recent N". Regeneron's accessions carry its filing agents' prefixes
+(`0001532176-`, `0001804220-`), not its own CIK, so the archive path is built from the
+company's CIK plus the accession; the accession's prefix says who filed, not whose filing it is. XBRL tags also change
+between filings: Moderna reports FY2019 revenue as
+`RevenueFromContractWithCustomerExcludingAssessedTax` in its FY2019 10-K and as `Revenues` in
+the next two. For each `(field, period, filing)` the adapter takes the first tag in a priority
+list that the filing reports, so one filing's values never mix two line items.
+
+**Provenance below the document.** A fact cites a document by `doc_id`, and a whole 10-K or
+exhibit is a big thing to cite. `rag_facts.source_ref` names the exact XBRL fact:
+`us-gaap:<Tag>@<accession>`, e.g.
+`us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax@0000078003-20-000014`. It is
+selectable in `query_table`, so the model, or a reviewer, can see which tag in which filing a
+number came from, and that Gilead's two R&D values are two different tags.
+
+**Offline fixtures.** CI, the tests and `fde rag seed-edgar --offline` never touch sec.gov.
+`evals/fixtures/edgar/cache/` holds real responses, trimmed (~1.1 MB): each company's
+`companyfacts` cut to the six tags in `FIELDS`, USD, 10-K rows and periods ending 2019–2021
+(every row kept exactly as SEC returned it); filing index pages whole; and each filing document
+as extracted text truncated to 40,000 characters. The sha256 of the full extracted text is in
+the manifest, so the truncation is visible and drift is detectable. Facts come from the XBRL
+data, not the text, so truncation does not affect them; it does limit what search can find in
+an offline seed to each filing's first 40,000 characters. To regenerate:
+
+```bash
+FDE_EDGAR_USER_AGENT="your-name you@example.com" python -m fde_kit.rag.adapters.capture
+```
+
+`fde rag edgar-drift` re-fetches every pinned filing live, re-extracts it, and compares the
+index and the hashes with the manifest; it exits 1 and names the document if SEC's copy has
+changed.
+
+**SEC fair access.** SEC asks automated clients to identify themselves with a contact in the
+User-Agent. `EdgarClient` refuses to go online without one (`FDE_EDGAR_USER_AGENT`), stays at
+5 requests a second (SEC allows 10), and caches every GET on disk (`FDE_EDGAR_CACHE_DIR`), so a
+second run makes no requests. The contact is held in memory only: never logged, never in
+`repr`, never written to the cache, the manifest or the fixtures, and a test checks the
+fixtures contain no email address. Offline mode needs no contact.
+
+**Local files.** `local_files` loads `.md`, `.txt` and `.htm`/`.html` (through the same
+`html_to_text`) from a directory, with the path relative to the root as the source; PDFs are
+skipped with a warning. Facts come from an optional `facts.jsonl` at the root, one JSON object
+per line naming the document, entity, field, value, unit and period, with `precision` and
+`source_ref` honoured when present.
 
 ### The attack suite
 
@@ -816,7 +962,7 @@ row estimates and, with `pg_get_partition_constraintdef`, their tenant ids; that
 also just set `app.tenant_id` and read the rows, so the boundary against a SQL-capable attacker
 is the role, not the catalog), and the authentication layer: RLS enforces whichever tenant the code sets, so the boundary is
 only as good as the line that maps a logged-in user to `tenant_id`. The model provider sees
-retrieved passages by design. Facts are loaded by code today (`add_facts`, the demo seed);
+retrieved passages by design. Facts are loaded by code today (`add_facts`, the demo seed, the source adapters);
 `rag_extraction_jobs` is there to record an LLM extraction run, but `fde rag extract` does
 not exist yet.
 
@@ -846,8 +992,8 @@ that class of bug before the full eval does.
 ## CI
 
 `.github/workflows/ci.yml` runs lint, tests (Postgres + pgvector service container), the
-offline retrieval eval with its cross-tenant gate, and the offline agent eval on every push and
-PR. On pushes
+offline retrieval eval with its cross-tenant gate, and the offline agent evals (including the
+EDGAR set, seeded from the committed fixtures) on every push and PR. On pushes
 to `main` it also runs the golden set against the real model **if** an `ANTHROPIC_API_KEY`
 repository secret is set, and fails the build below the threshold. The results JSON is uploaded
 as a build artifact.
@@ -874,6 +1020,8 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
 | `FDE_RAG_ADMIN_URL` | `postgresql://fde:fde@localhost:5432/fde` | Used only by `fde rag migrate` / `seed-demo` |
 | `FDE_RAG_PARTITION_KEY` | unset | Optional secret; partition names become an HMAC of the tenant id. Fixed at first `migrate`. |
 | `FDE_RAG_EMBEDDER` | `bge` | `bge` (bge-small via fastembed) or `hash` (offline, tests) |
+| `FDE_EDGAR_USER_AGENT` | unset | Contact SEC requires in the User-Agent, e.g. `"your-name you@example.com"`. Required for live EDGAR; not needed with `--offline`. Never logged or written to disk. |
+| `FDE_EDGAR_CACHE_DIR` | `.fde/edgar-cache` | On-disk cache of sec.gov responses; a re-run makes no new requests. |
 
 ## Design notes
 
@@ -897,12 +1045,16 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
   tool and what the tool returned, and a replay serves those rows in order, verifying
   `(name, input)`, so the guarantee is the same evidence path, not the same prose. A request the
   record does not have next is reported as `replay_diverged`, never answered from a different row.
+- **A conflict is surfaced, not resolved.** When two sources disagree, every value stays with
+  its citation and the agent reports them all; nothing picks a winner. Gilead's
+  FY2019 R&D is $9,106M or $4,055M depending on whether acquired in-process R&D counts, and no
+  rule in the store can know which one the person asking means.
 
 ## What's not here yet
 
-LLM extraction jobs (the table exists; `fde rag extract` does not), source adapters for public
-data (EDGAR), pairwise/A-B eval mode, a customers/ onboarding directory, and a one-command
-cloud deploy.
+LLM extraction jobs (the table exists; `fde rag extract` does not), pairwise/A-B eval mode, a
+customers/ onboarding directory, a one-command cloud deploy, and PDF ingestion in `local_files`
+(PDFs are skipped with a warning; there is no PDF dependency).
 
 ## License
 
