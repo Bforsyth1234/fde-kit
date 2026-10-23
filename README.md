@@ -716,7 +716,8 @@ incorporates its financial statements by reference from Exhibit 13; "Total reven
 only there. From FY2020 the statements are in the 10-K itself. The adapter ingests the primary
 document and any EX-13, and cites a filing's facts to the EX-13 when there is one (Pfizer: 4
 documents for 3 filings). Finding the filings had its own trap: the `submissions` API's
-"recent" list had already dropped Pfizer's 2020 10-K, so filings are discovered from the
+"recent" list had already dropped Pfizer's FY2019 10-K (filed February 2020; Pfizer files
+often enough to push it out of the window), so filings are discovered from the
 accession numbers in the company's XBRL data and resolved through the archive index for that
 accession, never by "most recent N". Regeneron's accessions carry its filing agents' prefixes
 (`0001532176-`, `0001804220-`), not its own CIK, so the archive path is built from the
