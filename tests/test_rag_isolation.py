@@ -888,6 +888,9 @@ def _fill_shared(admin_url: str, tid: str, n: int, near: bool, seed: int) -> Non
             "VALUES (%s, %s, %s::vector)",
             [(r[0], r[3], r[4]) for r in _rows(tid, "", n, near, rng)],
         )
+        # Deleted rows stay in the HNSW graph as dead tuples until vacuum, and the scan still
+        # walks them, so the measured work would reflect what bigco *used to* store.
+        cur.execute("REINDEX INDEX rag_demo_shared_hnsw")
         cur.execute("ANALYZE rag_demo_shared")
 
 
