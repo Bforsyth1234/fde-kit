@@ -74,12 +74,14 @@ class AgentActivities:
             try:
                 return fut.result(timeout=self.heartbeat_every)
             except TimeoutError:
-                # `fut.result(timeout=...)` raises TimeoutError both when the future is slow
-                # and when `fn` itself raised TimeoutError (e.g. a socket timeout). Only
-                # heartbeat while the future is still running; otherwise re-raise so the
-                # error propagates instead of looping forever.
+                # `fut.result(timeout=...)` raises TimeoutError both while `fn` is still running
+                # and when `fn` itself raised TimeoutError (e.g. a socket timeout), and `fn` may
+                # also finish between the wait timing out and this check. Once the future is
+                # done, return its own outcome: fn's value, or fn's exception re-raised. Never
+                # re-raise the wait's timeout for a finished future: that would fail an activity
+                # whose tool succeeded, and the retry would run the tool a second time.
                 if fut.done():
-                    raise
+                    return fut.result()
                 activity.heartbeat(detail)
 
     # -------------------------------------------------------------- activities

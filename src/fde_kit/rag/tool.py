@@ -55,16 +55,13 @@ def tenant_search_registry(
         raise ValueError(f"unknown tools {sorted(unknown)}; choose from {list(ALL_TOOLS)}")
     if registry is not None and registry.tenant_id not in (None, tenant_id):
         raise ValueError(f"registry already belongs to tenant {registry.tenant_id!r}")
-    # Never mutate a caller's shared base registry (where tenant_id is None) in place: doing so
-    # would bind that shared instance and its `search_documents` tool to this request's tenant.
-    # Never mutate a caller's shared base registry (where tenant_id is None or is already
-    # bound to this tenant) in place: doing so would bind that shared instance and its
-    # `search_documents` tool to this request's tenant, and a second call would hit a
-    # duplicate-registration error. Always copy the tool map into a fresh registry.
-    if registry is None:
-        out = ToolRegistry(tenant_id=tenant_id)
-    else:
-        out = ToolRegistry(_tools=dict(registry._tools), tenant_id=tenant_id)
+    # Never mutate the caller's registry: a shared base (tenant_id None) would end up bound to
+    # this request's tenant. Copy its tools into a fresh registry instead, leaving out any
+    # retrieval tools it already has (e.g. it is the output of an earlier call for this
+    # tenant), so they are re-registered here rather than raising "tool already registered".
+    out = ToolRegistry(tenant_id=tenant_id)
+    if registry is not None:
+        out._tools.update({n: spec for n, spec in registry._tools.items() if n not in ALL_TOOLS})
 
     if "search_documents" in tools:
 

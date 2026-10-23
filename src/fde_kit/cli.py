@@ -138,13 +138,12 @@ def _first_difference(recorded: str, replayed: str) -> str:
         if x != y:
             return f"differs at line {n}:\n  recorded: {x}\n  replayed: {y}"
     if len(a) == len(b):
-        # splitlines() strips a trailing newline that the original string still has.
-        which = "recorded" if len(recorded) > len(replayed) else "replayed"
-        return f"differs: only {which} has a trailing newline"
-    n = len(a) + 1
-    extra = (a if len(a) > len(b) else b)[n - 1]
-    which = "recorded" if len(a) > len(b) else "replayed"
-    return f"differs at line {n}:\n  only in {which}: {extra}"
+        # Every line matches, so the strings differ only in line breaks: a trailing newline,
+        # or \r\n vs \n (splitlines() treats both as the same boundary).
+        return f"differs only in line breaks:\n  recorded: {recorded!r}\n  replayed: {replayed!r}"
+    n = min(len(a), len(b)) + 1
+    longer, which = (a, "recorded") if len(a) > len(b) else (b, "replayed")
+    return f"differs at line {n}:\n  only in {which}: {longer[n - 1]}"
 
 
 def _cmd_run_from_record(args: argparse.Namespace, settings) -> int:
