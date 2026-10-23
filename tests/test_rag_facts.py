@@ -355,9 +355,17 @@ def test_add_facts_rejects_unknown_entities_and_bad_values(store: TenantStore, e
 # ------------------------------------------------------------------ facts and conflicts
 
 
+def _clear_facts(s) -> None:
+    """`demo_corpus.seed` loads 18 facts and a dictionary per tenant. Tests that assert exact
+    contents start from a clean slate; inside a tenant session the policy is the WHERE clause."""
+    s.conn.execute("DELETE FROM rag_facts")
+    s.conn.execute("DELETE FROM rag_dictionary")
+
+
 def test_add_facts_conflict_rule(store: TenantStore, entities: dict[str, str]):
     period = {"period_start": date(2026, 1, 1), "period_end": None}
     with store.session("harbor") as s:
+        _clear_facts(s)
         lease = s.conn.execute(
             "SELECT doc_id::text FROM rag_documents WHERE source LIKE 'harbor/leases/%' "
             "ORDER BY source LIMIT 1"
@@ -446,6 +454,7 @@ def test_facts_cannot_point_at_another_tenants_document(store: TenantStore, enti
 
 def test_dictionary_upserts_by_field(store: TenantStore):
     with store.session("harbor") as s:
+        s.conn.execute("DELETE FROM rag_dictionary")  # seed loaded one; assert exact contents
         s.set_dictionary(
             [
                 DictEntry("late_fee", "Fee charged after the grace period", "USD"),
@@ -470,7 +479,9 @@ def test_dictionary_upserts_by_field(store: TenantStore):
         DictEntry("late_fee", "Late payment fee", "USD", ("flat", "percent"), "revised"),
     ]
     with store.session("summit") as s:
-        assert s.dictionary() == []
+        # Dictionaries are per tenant: summit keeps its seeded entries, never harbor's edits.
+        summit = {e.field: e for e in s.dictionary()}
+        assert summit and summit["late_fee"].notes != "revised"
 
 
 # ------------------------------------------------------------------ query()
@@ -568,8 +579,10 @@ def test_query_statement_timeout(store: TenantStore):
 
 def test_query_sees_only_the_sessions_tenant(store: TenantStore, entities: dict[str, str]):
     with store.session("summit") as s:
+        _clear_facts(s)
         s.add_facts([FactRow("summit", "late_fee", 50, "USD")])
     with store.session("oakline") as s:
+        _clear_facts(s)
         s.add_facts([FactRow("oakline", "late_fee", 5, "percent_of_rent")])
     with store.session("summit") as s:
         r = s.query("SELECT * FROM rag_facts")

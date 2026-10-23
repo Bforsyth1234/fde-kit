@@ -24,11 +24,8 @@ from collections.abc import Sequence
 from typing import Any
 
 from ..tools import Source, ToolRegistry, ToolResult
-
-# TODO(integrator): replace with `from .store import DictEntry, QueryResult, SqlRejected`
-from ._contract import DictEntry, QueryResult, SqlRejected
 from .schema import validate_tenant_id
-from .store import Hit, TenantStore
+from .store import DictEntry, Hit, QueryResult, SqlRejected, TenantStore
 
 MAX_K = 10
 

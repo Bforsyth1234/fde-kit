@@ -27,8 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
-# TODO(integrator): replace with from .store import FactRow, DictEntry
-from ._contract_demo import DictEntry, FactRow
+from .store import DictEntry, FactRow
 
 
 @dataclass

@@ -10,8 +10,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from fde_kit.rag._contract import DictEntry, DocSlice, Fact, QueryResult, SqlRejected
-from fde_kit.rag.store import Hit, SearchResult
+from fde_kit.rag.store import DictEntry, DocSlice, Fact, Hit, QueryResult, SearchResult, SqlRejected
 from fde_kit.rag.tool import format_passages, tenant_search_registry
 from fde_kit.tools import Source, ToolRegistry
 
