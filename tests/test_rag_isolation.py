@@ -938,3 +938,205 @@ def test_demonstration_iterative_scan_on_a_shared_index_leaks_through_timing(
         rows, work[label] = _shared(store, "shared-a", iterative=True)
         assert rows == 5
     assert work["bigco empty"] < work["bigco unrelated"] < work["bigco about the query"], work
+
+
+# --- facts, query_table, fetch_document (PR 3)
+#
+# query_table hands the model a SQL string. The guard in rag/sqlguard.py is a keyword filter and
+# says so; what makes the tool safe is that the statement runs read-only, as the app role, in a
+# tenant session whose forced RLS policy filters every parent table it can name. These tests
+# attack both layers and check that the second one holds on its own.
+
+FACT_TABLES = (
+    "rag_facts",
+    "rag_entities",
+    "rag_documents",
+    "rag_dictionary",
+    "rag_extraction_jobs",
+)
+HOSTILE_SQL = [
+    "SELECT 1; DELETE FROM rag_facts",
+    "SELECT relname FROM pg_class",
+    "SELECT set_config('app.tenant_id', 'harbor', true)",
+    "COPY rag_facts TO '/tmp/facts.csv'",
+    "WITH x AS (UPDATE rag_facts SET value_num = 0 RETURNING 1) SELECT * FROM x",
+]
+
+
+def _late_fee_num(tid: str) -> str:
+    """'$75' -> '75'; the number as query_table prints it."""
+    return TENANTS[tid]["late_fee"].lstrip("$").split("%")[0]
+
+
+def _facts_snapshot(st: TenantStore, tid: str) -> list[tuple]:
+    with st.session(tid) as s:
+        return sorted((f.fact_id, f.field, f.value) for f in s.facts())
+
+
+@pytest.mark.parametrize("table", FACT_TABLES)
+def test_query_table_over_every_parent_returns_only_the_tenants_rows(store: TenantStore, table):
+    with store.session("summit") as s:
+        res = s.query(f"SELECT tenant_id FROM {table}")
+    assert res.rows and {r[0] for r in res.rows} == {"summit"}
+
+
+def test_query_table_union_against_another_tenant_returns_nothing_of_theirs(store: TenantStore):
+    """The guard lets a UNION through (it is one SELECT). RLS is what makes the harbor half
+    empty: the tool returns summit's rows, no error, and harbor's number is absent."""
+    reg = tenant_search_registry(store, "summit", cached=False)
+    out = reg.execute(
+        "query_table",
+        {
+            "sql": "SELECT field, value_num FROM rag_facts WHERE field = 'late_fee' "
+            "UNION SELECT field, value_num FROM rag_facts WHERE tenant_id = 'harbor'"
+        },
+    )
+    assert not out.is_error
+    assert _late_fee_num("summit") in out.content
+    assert _late_fee_num("harbor") not in out.content
+
+
+@pytest.mark.parametrize("hostile", HOSTILE_SQL)
+def test_query_table_rejects_statements_that_are_not_one_select(store: TenantStore, hostile):
+    harbor_before = _facts_snapshot(store, "harbor")
+    reg = tenant_search_registry(store, "summit", cached=False)
+    out = reg.execute("query_table", {"sql": hostile})
+    assert out.is_error and out.content.startswith("Query rejected")
+    # The session is not poisoned and nobody's facts moved.
+    with store.session("summit") as s:
+        assert s.query("SELECT count(*) FROM rag_facts").rows[0][0] > 0
+    assert _facts_snapshot(store, "harbor") == harbor_before
+
+
+def test_query_table_cannot_write_even_with_the_guard_bypassed(store: TenantStore):
+    """Skip the keyword filter entirely: after one query() the transaction is read-only, and
+    Postgres refuses the UPDATE itself."""
+    before = _facts_snapshot(store, "summit")
+    with store.session("summit") as s:
+        s.query("SELECT 1")
+        with pytest.raises(psycopg.errors.ReadOnlySqlTransaction), s.conn.transaction():
+            s.conn.execute("UPDATE rag_facts SET value_num = 0")
+        # ...and the transaction cannot be switched back.
+        with pytest.raises(psycopg.errors.ActiveSqlTransaction), s.conn.transaction():
+            s.conn.execute("SET LOCAL transaction_read_only = off")
+    assert _facts_snapshot(store, "summit") == before
+
+
+def test_fetch_document_with_another_tenants_doc_id_is_not_found(store: TenantStore, superuser):
+    row = superuser.execute(
+        "SELECT doc_id::text FROM rag_documents WHERE tenant_id = 'harbor' LIMIT 1"
+    ).fetchone()
+    assert row
+    doc_id = row[0]
+    as_summit = tenant_search_registry(store, "summit", cached=False)
+    out = as_summit.execute("fetch_document", {"doc_id": doc_id})
+    assert out.is_error and out.content == "No document with that id."
+    as_harbor = tenant_search_registry(store, "harbor", cached=False)
+    out = as_harbor.execute("fetch_document", {"doc_id": doc_id})
+    assert not out.is_error and out.sources[0].doc_id == doc_id
+
+
+def test_conflicting_facts_are_marked_and_cite_both_documents(store: TenantStore):
+    reg = tenant_search_registry(store, "harbor", cached=False)
+    out = reg.execute(
+        "query_table",
+        {
+            "sql": "SELECT fact_id, field, value_num, doc_id, conflict_group_id FROM rag_facts "
+            "WHERE field = 'late_fee'"
+        },
+    )
+    assert not out.is_error
+    rows = [line for line in out.content.splitlines()[1:] if line.startswith("[#")]
+    assert len(rows) == 2 and all(line.endswith(" conflict=true") for line in rows)
+    values = {line.split(" | ")[2] for line in rows}
+    assert values == {"75", "85"}
+    assert len(out.sources) == 2 and out.sources[0].doc_id != out.sources[1].doc_id
+    with store.session("harbor") as s:
+        sources = {s.fetch(str(src.doc_id)).source for src in out.sources}
+    assert "harbor/addenda/late-fee-2026.md" in sources
+    assert any(src.startswith("harbor/leases/") for src in sources)
+
+
+def test_fetch_document_slices_and_spans(store: TenantStore):
+    reg = tenant_search_registry(store, "harbor", cached=False)
+    with store.session("harbor") as s:
+        row = s.conn.execute(
+            s.sql("SELECT doc_id::text FROM @docs WHERE source = %s"),
+            ("harbor/leases/unit-2b.md",),
+        ).fetchone()
+        assert row
+        doc_id = row[0]
+        total = s.fetch(doc_id).total_chars
+    first = reg.execute("fetch_document", {"doc_id": doc_id, "char_start": 0, "char_end": 40})
+    assert not first.is_error and first.content.endswith("\n\nnext: 40")
+    assert first.sources[0].span == "chars:0-40"
+    assert first.sources[0].source_id == f"{doc_id}:0-40"
+    rest = reg.execute("fetch_document", {"doc_id": doc_id, "char_start": 40, "char_end": 10**6})
+    assert not rest.is_error and "next:" not in rest.content
+    assert rest.sources[0].span == f"chars:40-{total}"
+    assert f"chars 40-{total} of {total}" in rest.content.splitlines()[0]
+
+
+@pytest.mark.parametrize("table", FACT_TABLES)
+def test_posture_check_rejects_a_weakened_policy_on_a_fact_table(
+    admin_url: str, app_url: str, store, table: str
+):
+    from fde_kit.rag.schema import _policy_sql
+
+    with psycopg.connect(app_url) as conn:
+        assert check_posture(conn) == []
+    with psycopg.connect(admin_url, autocommit=True) as admin:
+        admin.execute(f"ALTER POLICY tenant_isolation ON {table} USING (true)")
+        try:
+            with psycopg.connect(app_url) as conn:
+                problems = [p for p in check_posture(conn) if p.check == "policy"]
+            assert problems and table in problems[0].detail
+            with pytest.raises(InsecureConnection):
+                TenantStore(app_url, HashEmbedder())
+        finally:
+            admin.execute(_policy_sql(table))  # as migrate writes it
+    with psycopg.connect(app_url) as conn:
+        assert check_posture(conn) == []
+
+
+def test_fact_query_plans_touch_only_the_tenants_own_partitions(store: TenantStore):
+    """Both the store's own fact queries (which name the partitions) and the model's SQL
+    through the parents (pruned by the policy's tenant_id = current_setting(...) qual)."""
+    own = {
+        partition_name(t, "summit")
+        for t in ("rag_facts", "rag_entities", "rag_documents", "rag_dictionary")
+    }
+    model_sql = (
+        "SELECT f.fact_id, e.canonical_name, f.field, f.value_num FROM rag_facts f "
+        "JOIN rag_entities e ON e.entity_id = f.entity_id WHERE f.field = 'late_fee'"
+    )
+    store_sql = (
+        "SELECT f.fact_id FROM @facts f JOIN @entities e ON e.entity_id = f.entity_id "
+        "LEFT JOIN @docs d ON d.doc_id = f.doc_id WHERE f.field = 'late_fee'"
+    )
+    with store.session("summit") as s:
+        for q in (model_sql, s.sql(store_sql)):
+            plan = s.conn.execute("EXPLAIN (FORMAT JSON) " + q).fetchone()
+            rels = _relations(plan[0][0]["Plan"])  # type: ignore[index]
+            assert rels and rels <= own, f"plans over {rels - own}"
+
+
+def test_fact_tools_have_no_tenant_argument(store: TenantStore):
+    reg = tenant_search_registry(store, "summit", cached=False)
+    schemas = {s["name"]: s["input_schema"]["properties"] for s in reg.api_schemas()}
+    assert set(schemas) == {"search_documents", "fetch_document", "query_table"}
+    for name, props in schemas.items():
+        assert not {"tenant_id", "tenant", "namespace", "filters"} & set(props), name
+    assert set(schemas["query_table"]) == {"sql"}
+    assert set(schemas["fetch_document"]) == {"doc_id", "char_start", "char_end"}
+    out = reg.execute(
+        "query_table",
+        {
+            "sql": "SELECT tenant_id, value_num FROM rag_facts WHERE field = 'late_fee'",
+            "tenant_id": "harbor",
+            "tenant": "harbor",
+        },
+    )
+    assert not out.is_error
+    assert "harbor" not in out.content and _late_fee_num("harbor") not in out.content
+    assert _late_fee_num("summit") in out.content
