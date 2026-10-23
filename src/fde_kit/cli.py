@@ -467,6 +467,61 @@ def cmd_rag(args: argparse.Namespace) -> int:
             _print_sources(result)
             console.print(f"recorded {result.record_path}")
             return 0
+        # --- rag facts (2-D)
+        if args.rag_cmd == "query":
+            with store.session(args.tenant) as s:
+                try:
+                    res = s.query(args.sql, max_rows=args.max_rows)
+                except rag.SqlRejected as exc:
+                    console.print(f"[red]Query rejected[/]: {exc.reason}")
+                    return 1
+            conflict_col = res.columns.index("conflict_group_id") if (
+                "conflict_group_id" in res.columns
+            ) else None
+            table = Table(title=f"{args.tenant}: {args.sql}")
+            for col in res.columns:
+                table.add_column(col)
+            if conflict_col is not None:
+                table.add_column("conflict")
+            for row in res.rows:
+                cells = ["" if v is None else str(v) for v in row]
+                if conflict_col is not None:
+                    cells.append("[red]true[/]" if row[conflict_col] is not None else "")
+                table.add_row(*cells)
+            console.print(table)
+            note = f" (truncated at {args.max_rows}; add a WHERE or LIMIT)" if res.truncated else ""
+            console.print(f"{len(res.rows)} row(s) in {res.elapsed_ms:.1f} ms{note}")
+            return 0
+        if args.rag_cmd == "fetch":
+            with store.session(args.tenant) as s:
+                try:
+                    d = s.fetch(args.doc_id, char_start=args.start, char_end=args.end)
+                except KeyError:
+                    console.print("[red]No document with that id.[/]")
+                    return 1
+            console.print(
+                f"{d.title or d.source} ({d.source}) v{d.version} "
+                f"chars {d.char_start}-{d.char_end} of {d.total_chars}",
+                markup=False,
+                highlight=False,
+                style="bold",
+            )
+            console.rule()
+            console.print(d.text, markup=False, highlight=False)
+            if d.next is not None:
+                console.print(f"\nnext: {d.next}")
+            return 0
+        if args.rag_cmd == "dictionary":
+            with store.session(args.tenant) as s:
+                entries = s.dictionary()
+            table = Table(title=f"{args.tenant}: field dictionary")
+            for col in ("field", "unit", "definition"):
+                table.add_column(col)
+            for e in entries:
+                table.add_row(e.field, e.unit, e.definition)
+            console.print(table)
+            return 0
+        # --- end rag facts (2-D)
     return 2
 
 
@@ -784,6 +839,25 @@ def main(argv: list[str] | None = None) -> int:
     ra.add_argument("--tenant", required=True)
     ra.add_argument("--url")
     ra.add_argument("--embedder")
+    # --- rag facts (2-D)
+    rq = rsub.add_parser("query", help="run one read-only SELECT over a tenant's fact tables")
+    rq.add_argument("sql")
+    rq.add_argument("--tenant", required=True)
+    rq.add_argument("--max-rows", type=int, default=200)
+    rq.add_argument("--url")
+    rq.add_argument("--embedder")
+    rf = rsub.add_parser("fetch", help="print a slice of one of a tenant's documents")
+    rf.add_argument("doc_id")
+    rf.add_argument("--tenant", required=True)
+    rf.add_argument("--start", type=int, default=0)
+    rf.add_argument("--end", type=int, default=6000)
+    rf.add_argument("--url")
+    rf.add_argument("--embedder")
+    rd = rsub.add_parser("dictionary", help="print a tenant's field dictionary")
+    rd.add_argument("--tenant", required=True)
+    rd.add_argument("--url")
+    rd.add_argument("--embedder")
+    # --- end rag facts (2-D)
     rg.set_defaults(fn=cmd_rag)
 
     # --- runs (1-C)

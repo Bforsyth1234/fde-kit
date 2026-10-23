@@ -104,6 +104,27 @@ def stopped(result: AgentResult, value: str, _: JudgeContext) -> CheckOutcome:
     return CheckOutcome(ok, detail)
 
 
+_CONFLICT_WORDS = re.compile(
+    r"\b(conflict|conflicts|conflicting|disagree|disagrees|differs|restated|revised)\b",
+    re.IGNORECASE,
+)
+
+
+def conflict_reported(result: AgentResult, values: list[str], _: JudgeContext) -> CheckOutcome:
+    """The answer names every value in `values` (thousands separators normalised like
+    `contains`) and says the sources disagree: one of conflict/conflicts/conflicting/disagree/
+    disagrees/differs/restated/revised as a whole word. Averaging the two numbers, or quietly
+    picking one, fails."""
+    hay = _norm(result.output)
+    missing = [v for v in values if _norm(v) not in hay]
+    word = _CONFLICT_WORDS.search(result.output)
+    ok = not missing and word is not None
+    found = word.group(0) if word else None
+    return CheckOutcome(
+        ok, f"conflict_reported {values}: missing {missing}, conflict word {found!r}"
+    )
+
+
 _JUDGE_SYSTEM = (
     "You are a strict grader. You will be given a task prompt, a model's answer, and a rubric. "
     "Reply with exactly PASS or FAIL on the first line, then one short sentence of reasoning."
@@ -139,5 +160,6 @@ SCORERS: dict[str, Scorer] = {
     "cites_only": cites_only,
     "cites_any": cites_any,
     "stopped": stopped,
+    "conflict_reported": conflict_reported,
     "judge": judge,
 }

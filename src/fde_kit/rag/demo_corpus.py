@@ -13,12 +13,21 @@ apart.
 Each tenant also has one document the others don't (a maintenance policy, a parking addendum,
 pool rules), so a question about it from another tenant has a correct answer of "nothing".
 
+Since PR 3 the corpus also carries *structured* data for the facts table: one `property_manager`
+entity per tenant, one `unit` entity per lease, a `FactRow` per lease number, and a field
+dictionary. Every tenant also gets a late-fee addendum (again from one shared template) whose
+revised number is loaded on the same `(entity, late_fee, period)` as the lease number, so each
+tenant has exactly one deliberate conflict group.
+
 All names, addresses and numbers are invented.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, datetime
+
+from .store import DictEntry, FactRow
 
 
 @dataclass
@@ -195,6 +204,11 @@ for _i, _tid in enumerate(TENANTS):
 
 _PREFIX = {"harbor": "HPM", "summit": "SR", "oakline": "OH"}
 
+ADDENDUM_LATE_FEES = {"harbor": "$85", "summit": "$60", "oakline": "6% of the monthly rent"}
+"""The late fee each tenant's 2026 addendum sets, as it appears in the addendum text."""
+ADDENDUM_EFFECTIVE = date(2026, 1, 1)
+_DEPOSIT_MONTHS = {"harbor": 1.5, "summit": 1, "oakline": 2}
+
 
 def lease_ref(tid: str, i: int) -> str:
     """A reference number like HPM-26-4317. Opaque on purpose: embeddings can't read meaning
@@ -237,6 +251,32 @@ Tenant must give written notice at least {t["notice_days"]} days before the end 
 
 Tenant reports needed repairs in writing. Landlord makes repairs within a reasonable time. Tenant is responsible for damage caused by Tenant or guests.
 """
+
+
+def _addendum(t: dict, new_fee: str) -> str:
+    """One template for every tenant; only the landlord's name and the new number vary. Like
+    the lease, a leaked addendum chunk would read as a perfectly good answer."""
+    return f"""ADDENDUM: LATE FEE REVISION (2026)
+
+This addendum amends Section 3 (Late Fees) of every residential lease between {t["name"]} ("Landlord") and its tenants.
+
+Effective January 1, 2026, the late fee stated in Section 3 of the lease is revised to {new_fee}. The grace period and every other term of Section 3 are unchanged.
+
+Where this addendum and the lease disagree, this addendum controls.
+"""
+
+
+def addendum_source(tid: str) -> str:
+    return f"{tid}/addenda/late-fee-2026.md"
+
+
+def addendum(tid: str) -> Doc:
+    return Doc(
+        addendum_source(tid),
+        "Addendum: late fee revision (2026)",
+        _addendum(TENANTS[tid], ADDENDUM_LATE_FEES[tid]),
+        {"type": "addendum", "effective": ADDENDUM_EFFECTIVE.isoformat()},
+    )
 
 
 _EXTRAS: dict[str, Doc] = {
@@ -310,7 +350,122 @@ def documents(tenant: str) -> list[Doc]:
         for i, (unit, name, rent, start, end) in enumerate(t["units"])
     ]
     docs.append(_EXTRAS[tenant])
+    docs.append(addendum(tenant))
     return docs
+
+
+# --- structured data (PR 3) -----------------------------------------------------------------
+
+
+def _usd(text: str) -> float:
+    return float(text.replace("$", "").replace(",", ""))
+
+
+def _late_fee(text: str) -> tuple[float, str]:
+    """ "$75" -> (75, "USD"); "5% of the monthly rent" -> (5, "percent_of_rent")."""
+    if text.startswith("$"):
+        return _usd(text), "USD"
+    return float(text.split("%")[0]), "percent_of_rent"
+
+
+def _date(text: str) -> date:
+    return datetime.strptime(text, "%B %d, %Y").date()
+
+
+def entities(tid: str) -> list[tuple[str, str, list[str]]]:
+    """`(kind, canonical_name, aliases)` for `upsert_entity`: the property manager (aliases:
+    tenant id and the first word of its name) and one unit per lease (alias: lease ref)."""
+    t = TENANTS[tid]
+    out = [("property_manager", t["name"], [tid, t["name"].split()[0]])]
+    for i, (unit, *_rest) in enumerate(t["units"]):
+        out.append(("unit", unit, [lease_ref(tid, i)]))
+    return out
+
+
+def fact_rows(tid: str) -> list[tuple[str, FactRow]]:
+    """`(document source, row)` pairs. `FactRow` has no source field, so the document each row
+    was read from rides alongside it; `seed()` swaps the source for the doc_id the ingest
+    returned. Use `facts()` when the provenance doesn't matter.
+
+    The lease's `late_fee` and the addendum's revised `late_fee` share
+    `period_start=ADDENDUM_EFFECTIVE`, so `add_facts` puts them in one conflict group."""
+    t = TENANTS[tid]
+    name = t["name"]
+    first_lease = f"{tid}/leases/{_slug(t['units'][0][0])}.md"
+    fee, fee_unit = _late_fee(t["late_fee"])
+    new_fee, new_fee_unit = _late_fee(ADDENDUM_LATE_FEES[tid])
+    pet: float | str = (
+        _usd(t["pet_deposit"]) if t["pet_deposit"].startswith("$") else t["pet_deposit"]
+    )
+    rows: list[tuple[str, FactRow]] = [
+        (first_lease, FactRow(name, "late_fee", fee, fee_unit, period_start=ADDENDUM_EFFECTIVE)),
+        (
+            addendum_source(tid),
+            FactRow(name, "late_fee", new_fee, new_fee_unit, period_start=ADDENDUM_EFFECTIVE),
+        ),
+        (first_lease, FactRow(name, "grace_days", int(t["grace_days"]), "days")),
+        (first_lease, FactRow(name, "notice_days", int(t["notice_days"]), "days")),
+        (first_lease, FactRow(name, "pet_deposit", pet, "USD" if pet != "not applicable" else "")),
+        (first_lease, FactRow(name, "security_deposit_months", _DEPOSIT_MONTHS[tid], "months")),
+    ]
+    for unit, _name, rent, start, end in t["units"]:
+        rows.append(
+            (
+                f"{tid}/leases/{_slug(unit)}.md",
+                FactRow(
+                    unit,
+                    "monthly_rent",
+                    _usd(rent),
+                    "USD",
+                    period_start=_date(start),
+                    period_end=_date(end),
+                ),
+            )
+        )
+    return rows
+
+
+def facts(tid: str) -> list[FactRow]:
+    """The rows of `fact_rows()` without their document sources (doc_id is None)."""
+    return [row for _src, row in fact_rows(tid)]
+
+
+def dictionary() -> list[DictEntry]:
+    """One entry per field in `facts()`; the same for every tenant."""
+    return [
+        DictEntry(
+            "late_fee",
+            "Fee charged when rent arrives after the grace period.",
+            notes=(
+                "Unit is USD (flat amount) or percent_of_rent (value_num is a percentage of "
+                "the unit's monthly rent). Two rows on the same period mean the lease and an "
+                "addendum disagree; the addendum controls."
+            ),
+        ),
+        DictEntry("grace_days", "Days after the due date before a late fee applies.", "days"),
+        DictEntry(
+            "notice_days",
+            "Days of written notice a tenant must give before the term ends to not renew.",
+            "days",
+        ),
+        DictEntry(
+            "pet_deposit",
+            "Refundable deposit for keeping a pet.",
+            "USD",
+            notes='value_text "not applicable" when the lease allows no pets.',
+        ),
+        DictEntry(
+            "security_deposit_months",
+            "Security deposit due before move-in, as a multiple of monthly rent.",
+            "months",
+        ),
+        DictEntry(
+            "monthly_rent",
+            "Rent due on the first of each month for one unit; period_start/period_end are the "
+            "lease term.",
+            "USD",
+        ),
+    ]
 
 
 def questions() -> list[Question]:
@@ -342,6 +497,20 @@ def questions() -> list[Question]:
             ),
             Question(
                 f"{tid}-pets", tid, "Can I keep a dog in the apartment?", t["pet_rule"], leases
+            ),
+            Question(
+                f"{tid}-grace-days",
+                tid,
+                "What is the grace period in days?",
+                f"{t['grace_days']} days",
+                leases,
+            ),
+            Question(
+                f"{tid}-addendum-late-fee",
+                tid,
+                "What is the revised late fee under the 2026 addendum?",
+                ADDENDUM_LATE_FEES[tid],
+                (addendum_source(tid),),
             ),
             Question(
                 f"{tid}-deposit",
@@ -396,17 +565,34 @@ def questions() -> list[Question]:
 
 
 def seed(store, tenants: list[str] | None = None, reset: bool = True) -> dict[str, int]:
-    """Ingest the corpus. Returns chunk counts per tenant.
+    """Ingest the corpus, then load entities, facts and the dictionary.
 
-    `reset` first deletes every document the demo tenant already has, so an older corpus can't
-    linger as extra distractors. The DELETE has no WHERE clause: inside a tenant session the
-    policy is the WHERE clause."""
+    Returns chunk counts per tenant under `tid`, and the number of fact ids written under
+    `f"{tid}:facts"`.
+
+    `reset` first deletes every document, fact and entity the demo tenant already has, so an
+    older corpus can't linger as extra distractors and a re-seed doesn't stack duplicate facts
+    (which would widen the conflict groups). The DELETEs have no WHERE clause: inside a tenant
+    session the policy is the WHERE clause."""
     counts: dict[str, int] = {}
     for tid in tenants or list(TENANTS):
         with store.session(tid) as s:
             if reset:
+                s.conn.execute("DELETE FROM rag_facts")
+                s.conn.execute("DELETE FROM rag_entities")
                 s.conn.execute("DELETE FROM rag_documents")
+            doc_ids: dict[str, str] = {}
             for d in documents(tid):
-                s.ingest(d.source, d.text, title=d.title, metadata=d.metadata)
+                doc_ids[d.source] = s.ingest(d.source, d.text, title=d.title, metadata=d.metadata)
             counts[tid] = s.count_chunks()
+            for kind, canonical, aliases in entities(tid):
+                s.upsert_entity(kind, canonical, aliases)
+            job = s.start_extraction_job("seed")
+            rows: list[FactRow] = []
+            for src, row in fact_rows(tid):
+                row.doc_id = doc_ids[src]
+                rows.append(row)
+            ids = s.add_facts(rows, extraction_job_id=job)
+            s.set_dictionary(dictionary())
+            counts[f"{tid}:facts"] = len(ids)
     return counts

@@ -15,22 +15,42 @@ from .schema import (
     drop_tenant,
     migrate,
 )
-from .store import Hit, SearchResult, TenantSession, TenantStore
+from .sqlguard import SqlRejected, check_select
+from .store import (
+    DictEntry,
+    DocSlice,
+    Fact,
+    FactRow,
+    Hit,
+    IngestOutcome,
+    QueryResult,
+    SearchResult,
+    TenantSession,
+    TenantStore,
+)
 from .tool import tenant_search_registry
 
 __all__ = [
     "APP_ROLE",
+    "DictEntry",
+    "DocSlice",
     "Embedder",
+    "Fact",
+    "FactRow",
     "FastEmbedEmbedder",
     "HashEmbedder",
     "Hit",
+    "IngestOutcome",
     "InsecureConnection",
     "PostureProblem",
+    "QueryResult",
     "SearchResult",
+    "SqlRejected",
     "TenantSession",
     "TenantStore",
     "app_url_from_admin",
     "check_posture",
+    "check_select",
     "chunk_text",
     "create_tenant",
     "drop_tenant",
