@@ -104,7 +104,8 @@ def tenant_search_registry(
             so each row is numbered, citable, and labelled with the document it came from and
             whether it conflicts; you do not need to join documents yourself. Rows marked
             conflict=true disagree with another source: report every value and say they
-            conflict."""
+            conflict. When conflicting rows were "reported as" different line items, say so:
+            that is a reclassification, not a correction of the same figure."""
             # The tables paragraph, an example query and one line per dictionary field are
             # appended to this description when the registry is built; see
             # query_table_description().
@@ -177,6 +178,18 @@ def format_slice(d: Any, *, tenant_id: str | None = None) -> ToolResult:
     return ToolResult(content, sources=(source,))
 
 
+def reported_line_item(source_ref: str) -> str:
+    """The line item a fact was reported under, from its `source_ref`.
+
+    Adapters write `"<taxonomy>:<Tag>@<accession>"` (EDGAR: `us-gaap:ResearchAndDevelopmentExpense@
+    0000882095-20-000006`); this returns the part before `@`. Empty for facts without one (the
+    lease demo). Showing it lets the model see *why* two values conflict when the reason is a
+    reclassification: Gilead's FY2019 R&D is $9,106M as ResearchAndDevelopmentExpense and
+    $4,055M as ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost.
+    """
+    return source_ref.split("@", 1)[0] if source_ref else ""
+
+
 def fact_ids_in(result: QueryResult) -> list[str]:
     """The non-null values of a `fact_id` column, if the result has one."""
     if "fact_id" not in result.columns:
@@ -196,7 +209,9 @@ def format_query_result(
 
     - Source = `Fact.to_source`: uri is the document's URL, title "<entity> <field> <period>",
       doc_id, the document's content hash, span `fact:<fact_id>`.
-    - The line the model reads ends with ` (source: <document title>)` and with
+    - The line the model reads ends with ` (source: <document title>)`, or
+      ` (source: <document title>; reported as <line item>)` when the fact has a `source_ref`
+      (the XBRL tag for EDGAR facts), and with
       ` conflict=true` when the fact is in a conflict group, even if neither column was
       selected. This is what lets the model say which filing each number came from without a
       second query.
@@ -232,7 +247,10 @@ def format_query_result(
             if fact is not None:
                 sources.append(fact.to_source(tenant_id))
                 label = fact.doc_title or fact.doc_source
-                if label:
+                reported_as = reported_line_item(fact.source_ref)
+                if label and reported_as:
+                    line += f" (source: {label}; reported as {reported_as})"
+                elif label:
                     line += f" (source: {label})"
                 conflict = conflict or fact.conflict_group_id is not None
             else:

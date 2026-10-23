@@ -47,6 +47,8 @@ VERTEX = "VERTEX PHARMACEUTICALS INC / MA"
 MODERNA = "Moderna, Inc."
 REGENERON = "REGENERON PHARMACEUTICALS, INC."
 
+REV = "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
+
 PFIZER_REVENUE_SQL = (
     "SELECT f.fact_id, e.canonical_name, f.value_num FROM rag_facts f "
     "JOIN rag_entities e ON e.entity_id = f.entity_id "
@@ -380,9 +382,9 @@ def test_query_table_citations_carry_the_filing_even_when_sql_selects_no_documen
         "40905000000",
     ]
     assert all(r.endswith(" conflict=true") for r in rows)
-    assert "(source: PFIZER INC 10-K FY2019 (EX-13))" in rows[0]
-    assert "(source: PFIZER INC 10-K FY2020 (10-K))" in rows[1]
-    assert "(source: PFIZER INC 10-K FY2021 (10-K))" in rows[2]
+    assert f"(source: PFIZER INC 10-K FY2019 (EX-13); reported as {REV})" in rows[0]
+    assert f"(source: PFIZER INC 10-K FY2020 (10-K); reported as {REV})" in rows[1]
+    assert f"(source: PFIZER INC 10-K FY2021 (10-K); reported as {REV})" in rows[2]
     assert len(out.sources) == 3
     for src in out.sources:
         assert src.uri.startswith("https://www.sec.gov/Archives/edgar/data/78003/")
@@ -399,3 +401,23 @@ def test_facts_by_id_ignores_non_uuids_and_other_tenants(seeded, store):
         got = s.facts_by_id([pfizer, moderna, "not-a-uuid", "1; DROP TABLE x"])
     assert set(got) == {pfizer}  # pharma-b's fact is invisible under RLS, junk is skipped
     assert got[pfizer].doc_title and got[pfizer].doc_source.startswith("https://www.sec.gov/")
+
+
+def test_gilead_reclassification_is_visible_to_the_model(seeded, store):
+    """Gilead's FY2019 R&D conflict is a reclassification. The model must be able to see that
+    from the tool output: each row names the line item it was reported under."""
+    out = tenant_search_registry(store, "pharma-a").execute(
+        "query_table",
+        {
+            "sql": "SELECT f.fact_id, f.value_num FROM rag_facts f "
+            "JOIN rag_entities e ON e.entity_id = f.entity_id "
+            "WHERE e.canonical_name = 'GILEAD SCIENCES, INC.' AND f.field = 'rd_expense' "
+            "AND f.period_end = '2019-12-31' ORDER BY f.value_num DESC"
+        },
+    )
+    rows = out.content.splitlines()[1:]
+    assert len(rows) == 3 and all(r.endswith(" conflict=true") for r in rows)
+    assert rows[0].split(" | ")[1].startswith("9106000000")
+    assert "reported as us-gaap:ResearchAndDevelopmentExpense)" in rows[0]
+    later = "reported as us-gaap:ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost)"
+    assert later in rows[1] and later in rows[2]

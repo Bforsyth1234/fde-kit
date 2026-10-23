@@ -497,9 +497,12 @@ def test_query_table_attaches_document_provenance_the_sql_did_not_select():
     out = reg.execute("query_table", {"sql": "SELECT fact_id, value_num FROM rag_facts"})
     lines = out.content.splitlines()
     assert lines[1] == (
-        "[#1] f-2019 | 51750000000 (source: PFIZER INC 10-K FY2019 (EX-13)) conflict=true"
+        "[#1] f-2019 | 51750000000 (source: PFIZER INC 10-K FY2019 (EX-13); "
+        "reported as us-gaap:Revenues) conflict=true"
     )
-    assert lines[2].endswith("(source: PFIZER INC 10-K FY2020 (10-K)) conflict=true")
+    assert lines[2].endswith(
+        "(source: PFIZER INC 10-K FY2020 (10-K); reported as us-gaap:Revenues) conflict=true"
+    )
     # f-x is not a fact the database knows: column fallback, no invented provenance.
     assert lines[3] == "[#3] f-x | 1"
     s1, s2, s3 = out.sources
@@ -527,3 +530,30 @@ def test_query_table_description_has_an_example_the_guard_accepts():
     example = TABLES_PARAGRAPH.split("Example:\n")[1].split("\nFields:")[0]
     assert example.startswith("SELECT f.fact_id") and check_select(example)
     assert "information_schema" in TABLES_PARAGRAPH  # says what is NOT available
+
+
+@pytest.mark.parametrize(
+    "ref, expected",
+    [
+        ("us-gaap:ResearchAndDevelopmentExpense@0000882095-20-000006",
+         "us-gaap:ResearchAndDevelopmentExpense"),
+        ("us-gaap:Revenues", "us-gaap:Revenues"),
+        ("", ""),
+    ],
+)
+def test_reported_line_item(ref, expected):
+    from fde_kit.rag.tool import reported_line_item
+
+    assert reported_line_item(ref) == expected
+
+
+def test_fact_without_source_ref_gets_no_reported_as():
+    f = _fact("f-1", 75, "lease", "Lease: Unit 1A", None)
+    f.source_ref = ""
+    s = FakeSession(
+        result=QueryResult(columns=["fact_id"], rows=[("f-1",)], truncated=False, elapsed_ms=1),
+        known_facts={"f-1": f},
+    )
+    reg, _ = registry(s)
+    line = reg.execute("query_table", {"sql": "SELECT fact_id FROM rag_facts"}).content
+    assert line.splitlines()[1] == "[#1] f-1 (source: Lease: Unit 1A)"
