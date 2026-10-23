@@ -51,6 +51,14 @@ jobs:
           FDE_RAG_ADMIN_URL: postgresql://fde:fde@localhost:5432/fde
           FDE_RAG_EMBEDDER: hash
           FDE_OTEL_ENABLED: "false"
+      - name: edgar eval (seed pharma-a/pharma-b from offline fixtures, scripted model, real tools)
+        # --seed ingests the pinned filings from evals/fixtures/edgar/cache: no network, no
+        # contact string. Idempotent, so it is safe on a database that is already seeded.
+        run: python -m evals.run_evals --set edgar --seed --provider mock --threshold 1.0
+        env:
+          FDE_RAG_ADMIN_URL: postgresql://fde:fde@localhost:5432/fde
+          FDE_RAG_EMBEDDER: hash
+          FDE_OTEL_ENABLED: "false"
 
   eval:
     # The real gate. Runs only when the repo has an API key secret, so forks and PRs from
