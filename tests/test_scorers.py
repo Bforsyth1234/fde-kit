@@ -90,3 +90,41 @@ def test_conflict_reported_is_value_aware():
 def test_amount_check_value_must_hold_one_number():
     with pytest.raises(ValueError):
         amount(r("x"), "$1 or $2", CTX)
+
+
+class _FakeJudge:
+    def __init__(self, reply: str) -> None:
+        self.reply, self.seen = reply, ""
+
+    def complete(self, *, system, messages, tools, max_tokens):
+        self.seen = messages[0]["content"]
+        return SimpleNamespace(text=self.reply)
+
+
+def _run_with_tool_output(content: str, answer: str) -> SimpleNamespace:
+    step = SimpleNamespace(tool_results=[{"name": "search_documents", "content": content}])
+    return SimpleNamespace(output=answer, steps=[step])
+
+
+def test_judge_sees_the_evidence_the_model_saw():
+    """A claim quoted from a document must not read as an outside fact: the judge gets the
+    tool outputs. (Live rag-conflict-01 failed because the judge saw only the answer.)"""
+    from evals.scorers import judge
+
+    fake = _FakeJudge("PASS\nGrounded.")
+    res = _run_with_tool_output(
+        "[1] This addendum amends Section 3 of every residential lease.",
+        "The addendum amends every lease [1].",
+    )
+    out = judge(res, "rubric", JudgeContext(provider=fake, prompt="q"))
+    assert out.passed
+    assert "amends Section 3 of every residential lease" in fake.seen
+    assert fake.seen.index("EVIDENCE") < fake.seen.index("MODEL ANSWER")
+
+
+def test_judge_evidence_is_capped():
+    from evals.scorers import evidence
+
+    text = evidence(_run_with_tool_output("x" * 50_000, "a"), limit=1000)
+    assert len(text) < 1100 and "truncated" in text
+    assert evidence(SimpleNamespace(steps=[])) == "(no tools were called)"
