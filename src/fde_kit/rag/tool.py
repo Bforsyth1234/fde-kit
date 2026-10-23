@@ -57,12 +57,14 @@ def tenant_search_registry(
         raise ValueError(f"registry already belongs to tenant {registry.tenant_id!r}")
     # Never mutate a caller's shared base registry (where tenant_id is None) in place: doing so
     # would bind that shared instance and its `search_documents` tool to this request's tenant.
+    # Never mutate a caller's shared base registry (where tenant_id is None or is already
+    # bound to this tenant) in place: doing so would bind that shared instance and its
+    # `search_documents` tool to this request's tenant, and a second call would hit a
+    # duplicate-registration error. Always copy the tool map into a fresh registry.
     if registry is None:
         out = ToolRegistry(tenant_id=tenant_id)
-    elif registry.tenant_id is None:
-        out = ToolRegistry(_tools=dict(registry._tools), tenant_id=tenant_id)
     else:
-        out = registry
+        out = ToolRegistry(_tools=dict(registry._tools), tenant_id=tenant_id)
 
     if "search_documents" in tools:
 

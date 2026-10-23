@@ -74,6 +74,12 @@ class AgentActivities:
             try:
                 return fut.result(timeout=self.heartbeat_every)
             except TimeoutError:
+                # `fut.result(timeout=...)` raises TimeoutError both when the future is slow
+                # and when `fn` itself raised TimeoutError (e.g. a socket timeout). Only
+                # heartbeat while the future is still running; otherwise re-raise so the
+                # error propagates instead of looping forever.
+                if fut.done():
+                    raise
                 activity.heartbeat(detail)
 
     # -------------------------------------------------------------- activities
