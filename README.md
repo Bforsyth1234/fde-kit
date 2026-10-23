@@ -230,13 +230,26 @@ both runtimes, one record.
 ```
 
 Check types: `exact`, `contains`, `any_of`, `regex`, `tool_called`, `no_tool`, `cites`,
-`cites_only`, `cites_any`, `stopped`, `conflict_reported`, `judge`. A case passes only if every
-check passes. `cites <id>` passes when the answer cites, by `[n]`, a Source whose `source_id`,
-`doc_id` or `uri` is `<id>`; naming the document in prose does not count. `cites_only` passes
-when no citation in the answer is fabricated. `stopped <reason>` compares
-`result.stopped_reason` (`end_turn`, `max_turns`, `replay_diverged`). `conflict_reported
-[values]` passes when the output contains every listed value and one of the words "conflict",
-"conflicts", "disagree", "differs", "restated". The report shows pass rate overall and per category, p50/p95 latency, token
+`cites_only`, `cites_any`, `cites_one_of`, `stopped`, `amount`, `no_amount`, `date`,
+`conflict_reported`, `judge`. A case passes only if every check passes. `cites <id>` passes when
+the answer cites, by `[n]`, a Source whose `source_id`, `doc_id` or `uri` is `<id>`; naming the
+document in prose does not count. `cites_one_of [ids]` passes when it cites any of them (for a
+clause every lease repeats). `cites_only` passes when no citation in the answer is fabricated.
+`stopped <reason>` compares `result.stopped_reason` (`end_turn`, `max_turns`, `replay_diverged`).
+
+Numbers and dates are checked by value, not by string. `amount "$16,071.7 million"` parses every
+amount in the answer, scale words included, so "$16.07 billion" and "USD 16,071,700,000" match
+too (relative tolerance 0.25%, tight enough that Pfizer's 41,172 and 40,905 stay distinct).
+`no_amount` is the leak check: the other tenant's number must not appear in any format, with a
+wider 1% tolerance so it errs toward flagging. `date "2026-12-01"` also accepts "December 1,
+2026". `conflict_reported [values]` passes when every value is present (value-aware) and the
+answer says the sources disagree (conflict, disagree, differ, restate, revise, inconsistent,
+discrepancy, in any form). Wording that a string check cannot judge fairly, such as whether a
+refusal says the company is not on file or whether a precision difference is explained as
+rounding, goes to a `judge` rubric; judges run only against a live model, so mock runs check
+everything else.
+
+The report shows pass rate overall and per category, p50/p95 latency, token
 totals and, when any citation was fabricated, citation precision in red; the header carries
 the model and the prompt hash. `--json` writes the full per-case record, including
 `prompt_sha256`, `sources`, `cited` and `fabricated_citations`, for diffing between model or
@@ -258,8 +271,8 @@ corpus, each bound to a tenant, with the three retrieval tools running for real 
 Postgres while the model is the mock or the live one. Four look a term up in a lease (`cites`
 the lease), four reach a number through `query_table` (`tool_called`, `contains`, `cites` the
 fact's document), two hit the late-fee conflict (`conflict_reported` both values, `cites` both
-documents), and two ask one tenant for another tenant's unit (`cites_only`; the answer says not
-found). CI seeds the demo and runs it in mock mode with a pass threshold of 1.0.
+documents), and two ask one tenant for another tenant's unit (`cites_only`, `no_amount` for the
+other tenant's figure, and a judge rubric that the answer says not found). CI seeds the demo and runs it in mock mode with a pass threshold of 1.0.
 
 `fde eval --set edgar` runs a third set, `evals/golden_edgar.jsonl`: 12 cases over the pinned
 EDGAR corpus (see Source adapters and SEC EDGAR), seeded offline from the committed fixtures.
@@ -267,10 +280,11 @@ Three `table-fact` cases reach one number through `query_table` (Moderna FY2021 
 Gilead FY2021 net income, Regeneron FY2021 revenue) and cite the filing. Three
 `table-conflict` cases hit a real restatement (Pfizer FY2019 revenue, Gilead FY2019 R&D,
 Regeneron FY2019 revenue): `conflict_reported` every value, `cites` every filing. Two
-`precision` cases (Vertex FY2019 revenue, Moderna FY2020 net loss) assert the opposite: no
-`conflict=true` in the tool output, one value in the answer, no conflict wording. Two
+`precision` cases (Vertex FY2019 revenue, Moderna FY2020 net loss) assert the opposite: the
+value is stated, and a judge rubric checks the answer treats the gap as rounding, not a conflict. Two
 `doc-lookup` cases answer from the first 40,000 characters of a filing, and two `cross-tenant`
-cases ask `pharma-b` for Pfizer and `pharma-a` for Moderna and expect not found. CI runs it in
+cases ask `pharma-b` for Pfizer and `pharma-a` for Moderna and expect not found, with the
+other tenant's figure absent in any format. CI runs it in
 mock mode with a pass threshold of 1.0; no network, no SEC contact.
 
 ## Durable runs (Temporal)
