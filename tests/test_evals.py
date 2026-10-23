@@ -155,7 +155,9 @@ def test_golden_rag_cases_are_well_formed():
             cited = {chk["value"] for chk in c["checks"] if chk["type"] == "cites"}
             assert addendum_source(c["tenant"]) in cited, c["id"]
         if c["category"] == "cross-tenant":
-            assert any(chk["type"] == "regex" for chk in c["checks"]), c["id"]
+            # The other tenant's number must not appear in any format; wording goes to the judge.
+            assert any(chk["type"] == "no_amount" for chk in c["checks"]), c["id"]
+            assert any(chk["type"] == "judge" for chk in c["checks"]), c["id"]
     assert by_cat == RAG_CATEGORIES
 
 
@@ -248,12 +250,12 @@ def test_golden_edgar_cases_are_well_formed():
             assert len(conflict) == 1 and len(conflict[0]["value"]) >= 2, c["id"]
             assert len(cited) >= 2, f"{c['id']}: a conflict cites every filing"
         if c["category"] == "precision":
-            assert any(
-                chk["type"] == "regex" and "conflict" in chk["value"] for chk in c["checks"]
-            ), c["id"]
+            assert any(chk["type"] == "amount" for chk in c["checks"]), c["id"]
+            assert any(chk["type"] == "judge" for chk in c["checks"]), c["id"]
         if c["category"] == "cross-tenant":
             assert not cited, c["id"]
-            assert any(chk["type"] == "regex" for chk in c["checks"]), c["id"]
+            assert any(chk["type"] == "no_amount" for chk in c["checks"]), c["id"]
+            assert any(chk["type"] == "judge" for chk in c["checks"]), c["id"]
     assert by_cat == EDGAR_CATEGORIES
     assert {c["tenant"] for c in cases} == set(EDGAR_TENANTS)
 
