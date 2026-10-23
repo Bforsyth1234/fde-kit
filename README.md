@@ -11,7 +11,8 @@ knowing whether it works, with every answer traceable to the records and the pro
 | Tool registry | `@registry.tool` on a typed Python function. Schema derived from the signature. Errors returned to the model, not raised. A tool may return `ToolResult(content, sources=...)` to say what records its content came from. | `src/fde_kit/tools.py` |
 | Prompts | Markdown files, Git-tracked, hashed. Every run records `prompt_name` and `prompt_sha256` on the result, the spans and the eval JSON. | `src/fde_kit/prompts/` |
 | Tracing | OpenTelemetry → Arize Phoenix (one container, no config). Token counts, tool I/O, source ids and prompt hash per span. | `src/fde_kit/tracing.py`, `docker-compose.yml` |
-| Eval harness | 22-case golden set, deterministic checks (incl. `cites` / `cites_only`) + optional LLM-as-judge, pass-rate and citation-precision gates wired into CI. | `evals/` |
+| Run records | A run as a JSONL file: replay it exactly, replay with a live model, or fork it at a turn. Durable runs export to the same file. | `src/fde_kit/record.py` |
+| Eval harness | 25-case golden set, deterministic checks (incl. `cites` / `cites_only`, replayed runs) + optional LLM-as-judge, pass-rate and citation-precision gates wired into CI. | `evals/` |
 
 **Optional extras** (`pip install "fde-kit[durable]"`, `"fde-kit[rag]"`):
 
@@ -109,6 +110,112 @@ history (`AgentRunInput` / `AgentRunOutput`). Two eval files with different hash
 experiments; Git is the version store and the hash is how a trace points at a commit of the
 prompt without needing Git at runtime.
 
+## Record, replay, fork
+
+A finished run becomes one file, `runs/<run_id>.jsonl`, with every LLM response and every tool
+result in the order they happened. The file can be replayed without the model or the database,
+replayed against a live model with the evidence frozen, or forked at a turn with a new
+instruction.
+
+| Mode | What is frozen | What re-runs | What the diff tells you |
+| --- | --- | --- | --- |
+| Exact replay | prompt, LLM responses, tool results | nothing | Nothing: output is byte-identical. Proves the evidence path and the citations are reconstructible from the file alone. |
+| Live-LLM replay | prompt (pinned from the header), tool results | every LLM call | How the model's reasoning and wording changed on the same evidence; the `cites` checks say whether the citations held. |
+| Fork | turns 1..N exactly as recorded | turn N+1 onward, with an injected instruction, live model, real tools | What a different instruction does from the same starting state. The parent file is never written to; lineage is in the child's header. |
+
+```
+fde run "prompt"                         # as today; + "run_id r-… saved to runs/r-….jsonl" if FDE_RECORD_RUNS
+fde run --record PATH "prompt"            # record to PATH
+fde run --replay PATH                     # exact replay; prompt taken from the record
+fde run --replay PATH --live-llm          # tools from record, model live, prompt pinned from header
+fde run --fork PATH --at N "instruction"  # new run; header.parent_run_id/fork_at set; written to runs/
+fde rag ask --tenant T "q"                # always records to runs/ (prints the path)
+fde runs list [--dir runs]                # table: run_id, created_at, runtime, tenant, model, prompt, turns, stopped, parent
+fde runs tree RUN_ID                      # lineage: parents up, forks down (scans the dir)
+fde runs show RUN_ID                      # header + one line per row (turn, kind, name/stop_reason)
+fde durable-export WORKFLOW_ID [--out PATH]   # a Temporal run's history, as the same file
+```
+
+`--replay` prints the recorded output, then the replayed output, then `identical` or `differs`
+with the first differing line; for `--live-llm` that line is the point. A replay that asks for a
+tool call the record does not have next prints `replay diverged at turn N: expected
+<name>(input) got <name>(input)` and exits 3.
+
+```python
+from fde_kit import Agent
+from fde_kit.record import (RunRecord, fork_session, live_llm_session, recorded_prompt,
+                            replay_session)
+
+result = Agent(registry).run("What is the uptime SLA?", record="runs/sla.jsonl")
+result.run_id, result.record_path            # "r-3f9a1c2e7b4d", "runs/sla.jsonl"
+
+rec = RunRecord.load("runs/sla.jsonl")       # validates the header and the format version
+rec.header["model"], rec.result["output"]    # rec.llm_rows(), rec.tool_rows(), rec.user_rows()
+prompt = recorded_prompt(rec)                # the opening user row
+
+again = Agent(registry).run(prompt, session=replay_session(rec, registry))
+again.output == rec.result["output"]         # True, byte for byte
+again.stopped_reason                         # "end_turn", or "replay_diverged" with diverged_at set
+
+live = Agent(registry).run(prompt, session=live_llm_session(rec, registry, provider))
+
+child = Agent(registry).run(
+    prompt,
+    session=fork_session(rec, registry, provider, at=1, instruction="Quote the clause verbatim."),
+    record="runs/sla-fork.jsonl",            # child file; header carries parent_run_id and fork_at
+)
+```
+
+`provider` is any `LLMProvider` (the Anthropic one, or `MockProvider` in tests). The second
+argument to each session helper is the registry the run was recorded with: the model must see
+the same tool schemas, and after a fork's `at` the real tools in it run.
+
+The file, one JSON object per line, `kind` first (trimmed):
+
+```jsonc
+{"kind":"header","version":1,"run_id":"r-3f9a1c2e7b4d","created_at":"2026-10-22T23:40:11Z",
+ "runtime":"agent","tenant_id":null,"model":"claude-sonnet-5-5","prompt_name":"default",
+ "prompt_sha256":"9abf…","prompt_text":"…","tools":["search_documents"],"parent_run_id":null,"fork_at":null}
+{"kind":"user","turn":1,"text":"How much is the late fee?","actor":"user","by":""}
+{"kind":"llm","turn":1,"text":"","stop_reason":"tool_use",
+ "tool_calls":[{"id":"toolu_01","name":"search_documents","input":{"query":"late fee"}}],"raw_content":[…],"usage":{…}}
+{"kind":"tool","turn":1,"tool_use_id":"toolu_01","name":"search_documents","input":{"query":"late fee"},
+ "content":"[#1] Lease 101 (…)\n…","is_error":false,"sources":[{"source_id":"…","content_hash":"…"}],"approval":null}
+{"kind":"llm","turn":2,"text":"The late fee is $50 [1].","stop_reason":"end_turn","tool_calls":[],…}
+{"kind":"result","output":"The late fee is $50 [1].","stopped_reason":"end_turn","turns":2,
+ "total_ms":2412,"sources":[…],"cited":["lease:101"],"fabricated_citations":[]}
+```
+
+Two details make replay exact. A `tool` row stores the tool's raw content, with its local
+`[#i]` markers, before the citation ledger rewrote them to run-wide `[n]`; a replay pushes that
+content through the same ledger, so the numbering, `result.sources` and `result.cited` are
+re-derived rather than copied. And a replay matches each requested tool call to the next
+unconsumed `tool` row by `(name, input)`, never by `tool_use_id`: ids differ across providers
+and across live reruns, while a model that asks the same tool the same question is on the same
+evidence path. Anything else raises `ReplayDiverged`, which the loop reports as
+`stopped_reason="replay_diverged"` with `diverged_at` and the expected and actual calls.
+`llm` rows are indexed by the number of assistant messages already in the conversation, the
+same way `MockProvider` is, so a fork's injected user message does not shift them.
+
+Determinism, stated plainly: pure replay is exact. Live-LLM replay and forks reproduce the
+evidence path exactly and the model's wording approximately. The `cites` checks assert the
+former.
+
+**`runs/` is local evidence.** The file is unredacted: prompt text, every passage a tool
+returned, the answer. Treat it like a trace with `FDE_OTEL_TENANT_CONTENT=1`. The directory is
+gitignored; delete it on your own schedule. `fde run` records only when `FDE_RECORD_RUNS=1` or
+`--record` is given; `fde rag ask` always records and prints the path.
+
+A durable run exports to the same file. `fde durable-export WORKFLOW_ID` walks the workflow's
+event history: the start event gives the header and the `user` row, each `llm_call` and
+`tool_execute` activity gives an `llm` or `tool` row (with the approval decision on the tool row
+when there was one), and the completion gives the `result` row. The summarizer activity is
+skipped so the record keeps the raw tool content; a summarized step carries
+`summarized_from_chars` instead. `tests/test_durable.py::test_export_then_replay` runs the
+standard mock scenario on a worker, exports it, loads it with `RunRecord.load` and replays it
+through the in-process `Agent`, asserting the same output and `stopped_reason == "end_turn"`:
+both runtimes, one record.
+
 ## Evals
 
 `evals/golden.jsonl` has one case per line:
@@ -123,10 +230,11 @@ prompt without needing Git at runtime.
 ```
 
 Check types: `exact`, `contains`, `any_of`, `regex`, `tool_called`, `no_tool`, `cites`,
-`cites_only`, `cites_any`, `judge`. A case passes only if every check passes. `cites <id>`
-passes when the answer cites, by `[n]`, a Source whose `source_id`, `doc_id` or `uri` is `<id>`;
-naming the document in prose does not count. `cites_only` passes when no citation in the answer
-is fabricated. The report shows pass rate overall and per category, p50/p95 latency, token
+`cites_only`, `cites_any`, `stopped`, `judge`. A case passes only if every check passes.
+`cites <id>` passes when the answer cites, by `[n]`, a Source whose `source_id`, `doc_id` or
+`uri` is `<id>`; naming the document in prose does not count. `cites_only` passes when no
+citation in the answer is fabricated. `stopped <reason>` compares `result.stopped_reason`
+(`end_turn`, `max_turns`, `replay_diverged`). The report shows pass rate overall and per category, p50/p95 latency, token
 totals and, when any citation was fabricated, citation precision in red; the header carries
 the model and the prompt hash. `--json` writes the full per-case record, including
 `prompt_sha256`, `sources`, `cited` and `fabricated_citations`, for diffing between model or
@@ -135,6 +243,13 @@ prompt versions.
 Every case carries a `mock` script. `--provider mock` replays it, which tests the harness and the
 tools rather than the model. If a case passes in mock mode and fails against the real model, the
 model is the problem. If it fails in both, the check or the tool is. Keep both honest.
+
+A case may carry `"replay": "evals/runs/<file>.jsonl"` instead of `mock`: the harness replays
+that record (see Record, replay, fork) and applies the checks to the result, in both providers.
+The three `replay` cases cover a cited run, a two-tool run, and a record edited so the second
+tool input differs, which must end with `stopped: replay_diverged`. The fixture records are
+generated by `python -m evals.make_replay_fixtures` and committed; `tests/test_evals.py`
+asserts they regenerate byte-identical, so a drift in the file format is caught.
 
 ## Durable runs (Temporal)
 
@@ -618,6 +733,8 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
 | `FDE_OTEL_ENABLED` | `true` | Export spans |
 | `FDE_OTEL_ENDPOINT` | `http://localhost:6006/v1/traces` | OTLP/HTTP collector |
 | `FDE_OTEL_TENANT_CONTENT` | `false` | Record prompts and tool I/O on spans for tenant-bound runs. Only with a per-tenant access-controlled trace store. |
+| `FDE_RUNS_DIR` | `runs` | Where run records are written (`<run_id>.jsonl`). Unredacted local evidence; gitignored. |
+| `FDE_RECORD_RUNS` | `false` | Record every `fde run`. `fde rag ask` always records. |
 | `FDE_EVAL_PASS_THRESHOLD` | `0.85` | CI gate |
 | `FDE_RAG_URL` | derived from admin URL | App connection for retrieval, as `fde_rag_app`. Never a superuser. |
 | `FDE_RAG_ADMIN_URL` | `postgresql://fde:fde@localhost:5432/fde` | Used only by `fde rag migrate` / `seed-demo` |
@@ -642,12 +759,15 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
   model's description of its source is trusted.
 - **Trace attributes for citations are ids only.** `tool.source_ids` and `tool.citations` go on
   spans even for tenant-bound runs; content stays `[redacted]` there.
+- **Replay is deterministic at the tool boundary.** A record stores what the model asked each
+  tool and what the tool returned, and a replay serves those rows in order, verifying
+  `(name, input)`, so the guarantee is the same evidence path, not the same prose. A request the
+  record does not have next is reported as `replay_diverged`, never answered from a different row.
 
 ## What's not here yet
 
-Record/replay/fork of a finished run, structured facts with a `query_table` tool, source
-adapters for public data (EDGAR), pairwise/A-B eval mode, a customers/ onboarding directory,
-and a one-command cloud deploy.
+Structured facts with a `query_table` tool, source adapters for public data (EDGAR),
+pairwise/A-B eval mode, a customers/ onboarding directory, and a one-command cloud deploy.
 
 ## License
 

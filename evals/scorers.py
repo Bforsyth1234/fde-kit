@@ -95,6 +95,15 @@ def cites_any(result: AgentResult, _v: Any, _: JudgeContext) -> CheckOutcome:
     return CheckOutcome(bool(result.cited), f"cites_any: cited {len(result.cited)}")
 
 
+def stopped(result: AgentResult, value: str, _: JudgeContext) -> CheckOutcome:
+    """The run ended for this reason: `end_turn`, `max_turns` or `replay_diverged`."""
+    ok = result.stopped_reason == value
+    detail = f"stopped {value}: got {result.stopped_reason!r}"
+    if result.divergence is not None:
+        detail += f" at turn {result.diverged_at} ({result.divergence})"
+    return CheckOutcome(ok, detail)
+
+
 _JUDGE_SYSTEM = (
     "You are a strict grader. You will be given a task prompt, a model's answer, and a rubric. "
     "Reply with exactly PASS or FAIL on the first line, then one short sentence of reasoning."
@@ -129,5 +138,6 @@ SCORERS: dict[str, Scorer] = {
     "cites": cites,
     "cites_only": cites_only,
     "cites_any": cites_any,
+    "stopped": stopped,
     "judge": judge,
 }

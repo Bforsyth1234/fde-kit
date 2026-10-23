@@ -3,15 +3,18 @@ from pathlib import Path
 
 import pytest
 
+from evals.make_replay_fixtures import FIXTURES, RUNS_DIR, generate
 from evals.run_evals import GOLDEN, load_cases, main, run_case, summarise
 
 
-def test_golden_set_has_twenty_two_valid_cases():
+def test_golden_set_has_twenty_five_valid_cases():
     cases = load_cases(GOLDEN)
-    assert len(cases) == 22
-    assert len({c["id"] for c in cases}) == 22, "duplicate ids"
+    assert len(cases) == 25
+    assert len({c["id"] for c in cases}) == 25, "duplicate ids"
     for c in cases:
-        assert "mock" in c, f"{c['id']} has no mock script; offline eval would be vacuous"
+        assert "mock" in c or "replay" in c, (
+            f"{c['id']} has no mock script or replay file; offline eval would be vacuous"
+        )
 
 
 def test_every_case_passes_in_mock_mode(monkeypatch):
@@ -29,7 +32,7 @@ def test_gate_exit_codes(monkeypatch, tmp_path: Path):
     out = tmp_path / "r.json"
     assert main(["--provider", "mock", "--json", str(out)]) == 0
     data = json.loads(out.read_text())
-    assert data["summary"]["total"] == 22
+    assert data["summary"]["total"] == 25
 
     # Flip one case's mock to a wrong answer -> below a 100% threshold -> exit 1.
     cases = load_cases(GOLDEN)
@@ -38,6 +41,52 @@ def test_gate_exit_codes(monkeypatch, tmp_path: Path):
     broken.write_text("\n".join(json.dumps(c) for c in cases))
     assert main(["--provider", "mock", "--golden", str(broken), "--threshold", "1.0"]) == 1
     assert main(["--provider", "mock", "--golden", str(broken), "--threshold", "0.9"]) == 0
+
+
+def test_case_without_mock_or_replay_rejected(tmp_path: Path):
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text(json.dumps({"id": "x", "prompt": "p", "checks": []}))
+    with pytest.raises(ValueError, match="needs a 'mock' script or a 'replay'"):
+        load_cases(bad)
+    bad.write_text(
+        json.dumps({"id": "x", "prompt": "p", "checks": [], "replay": "evals/runs/nope.jsonl"})
+    )
+    with pytest.raises(ValueError, match="replay file not found"):
+        load_cases(bad)
+
+
+def test_replay_fixtures_regenerate_byte_identical(tmp_path: Path):
+    """The committed run files are exactly what the generator produces: a format drift in
+    fde_kit.record, or a hand edit of a fixture, fails here."""
+    fresh = generate(tmp_path)
+    assert [p.name for p in fresh] == [f"{fx.name}.jsonl" for fx in FIXTURES]
+    for path in fresh:
+        committed = RUNS_DIR / path.name
+        assert committed.is_file(), f"{committed} missing: run python -m evals.make_replay_fixtures"
+        assert path.read_bytes() == committed.read_bytes(), (
+            f"{committed.name} differs from a fresh generation; "
+            "run python -m evals.make_replay_fixtures"
+        )
+    # And the generator is deterministic on its own: a second run matches the first.
+    again = generate(tmp_path / "again")
+    for a, b in zip(fresh, again, strict=True):
+        assert a.read_bytes() == b.read_bytes()
+
+
+def test_replay_cases_pass_offline(monkeypatch):
+    monkeypatch.setenv("FDE_OTEL_ENABLED", "false")
+    cases = load_cases(GOLDEN, ids={"replay-01", "replay-02", "replay-03"})
+    assert len(cases) == 3 and all("mock" not in c for c in cases)
+    results = {r.id: r for r in (run_case(c, "mock", judge=None) for c in cases)}
+    failing = [(r.id, r.details) for r in results.values() if not r.passed]
+    assert not failing, failing
+    assert results["replay-01"].replay == "evals/runs/replay-01.jsonl"
+    assert results["replay-01"].cited == 1
+    assert results["replay-02"].cited == 2
+    assert results["replay-02"].tools_called == ["lookup_policy", "lookup_policy"]
+    # replay-03 diverges on the first tool call: no step completes, no tool is recorded.
+    assert results["replay-03"].turns == 0 and results["replay-03"].tools_called == []
+    assert any("replay_diverged" in d for d in results["replay-03"].details)
 
 
 def test_unknown_check_type_rejected(tmp_path: Path):
