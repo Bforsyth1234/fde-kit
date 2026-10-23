@@ -427,7 +427,8 @@ def test_add_facts_conflict_rule(store: TenantStore, entities: dict[str, str]):
         src = fa.to_source("harbor")
         assert src.source_id == a and src.uri == fa.doc_source and src.doc_id == lease[0]
         assert src.content_hash == fa.doc_hash and src.span == f"fact:{a}"
-        assert src.title == f"{HARBOR} late_fee" and src.tenant_id == "harbor"
+        # The period is part of the title so facts for different years are distinguishable.
+        assert src.title == f"{HARBOR} late_fee from 2026-01-01" and src.tenant_id == "harbor"
         fb = by_id[b]
         assert fb.doc_id is None and fb.doc_source is None and fb.doc_hash is None
         assert fb.to_source().uri == f"fact:{b}"

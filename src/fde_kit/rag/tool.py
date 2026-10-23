@@ -20,22 +20,28 @@ Build a fresh registry per request:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..tools import Source, ToolRegistry, ToolResult
 from .schema import validate_tenant_id
-from .store import DictEntry, Hit, QueryResult, SqlRejected, TenantStore
+from .store import DictEntry, Fact, Hit, QueryResult, SqlRejected, TenantStore
 
 MAX_K = 10
 
 ALL_TOOLS: tuple[str, ...] = ("search_documents", "fetch_document", "query_table")
 
 TABLES_PARAGRAPH = (
-    "Tables: rag_facts(entity_id, field, period_start, period_end, value_num, value_text, "
-    "unit, doc_id, chunk_id, conflict_group_id), rag_entities(entity_id, kind, "
+    "Tables: rag_facts(fact_id, entity_id, field, period_start, period_end, value_num, "
+    "value_text, unit, doc_id, chunk_id, conflict_group_id), rag_entities(entity_id, kind, "
     "canonical_name, aliases), rag_documents(doc_id, source, title, version). Join facts to "
-    "entities on entity_id. Fields:"
+    "entities on entity_id; match names case-insensitively, e.g. e.canonical_name ILIKE "
+    "'%pfizer%'. One plain SELECT (or WITH ... SELECT) only; system catalogs such as "
+    "information_schema and pg_* are not available. Example:\n"
+    "SELECT f.fact_id, e.canonical_name, f.field, f.period_start, f.period_end, f.value_num, "
+    "f.unit FROM rag_facts f JOIN rag_entities e ON e.entity_id = f.entity_id "
+    "WHERE e.canonical_name ILIKE '%pfizer%' AND f.field = 'revenue' ORDER BY f.period_end\n"
+    "Fields:"
 )
 
 TRUNCATED_NOTE = "... (truncated at {n} rows; add a WHERE or LIMIT)"
@@ -94,17 +100,24 @@ def tenant_search_registry(
 
         @out.tool(name="query_table")
         def query_table(sql: str) -> ToolResult:
-            """Run one read-only SQL SELECT over this customer's fact tables. Include f.fact_id
-            in the SELECT so each row is numbered and citable. Rows marked conflict=true
-            disagree with another source: report both values and say they conflict."""
-            # The tables paragraph and one line per dictionary field are appended to this
-            # description when the registry is built; see query_table_description().
+            """Run one read-only SQL SELECT over this customer's fact tables. Select f.fact_id
+            so each row is numbered, citable, and labelled with the document it came from and
+            whether it conflicts; you do not need to join documents yourself. Rows marked
+            conflict=true disagree with another source: report every value and say they
+            conflict."""
+            # The tables paragraph, an example query and one line per dictionary field are
+            # appended to this description when the registry is built; see
+            # query_table_description().
             with store.session(tenant_id) as s:
                 try:
                     result = s.query(sql)
                 except SqlRejected as exc:
                     return ToolResult(f"Query rejected: {exc.reason}", is_error=True)
-            return format_query_result(result, tenant_id=tenant_id)
+                # Provenance from the database, not from the columns the model chose: every
+                # row with a fact_id gets its document's URL, title and hash, and its conflict
+                # status. Same tenant session, so RLS still bounds what can be looked up.
+                facts = s.facts_by_id(fact_ids_in(result))
+            return format_query_result(result, tenant_id=tenant_id, facts=facts)
 
         with store.session(tenant_id) as s:
             entries = s.dictionary()
@@ -164,22 +177,36 @@ def format_slice(d: Any, *, tenant_id: str | None = None) -> ToolResult:
     return ToolResult(content, sources=(source,))
 
 
-def format_query_result(result: QueryResult, *, tenant_id: str | None = None) -> ToolResult:
-    """Render a `QueryResult` as a compact table and derive Sources from its columns.
+def fact_ids_in(result: QueryResult) -> list[str]:
+    """The non-null values of a `fact_id` column, if the result has one."""
+    if "fact_id" not in result.columns:
+        return []
+    k = list(result.columns).index("fact_id")
+    return [str(row[k]) for row in result.rows if row[k] is not None]
 
-    The model's SQL decides which columns come back, so the Source for a row is built from
-    whatever provenance columns are present, mirroring `Fact.to_source`:
 
-    - `fact_id` (required for a row to get a `[#i]` marker and a Source): `source_id`, and
-      `span="fact:<fact_id>"`.
-    - `doc_source` or `source`: `uri`; otherwise `uri="fact:<fact_id>"`.
-    - `entity` + `field`: `title="<entity> <field>"` (either alone is used on its own).
-    - `doc_id`: `doc_id`.
-    - `doc_hash` or `content_hash`: `content_hash`.
+def format_query_result(
+    result: QueryResult, *, tenant_id: str | None = None, facts: Mapping[str, Fact] | None = None
+) -> ToolResult:
+    """Render a `QueryResult` as a compact table with a `[#i]` and a Source per fact row.
 
-    Rows without a `fact_id` column (e.g. `SELECT count(*)`) are printed without a marker and
-    produce no Source. A row whose `conflict_group_id` column is non-null gets ` conflict=true`.
+    A row gets a marker and a Source only if the SQL selected `fact_id`. Its provenance comes
+    from `facts` (looked up from the database by `query_table`), not from the columns the model
+    happened to select:
+
+    - Source = `Fact.to_source`: uri is the document's URL, title "<entity> <field> <period>",
+      doc_id, the document's content hash, span `fact:<fact_id>`.
+    - The line the model reads ends with ` (source: <document title>)` and with
+      ` conflict=true` when the fact is in a conflict group, even if neither column was
+      selected. This is what lets the model say which filing each number came from without a
+      second query.
+
+    A fact_id that is not in `facts` (not a real fact id, or called without a lookup) falls back
+    to the columns: `doc_source`/`source` for uri (else `fact:<fact_id>`), `entity` + `field`
+    for title, `doc_id`, `doc_hash`/`content_hash`, and `conflict_group_id` for the marker.
+    Rows without a `fact_id` column (e.g. `SELECT count(*)`) get no marker and no Source.
     """
+    facts = facts or {}
     cols = list(result.columns)
     idx = {c: i for i, c in enumerate(cols)}
     has_fact = "fact_id" in idx
@@ -195,30 +222,36 @@ def format_query_result(result: QueryResult, *, tenant_id: str | None = None) ->
     sources: list[Source] = []
     n = 0
     for row in result.rows:
-        cells = " | ".join("" if v is None else str(v) for v in row)
-        prefix = ""
+        line = " | ".join("" if v is None else str(v) for v in row)
+        conflict = conflict_col is not None and row[conflict_col] is not None
         if has_fact and row[idx["fact_id"]] is not None:
             n += 1
-            prefix = f"[#{n}] "
+            line = f"[#{n}] {line}"
             fact_id = str(row[idx["fact_id"]])
-            entity, field = col(row, "entity"), col(row, "field")
-            title = " ".join(str(x) for x in (entity, field) if x is not None)
-            doc_hash = col(row, "doc_hash", "content_hash")
-            doc_id = col(row, "doc_id")
-            uri = col(row, "doc_source", "source")
-            sources.append(
-                Source(
-                    source_id=fact_id,
-                    uri=str(uri) if uri is not None else f"fact:{fact_id}",
-                    title=title,
-                    doc_id=str(doc_id) if doc_id is not None else None,
-                    content_hash=str(doc_hash) if doc_hash is not None else None,
-                    span=f"fact:{fact_id}",
-                    tenant_id=tenant_id,
+            fact = facts.get(fact_id)
+            if fact is not None:
+                sources.append(fact.to_source(tenant_id))
+                label = fact.doc_title or fact.doc_source
+                if label:
+                    line += f" (source: {label})"
+                conflict = conflict or fact.conflict_group_id is not None
+            else:
+                entity, field = col(row, "entity"), col(row, "field")
+                doc_hash = col(row, "doc_hash", "content_hash")
+                doc_id = col(row, "doc_id")
+                uri = col(row, "doc_source", "source")
+                sources.append(
+                    Source(
+                        source_id=fact_id,
+                        uri=str(uri) if uri is not None else f"fact:{fact_id}",
+                        title=" ".join(str(x) for x in (entity, field) if x is not None),
+                        doc_id=str(doc_id) if doc_id is not None else None,
+                        content_hash=str(doc_hash) if doc_hash is not None else None,
+                        span=f"fact:{fact_id}",
+                        tenant_id=tenant_id,
+                    )
                 )
-            )
-        line = prefix + cells
-        if conflict_col is not None and row[conflict_col] is not None:
+        if conflict:
             line += " conflict=true"
         lines.append(line)
     if result.truncated:

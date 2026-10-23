@@ -132,7 +132,7 @@ fde run --fork PATH --at N "instruction"  # new run; header.parent_run_id/fork_a
 fde rag ask --tenant T "q"                # always records to runs/ (prints the path)
 fde runs list [--dir runs]                # table: run_id, created_at, runtime, tenant, model, prompt, turns, stopped, parent
 fde runs tree RUN_ID                      # lineage: parents up, forks down (scans the dir)
-fde runs show RUN_ID                      # header + one line per row (turn, kind, name/stop_reason)
+fde runs show RUN_ID [--full]             # header + one line per row; --full adds tool inputs (SQL) and outputs
 fde durable-export WORKFLOW_ID [--out PATH]   # a Temporal run's history, as the same file
 ```
 
@@ -571,11 +571,15 @@ tools=("search_documents", "fetch_document", "query_table"))` registers up to th
 | --- | --- | --- |
 | `search_documents(query: str, k: int = 5)` | passages numbered `[#i]` | `source_id` = chunk id, `uri` = document source, `doc_id`, the chunk's `content_hash` |
 | `fetch_document(doc_id: str, char_start: int = 0, char_end: int = 6000)` | `[#1] {title} ({source}) v{version} chars {start}-{end} of {total}`, the text, and `next: <offset>` while more remains | `source_id` = `{doc_id}:{start}-{end}`, `doc_id`, the document's `content_hash`, `span` = `chars:{start}-{end}`. Two slices of one document are two citations, each provable. Unknown id: `No document with that id.` as an error result. |
-| `query_table(sql: str)` | a header line, then one row per line. A row with a `fact_id` column gets `[#i]` and a Source; a row whose `conflict_group_id` is set gets ` conflict=true`; `SELECT count(*)` rows get neither. More than 200 rows: `... (truncated at 200 rows; add a WHERE or LIMIT)` | `source_id` = `fact_id`, `span` = `fact:{fact_id}`, `uri` from a `doc_source` or `source` column (else `fact:{fact_id}`), `doc_id`, `content_hash` from `doc_hash` or `content_hash`, title from `entity` + `field`. The model's SELECT decides which of these are present. |
+| `query_table(sql: str)` | a header line, then one row per line. A row with a `fact_id` column gets `[#i]`, a Source, and ` (source: <document title>)`; a fact in a conflict group gets ` conflict=true`, whether or not the SQL selected `conflict_group_id`; `SELECT count(*)` rows get neither. More than 200 rows: `... (truncated at 200 rows; add a WHERE or LIMIT)` | Looked up from the database by `fact_id` (`TenantSession.facts_by_id`, same tenant session): `source_id` = `fact_id`, `uri` = the document's URL, `doc_id`, `content_hash` = the document's hash, title `<entity> <field> <period>`, `span` = `fact:{fact_id}`. The model's SELECT does not decide provenance; a `fact_id` the database does not know falls back to the columns (`doc_source`/`source`, `doc_hash`/`content_hash`, `entity` + `field`). |
 
 The `query_table` description is built once per registry: the docstring, then a paragraph
-naming `rag_facts`, `rag_entities` and `rag_documents` with their columns, then one
-`- field (unit): definition` line per `rag_dictionary` row. One query per request, not per call.
+naming `rag_facts`, `rag_entities` and `rag_documents` with their columns, what the guard does
+not allow (`information_schema`, `pg_*`), and a worked example query (a test checks the guard
+accepts it), then one `- field (unit): definition` line per `rag_dictionary` row. One query per
+request, not per call. The example and the inline `(source: …)` labels came from a live run in
+which the model spent four `query_table` calls on one question, one of them only to learn which
+filing each number came from, and still cited facts with no document attached.
 
 **`query_table` has three layers, and only two of them are the boundary.**
 
