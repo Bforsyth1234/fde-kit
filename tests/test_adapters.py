@@ -29,7 +29,6 @@ from fde_kit.rag.adapters import (
     ingest,
     load_manifest,
 )
-from fde_kit.rag.adapters._factrow import make_fact_row
 from fde_kit.rag.adapters.edgar import parse_filing_index
 from fde_kit.rag.store import FactRow, IngestOutcome
 
@@ -288,7 +287,7 @@ class _ListAdapter:
 
 
 def _batch(doc_source: str = "doc-a") -> AdapterBatch:
-    row = make_fact_row(
+    row = FactRow(
         entity="Acme", field="revenue", value=100, unit="USD", precision=1, source_ref="x@1"
     )
     return AdapterBatch(

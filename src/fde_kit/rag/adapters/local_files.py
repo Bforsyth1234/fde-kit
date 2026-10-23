@@ -17,7 +17,7 @@ from collections.abc import Iterator
 from datetime import date
 from pathlib import Path
 
-from ._factrow import make_fact_row
+from ..store import FactRow
 from .base import AdapterBatch, RawDocument, RawEntity, RawFact
 from .edgar import html_to_text
 
@@ -86,7 +86,7 @@ class LocalFilesAdapter:
                 entity = d.get("entity") or self.entity
                 if not entity:
                     raise ValueError("no entity (set it on the line or pass entity=)")
-                row = make_fact_row(
+                row = FactRow(
                     entity=entity,
                     field=d["field"],
                     value=d["value"],

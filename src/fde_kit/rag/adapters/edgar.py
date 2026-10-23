@@ -27,8 +27,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-from ..store import DictEntry
-from ._factrow import make_fact_row
+from ..store import DictEntry, FactRow
 from .base import AdapterBatch, RawDocument, RawEntity, RawFact
 
 SEC_WWW = "https://www.sec.gov"
@@ -430,7 +429,7 @@ def xbrl_facts(cf: dict, filing: Filing, fields: dict[str, tuple[str, ...]]) -> 
             out.append(
                 (
                     name,
-                    make_fact_row(
+                    FactRow(
                         entity=entity,
                         field=name,
                         value=val,
