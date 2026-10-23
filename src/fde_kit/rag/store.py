@@ -291,7 +291,7 @@ def fuse(
     vec: list[Hit], kw: list[Hit], k: int, method: Fusion = "relative", alpha: float = 0.5
 ) -> list[Hit]:
     """Merge two ranked lists. Each input Hit carries its own retriever's score and rank."""
-    merged: dict[int, Hit] = {}
+    merged: dict[str, Hit] = {}
     for h in vec:
         merged[h.chunk_id] = Hit(**{**asdict(h), "score": 0.0, "keyword_rank": None})
     for h in kw:

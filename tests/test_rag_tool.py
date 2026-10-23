@@ -409,3 +409,30 @@ def test_dictionary_line_omits_empty_unit_and_no_placeholder_leaks():
     assert "- grace_days (d): Days" in desc
     # The model reads the tool's docstring; no template placeholder may be left in it.
     assert "<DICTIONARY>" not in Path(tool.__file__).read_text()
+
+
+def test_registry_can_be_rebuilt_from_its_own_output_for_the_same_tenant():
+    """Passing a registry back in for the same tenant re-registers the retrieval tools on a
+    fresh copy instead of raising "tool already registered" (PR #12)."""
+    store = FakeStore()
+    first = tenant_search_registry(store, "harbor")
+    again = tenant_search_registry(store, "harbor", registry=first)
+    assert again is not first
+    assert again.names() == ["search_documents", "fetch_document", "query_table"]
+    assert again.tenant_id == "harbor"
+
+
+def test_a_registry_already_bound_to_the_tenant_is_not_mutated():
+    base = ToolRegistry(tenant_id="harbor")
+
+    @base.tool
+    def ping() -> str:
+        """Ping."""
+        return "pong"
+
+    out = tenant_search_registry(FakeStore(), "harbor", registry=base)
+    assert base.names() == ["ping"]
+    assert out.names() == ["ping", "search_documents", "fetch_document", "query_table"]
+    # Only the retrieval tools selected this time are present on the copy.
+    narrowed = tenant_search_registry(FakeStore(), "harbor", registry=out, tools=("query_table",))
+    assert narrowed.names() == ["ping", "query_table"]

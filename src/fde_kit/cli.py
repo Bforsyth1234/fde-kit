@@ -137,10 +137,13 @@ def _first_difference(recorded: str, replayed: str) -> str:
     for n, (x, y) in enumerate(zip(a, b, strict=False), 1):
         if x != y:
             return f"differs at line {n}:\n  recorded: {x}\n  replayed: {y}"
+    if len(a) == len(b):
+        # Every line matches, so the strings differ only in line breaks: a trailing newline,
+        # or \r\n vs \n (splitlines() treats both as the same boundary).
+        return f"differs only in line breaks:\n  recorded: {recorded!r}\n  replayed: {replayed!r}"
     n = min(len(a), len(b)) + 1
-    extra = (a if len(a) > len(b) else b)[n - 1] if max(len(a), len(b)) >= n else ""
-    which = "recorded" if len(a) > len(b) else "replayed"
-    return f"differs at line {n}:\n  only in {which}: {extra}"
+    longer, which = (a, "recorded") if len(a) > len(b) else (b, "replayed")
+    return f"differs at line {n}:\n  only in {which}: {longer[n - 1]}"
 
 
 def _cmd_run_from_record(args: argparse.Namespace, settings) -> int:
@@ -823,7 +826,7 @@ def cmd_runs(args: argparse.Namespace) -> int:
 
     if args.runs_cmd == "list":
         if not runs and not bad:
-            console.print(f"no runs in {dir_}")
+            console.print(f"no runs in {dir_}", soft_wrap=True)
             return 0
         runs.sort(key=lambda e: str(e[1].get("created_at") or ""), reverse=True)
         table = Table(title=f"runs in {dir_}", show_header=True)
@@ -855,7 +858,7 @@ def cmd_runs(args: argparse.Namespace) -> int:
     if args.runs_cmd == "tree":
         target = _find_run(runs, args.run_id)
         if target is None:
-            console.print(f"[red]unknown run[/] {args.run_id} (looked in {dir_})")
+            console.print(f"[red]unknown run[/] {args.run_id} (looked in {dir_})", soft_wrap=True)
             return 1
         by_id = {h["run_id"]: (p, h, r) for p, h, r in runs}
         children: dict[str, list[str]] = {}
@@ -906,7 +909,7 @@ def cmd_runs(args: argparse.Namespace) -> int:
     if args.runs_cmd == "show":
         target = _find_run(runs, args.run_id)
         if target is None:
-            console.print(f"[red]unknown run[/] {args.run_id} (looked in {dir_})")
+            console.print(f"[red]unknown run[/] {args.run_id} (looked in {dir_})", soft_wrap=True)
             return 1
         path, header, rows = target
         console.rule(f"[bold]{header['run_id']}  ({path})")

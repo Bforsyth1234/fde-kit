@@ -174,3 +174,29 @@ def test_exclusive_flag_combinations_are_usage_errors(env, argv):
 def test_replay_missing_file_is_an_error(env, capsys):
     code, out = _run(capsys, "run", "--replay", str(env / "nope.jsonl"))
     assert code == 2
+
+
+# ------------------------------------------------------------------ _first_difference (PR #12)
+
+
+@pytest.mark.parametrize(
+    "recorded, replayed, expected",
+    [
+        ("a\nb", "a\nb", "identical"),
+        ("a\nb", "a\nX", "differs at line 2:\n  recorded: b\n  replayed: X"),
+        ("a\nb\nc", "a\nb", "differs at line 3:\n  only in recorded: c"),
+        ("a\nb", "a\nb\nc", "differs at line 3:\n  only in replayed: c"),
+        ("", "a", "differs at line 1:\n  only in replayed: a"),
+    ],
+)
+def test_first_difference_names_the_first_differing_line(recorded, replayed, expected):
+    assert cli._first_difference(recorded, replayed) == expected
+
+
+@pytest.mark.parametrize("recorded, replayed", [("a\nb\n", "a\nb"), ("a\r\nb", "a\nb")])
+def test_first_difference_reports_line_break_only_differences(recorded, replayed):
+    """Same lines, different line breaks: no bogus line number, no empty "only in" line, and
+    both strings shown with repr so the difference is visible."""
+    out = cli._first_difference(recorded, replayed)
+    assert out.startswith("differs only in line breaks")
+    assert repr(recorded) in out and repr(replayed) in out
