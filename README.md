@@ -247,7 +247,8 @@ answer says the sources disagree (conflict, disagree, differ, restate, revise, i
 discrepancy, in any form). Wording that a string check cannot judge fairly, such as whether a
 refusal says the company is not on file or whether a precision difference is explained as
 rounding, goes to a `judge` rubric; judges run only against a live model, so mock runs check
-everything else.
+everything else. The judge sees the tool outputs the model saw (capped at 12,000
+characters), so it can tell a claim quoted from a document from one the model brought in itself.
 
 The report shows pass rate overall and per category, p50/p95 latency, token
 totals and, when any citation was fabricated, citation precision in red; the header carries
