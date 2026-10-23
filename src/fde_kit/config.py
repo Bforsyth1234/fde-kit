@@ -47,6 +47,19 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Record / replay
+    runs_dir: str = Field(
+        default="runs",
+        description=(
+            "Where recorded runs are written (runs/<run_id>.jsonl). Files are unredacted "
+            "local evidence; keep the directory out of version control."
+        ),
+    )
+    record_runs: bool = Field(
+        default=False,
+        description="Record every `fde run` to runs_dir. `fde rag ask` always records.",
+    )
+
     # Tracing
     otel_enabled: bool = True
     otel_endpoint: str = Field(
