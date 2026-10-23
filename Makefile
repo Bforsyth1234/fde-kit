@@ -1,5 +1,5 @@
 .PHONY: install test lint eval eval-mock trace up down worker crash-demo upgrade-demo replay-check \
-	rag-demo rag-eval rag-test
+	rag-demo rag-eval rag-test rag-agent-eval
 
 worker:          ## Temporal worker for durable runs (needs `make up`)
 	fde worker
@@ -18,6 +18,9 @@ rag-demo:        ## three tenants, one lease template, same question (needs `mak
 
 rag-eval:        ## per-tenant retrieval eval with bge-small embeddings (needs `make up`)
 	python -m evals.rag_eval
+
+rag-agent-eval:  ## the lease-corpus agent eval: scripted model, real tools under RLS (needs `make up`, seeded)
+	FDE_OTEL_ENABLED=false FDE_RAG_EMBEDDER=hash python -m evals.run_evals --set rag --provider mock --threshold 1.0
 
 rag-test:        ## the tenant-isolation attack suite (needs `make up`)
 	FDE_TEST_PG_URL=postgresql://fde:fde@localhost:5432/fde pytest tests/test_rag_isolation.py -v
