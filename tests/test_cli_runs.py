@@ -213,3 +213,32 @@ def test_loader_skips_blank_lines(runs_dir):
     header, rows = cli._load_run_file(runs_dir / f"{PARENT}.jsonl")
     assert header["run_id"] == PARENT
     assert [r["kind"] for r in rows] == ["user", "llm", "tool", "llm", "result"]
+
+
+def test_show_full_prints_tool_inputs_and_outputs(runs_dir, capsys):
+    code, out = _run(capsys, "runs", "show", CHILD, "--dir", str(runs_dir), "--full")
+    assert code == 0
+    assert 'call search_documents: {"query": "late fee"}' in out  # the model's tool call
+    assert 'input: {"query": "late fee"}' in out  # the tool row's input
+    assert "output: [#1] Lease 101" in out  # brackets survive: no rich markup
+    # Without --full, none of that detail is printed.
+    _, short = _run(capsys, "runs", "show", CHILD, "--dir", str(runs_dir))
+    assert "output: [#1] Lease 101" not in short
+
+
+def test_show_full_prints_sql_and_errors_and_clips_long_output(tmp_path, capsys):
+    rows = [
+        {"kind": "header", "version": 1, "run_id": "r-sqlsqlsqlsql",
+         "created_at": "2026-10-23T00:00:00Z",
+         "runtime": "agent", "tenant_id": "pharma-a", "model": "m", "prompt_name": "default",
+         "prompt_sha256": "0" * 64, "parent_run_id": None, "fork_at": None},
+        {"kind": "tool", "turn": 1, "name": "query_table", "input": {"sql": "SELECT 1"},
+         "content": "Query rejected: one statement only", "is_error": True, "sources": []},
+        {"kind": "tool", "turn": 2, "name": "query_table", "input": {"sql": "SELECT f.fact_id"},
+         "content": "x" * 5000, "is_error": False, "sources": []},
+    ]
+    (tmp_path / "r-sqlsqlsqlsql.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    code, out = _run(capsys, "runs", "show", "r-sqlsqlsqlsql", "--dir", str(tmp_path), "--full")
+    assert code == 0
+    assert "sql: SELECT 1" in out and "error: Query rejected: one statement only" in out
+    assert "sql: SELECT f.fact_id" in out and "[3800 more chars]" in out

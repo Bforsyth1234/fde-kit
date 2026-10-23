@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 import uuid
 from collections.abc import Iterable, Iterator
@@ -188,12 +189,23 @@ class Fact:
     extraction_job_id: str | None
     precision: int | None = None
     source_ref: str = ""
+    doc_title: str | None = None
+
+    @property
+    def period(self) -> str:
+        """"2019-01-01..2019-12-31", "from 2026-01-01", or "" when the fact has no period."""
+        if self.period_start and self.period_end:
+            return f"{self.period_start}..{self.period_end}"
+        if self.period_start:
+            return f"from {self.period_start}"
+        return f"to {self.period_end}" if self.period_end else ""
 
     def to_source(self, tenant_id: str | None = None) -> Source:
+        title = " ".join(x for x in (self.entity, self.field, self.period) if x)
         return Source(
             source_id=self.fact_id,
             uri=self.doc_source or f"fact:{self.fact_id}",
-            title=f"{self.entity} {self.field}",
+            title=title,
             doc_id=self.doc_id,
             content_hash=self.doc_hash,
             span=f"fact:{self.fact_id}",
@@ -315,6 +327,42 @@ def fuse(
     else:
         raise ValueError(f"unknown fusion method: {method}")
     return sorted(merged.values(), key=lambda h: (-h.score, h.chunk_id))[:k]
+
+
+_FACT_SELECT = """
+            SELECT f.fact_id::text, f.entity_id::text, e.canonical_name, f.field,
+                   f.period_start, f.period_end, f.value_num, f.value_text, f.unit,
+                   f.doc_id::text, f.chunk_id::text, d.source, d.content_hash,
+                   f.conflict_group_id::text, f.extraction_job_id::text,
+                   f.precision, f.source_ref, d.title
+            FROM @facts f
+            JOIN @entities e ON e.entity_id = f.entity_id
+            LEFT JOIN @docs d ON d.doc_id = f.doc_id
+"""
+
+_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _fact_from_row(r: tuple) -> Fact:
+    return Fact(
+        fact_id=r[0],
+        entity_id=r[1],
+        entity=r[2],
+        field=r[3],
+        period_start=r[4],
+        period_end=r[5],
+        value=_plain(r[6]) if r[6] is not None else r[7],
+        unit=r[8],
+        doc_id=r[9],
+        chunk_id=r[10],
+        doc_source=r[11],
+        doc_hash=r[12] or None,
+        conflict_group_id=r[13],
+        extraction_job_id=r[14],
+        precision=_plain(r[15]) if r[15] is not None else None,
+        source_ref=r[16],
+        doc_title=r[17] or None,
+    )
 
 
 class TenantStore:
@@ -631,42 +679,30 @@ class TenantSession:
             if entity_id is None:
                 return []
         rows = self.conn.execute(
-            self.sql("""
-            SELECT f.fact_id::text, f.entity_id::text, e.canonical_name, f.field,
-                   f.period_start, f.period_end, f.value_num, f.value_text, f.unit,
-                   f.doc_id::text, f.chunk_id::text, d.source, d.content_hash,
-                   f.conflict_group_id::text, f.extraction_job_id::text,
-                   f.precision, f.source_ref
-            FROM @facts f
-            JOIN @entities e ON e.entity_id = f.entity_id
-            LEFT JOIN @docs d ON d.doc_id = f.doc_id
+            self.sql(_FACT_SELECT + """
             WHERE (%(e)s::uuid IS NULL OR f.entity_id = %(e)s::uuid)
               AND (%(f)s::text IS NULL OR f.field = %(f)s::text)
             ORDER BY e.canonical_name, f.field, f.period_start NULLS FIRST, f.created_at, f.fact_id
             """),
             {"e": entity_id, "f": field},
         ).fetchall()
-        return [
-            Fact(
-                fact_id=r[0],
-                entity_id=r[1],
-                entity=r[2],
-                field=r[3],
-                period_start=r[4],
-                period_end=r[5],
-                value=_plain(r[6]) if r[6] is not None else r[7],
-                unit=r[8],
-                doc_id=r[9],
-                chunk_id=r[10],
-                doc_source=r[11],
-                doc_hash=r[12] or None,
-                conflict_group_id=r[13],
-                extraction_job_id=r[14],
-                precision=_plain(r[15]) if r[15] is not None else None,
-                source_ref=r[16],
-            )
-            for r in rows
-        ]
+        return [_fact_from_row(r) for r in rows]
+
+    def facts_by_id(self, fact_ids: Iterable[str]) -> dict[str, Fact]:
+        """This tenant's facts with these ids, with their document's source, title and hash.
+
+        `query_table` uses it to attach provenance from the database to every row the model's
+        SQL returned with a `fact_id`, whatever other columns that SQL selected. Strings that
+        are not UUIDs are ignored (the model's SQL can alias anything as `fact_id`); ids of
+        another tenant's facts are invisible under RLS and simply absent from the result.
+        """
+        ids = sorted({str(i) for i in fact_ids if _UUID.match(str(i))})
+        if not ids:
+            return {}
+        rows = self.conn.execute(
+            self.sql(_FACT_SELECT + " WHERE f.fact_id = ANY(%(ids)s::uuid[])"), {"ids": ids}
+        ).fetchall()
+        return {f.fact_id: f for f in map(_fact_from_row, rows)}
 
     def set_dictionary(self, entries: Iterable[DictEntry]) -> None:
         """Upsert by field."""

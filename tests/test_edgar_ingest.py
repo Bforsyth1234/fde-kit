@@ -353,3 +353,49 @@ def test_cli_ingest_local_files(admin_url, store, tmp_path, capsys):
         assert main(["rag", "ingest", "--tenant", tid, "--adapter", "local_files"]) == 2
     finally:
         drop_tenant(admin_url, tid)
+
+
+# --- provenance from the database, whatever the SQL selected (live run r-1feef1c45323)
+
+
+def test_query_table_citations_carry_the_filing_even_when_sql_selects_no_document(seeded, store):
+    """The live model selected fact_id and values only. Every citation must still resolve to
+    its SEC filing (URL + hash), the model must see which filing each row came from, and the
+    three Pfizer FY2019 revenue rows must be marked as conflicting without selecting
+    conflict_group_id."""
+    out = tenant_search_registry(store, "pharma-a").execute(
+        "query_table",
+        {
+            "sql": "SELECT f.fact_id, f.value_num FROM rag_facts f "
+            "JOIN rag_entities e ON e.entity_id = f.entity_id "
+            "WHERE e.canonical_name = 'PFIZER INC' AND f.field = 'revenue' "
+            "AND f.period_end = '2019-12-31' ORDER BY f.value_num DESC"
+        },
+    )
+    assert not out.is_error
+    rows = out.content.splitlines()[1:]
+    assert [r.split(" | ")[1].split(" ")[0] for r in rows] == [
+        "51750000000",
+        "41172000000",
+        "40905000000",
+    ]
+    assert all(r.endswith(" conflict=true") for r in rows)
+    assert "(source: PFIZER INC 10-K FY2019 (EX-13))" in rows[0]
+    assert "(source: PFIZER INC 10-K FY2020 (10-K))" in rows[1]
+    assert "(source: PFIZER INC 10-K FY2021 (10-K))" in rows[2]
+    assert len(out.sources) == 3
+    for src in out.sources:
+        assert src.uri.startswith("https://www.sec.gov/Archives/edgar/data/78003/")
+        assert src.content_hash and src.doc_id and src.tenant_id == "pharma-a"
+        assert src.title == "PFIZER INC revenue 2019-01-01..2019-12-31"
+    assert out.sources[0].uri.endswith("pfe-exhibit13x12312019.htm")
+
+
+def test_facts_by_id_ignores_non_uuids_and_other_tenants(seeded, store):
+    with store.session("pharma-b") as s:
+        moderna = s.facts(entity="Moderna, Inc.")[0].fact_id
+    with store.session("pharma-a") as s:
+        pfizer = s.facts(entity="PFIZER INC")[0].fact_id
+        got = s.facts_by_id([pfizer, moderna, "not-a-uuid", "1; DROP TABLE x"])
+    assert set(got) == {pfizer}  # pharma-b's fact is invisible under RLS, junk is skipped
+    assert got[pfizer].doc_title and got[pfizer].doc_source.startswith("https://www.sec.gov/")

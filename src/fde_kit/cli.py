@@ -918,10 +918,47 @@ def cmd_runs(args: argparse.Namespace) -> int:
                 continue
             console.print(f"{key}: {json.dumps(value) if not isinstance(value, str) else value}")
         console.rule("[bold]rows")
+        full = getattr(args, "full", False)
         for row in rows:
-            console.print(_describe_row(row))
+            console.print(_describe_row(row), markup=False)
+            if full:
+                for line in _row_detail(row):
+                    console.print(line, markup=False, soft_wrap=True)
         return 0
     return 2
+
+
+FULL_CHARS = 1200
+"""`fde runs show --full` prints at most this many characters of any one text field."""
+
+
+def _clip(text: str, limit: int = FULL_CHARS) -> str:
+    text = str(text)
+    return text if len(text) <= limit else f"{text[:limit]}… [{len(text) - limit} more chars]"
+
+
+def _row_detail(row: dict) -> list[str]:
+    """What `--full` adds under a row: the model's text and tool inputs, a tool's input and
+    output, the final answer. Indented so the one-line summary above stays scannable."""
+    pad = "          "
+    kind = row.get("kind")
+    out: list[str] = []
+    if kind == "llm":
+        if row.get("text"):
+            out.append(pad + "text: " + _clip(row["text"]))
+        for tc in row.get("tool_calls") or []:
+            out.append(pad + f"call {tc.get('name')}: " + _clip(json.dumps(tc.get("input"))))
+    elif kind == "tool":
+        inp = row.get("input") or {}
+        if set(inp) == {"sql"}:
+            out.append(pad + "sql: " + _clip(inp["sql"]))
+        else:
+            out.append(pad + "input: " + _clip(json.dumps(inp)))
+        content = _clip(row.get("content", "")).replace("\n", "\n" + pad + "  ")
+        out.append(pad + ("error: " if row.get("is_error") else "output: ") + content)
+    elif kind == "result":
+        out.append(pad + "output: " + _clip(row.get("output", "")).replace("\n", "\n" + pad))
+    return out
 
 
 def _describe_row(row: dict) -> str:
@@ -1077,6 +1114,9 @@ def main(argv: list[str] | None = None) -> int:
     rsh = rusub.add_parser("show", help="header and one line per recorded row")
     rsh.add_argument("run_id")
     rsh.add_argument("--dir")
+    rsh.add_argument(
+        "--full", action="store_true", help="also print tool inputs/outputs (SQL, results)"
+    )
     ru.set_defaults(fn=cmd_runs)
 
     args = p.parse_args(argv)

@@ -57,6 +57,8 @@ class FakeSession:
     )
     entries: list[DictEntry] = field(default_factory=lambda: list(DICT))
     calls: list[tuple] = field(default_factory=list)
+    known_facts: dict[str, Fact] = field(default_factory=dict)
+    """What `facts_by_id` returns: empty by default, so the column-fallback tests still apply."""
 
     def search(self, query, *, k=5):
         self.calls.append(("search", query, k))
@@ -81,6 +83,11 @@ class FakeSession:
     def dictionary(self):
         self.calls.append(("dictionary",))
         return self.entries
+
+    def facts_by_id(self, fact_ids):
+        ids = list(fact_ids)
+        self.calls.append(("facts_by_id", ids))
+        return {i: self.known_facts[i] for i in ids if i in self.known_facts}
 
 
 class FakeStore:
@@ -221,8 +228,9 @@ def test_query_table_description_has_tables_paragraph_and_dictionary_lines():
     reg, store = registry()
     desc = reg.get("query_table").description
     assert desc.startswith("Run one read-only SQL SELECT over this customer's fact tables.")
-    assert "\n\nTables: rag_facts(entity_id, field, period_start, period_end, value_num, " in desc
-    assert "Join facts to entities on entity_id. Fields:\n" in desc
+    assert "\n\nTables: rag_facts(fact_id, entity_id, field, period_start, period_end, " in desc
+    assert "Join facts to entities on entity_id" in desc
+    assert "ORDER BY f.period_end\nFields:\n" in desc  # example query, then the dictionary
     assert "- late_fee (USD): Fee charged after the grace period\n" in desc
     assert "- grace_days (days): Days after the due date before a late fee\n" in desc
     assert desc.index("late_fee") < desc.index("grace_days")
@@ -436,3 +444,86 @@ def test_a_registry_already_bound_to_the_tenant_is_not_mutated():
     # Only the retrieval tools selected this time are present on the copy.
     narrowed = tenant_search_registry(FakeStore(), "harbor", registry=out, tools=("query_table",))
     assert narrowed.names() == ["ping", "query_table"]
+
+
+# ------------------------------------------------------------------ provenance from the database
+
+
+def _fact(fact_id, value, doc, title, group=None):
+    from datetime import date
+
+    return Fact(
+        fact_id=fact_id,
+        entity_id="e-pfe",
+        entity="PFIZER INC",
+        field="revenue",
+        period_start=date(2019, 1, 1),
+        period_end=date(2019, 12, 31),
+        value=value,
+        unit="USD",
+        doc_id=f"doc-{doc}",
+        chunk_id=None,
+        doc_source=f"https://www.sec.gov/Archives/edgar/data/78003/{doc}.htm",
+        doc_hash=f"hash-{doc}",
+        conflict_group_id=group,
+        extraction_job_id=None,
+        precision=1_000_000,
+        source_ref=f"us-gaap:Revenues@{doc}",
+        doc_title=title,
+    )
+
+
+FY19_EX13 = "PFIZER INC 10-K FY2019 (EX-13)"
+FY20_10K = "PFIZER INC 10-K FY2020 (10-K)"
+
+
+def test_query_table_attaches_document_provenance_the_sql_did_not_select():
+    """The live run that motivated this: the model selected fact_id and values but no document
+    columns. Citations must still carry the filing URL and hash, and the model must see which
+    filing each row came from and that the rows conflict, without a second query."""
+    s = FakeSession(
+        result=QueryResult(
+            columns=["fact_id", "value_num"],
+            rows=[("f-2019", 51750000000), ("f-2020", 41172000000), ("f-x", 1)],
+            truncated=False,
+            elapsed_ms=1,
+        ),
+        known_facts={
+            "f-2019": _fact("f-2019", 51750000000, "ex13-2019", FY19_EX13, "g1"),
+            "f-2020": _fact("f-2020", 41172000000, "10k-2020", FY20_10K, "g1"),
+        },
+    )
+    reg, _ = registry(s)
+    out = reg.execute("query_table", {"sql": "SELECT fact_id, value_num FROM rag_facts"})
+    lines = out.content.splitlines()
+    assert lines[1] == (
+        "[#1] f-2019 | 51750000000 (source: PFIZER INC 10-K FY2019 (EX-13)) conflict=true"
+    )
+    assert lines[2].endswith("(source: PFIZER INC 10-K FY2020 (10-K)) conflict=true")
+    # f-x is not a fact the database knows: column fallback, no invented provenance.
+    assert lines[3] == "[#3] f-x | 1"
+    s1, s2, s3 = out.sources
+    assert s1.uri == "https://www.sec.gov/Archives/edgar/data/78003/ex13-2019.htm"
+    assert s1.content_hash == "hash-ex13-2019" and s1.doc_id == "doc-ex13-2019"
+    assert s1.title == "PFIZER INC revenue 2019-01-01..2019-12-31"
+    assert s1.span == "fact:f-2019" and s1.tenant_id == "harbor"
+    assert s3.uri == "fact:f-x"
+    assert ("facts_by_id", ["f-2019", "f-2020", "f-x"]) in s.calls
+
+
+def test_query_table_does_not_look_up_provenance_without_a_fact_id_column():
+    s = FakeSession(
+        result=QueryResult(columns=["n"], rows=[(3,)], truncated=False, elapsed_ms=1)
+    )
+    reg, _ = registry(s)
+    out = reg.execute("query_table", {"sql": "SELECT count(*) AS n FROM rag_facts"})
+    assert out.sources == () and ("facts_by_id", []) in s.calls
+
+
+def test_query_table_description_has_an_example_the_guard_accepts():
+    from fde_kit.rag.sqlguard import check_select
+    from fde_kit.rag.tool import TABLES_PARAGRAPH
+
+    example = TABLES_PARAGRAPH.split("Example:\n")[1].split("\nFields:")[0]
+    assert example.startswith("SELECT f.fact_id") and check_select(example)
+    assert "information_schema" in TABLES_PARAGRAPH  # says what is NOT available
