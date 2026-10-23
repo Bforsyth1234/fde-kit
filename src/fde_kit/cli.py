@@ -20,6 +20,7 @@ from typing import Any
 
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from .agent import Agent
 from .builtin_tools import registry
@@ -729,7 +730,14 @@ def _add_adapter_parsers(rsub) -> None:
 
 
 def _print_sources(result) -> None:
-    """Evidence the run saw, marking what the answer actually cited."""
+    """Evidence the run saw, marking what the answer actually cited.
+
+    A compact table (number, cited, title, hash) and then one line per source with its FULL
+    location. The table shrinks to the terminal width and would cut a long SEC URL to
+    "https://www.sec.gov/Archives/edgar/data/78…"; the lines below it are never truncated or
+    wrapped, so each can be copied whole, and http(s) links are emitted as terminal hyperlinks
+    where the terminal supports them.
+    """
     if not result.sources:
         return
     cited = {s.source_id for s in result.cited}
@@ -737,13 +745,18 @@ def _print_sources(result) -> None:
     table = Table(show_header=True)
     table.add_column("#", justify="right")
     table.add_column("cited")
-    table.add_column("source")
     table.add_column("title")
     table.add_column("hash")
     for n, s in enumerate(result.sources, 1):
         mark = "[green]yes[/]" if s.source_id in cited else "-"
-        table.add_row(str(n), mark, s.uri, s.title, (s.content_hash or "")[:12])
+        table.add_row(str(n), mark, s.title or s.uri, (s.content_hash or "")[:12])
     console.print(table)
+    width = len(str(len(result.sources)))
+    for n, s in enumerate(result.sources, 1):
+        line = Text(f"{n:>{width}}  ")
+        style = f"link {s.uri}" if s.uri.startswith(("http://", "https://")) else ""
+        line.append(s.uri, style=style)
+        console.print(line, soft_wrap=True, no_wrap=True, crop=False, overflow="ignore")
     if result.fabricated_citations:
         console.print(
             f"[red]fabricated citations[/]: {result.fabricated_citations} "
