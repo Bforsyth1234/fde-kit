@@ -95,10 +95,11 @@ def tenant_search_registry(
 
         @out.tool(name="query_table")
         def query_table(sql: str) -> ToolResult:
-            """Run one read-only SQL SELECT over this customer's fact tables. <DICTIONARY> is
-            appended to this description at registry build time (see below). Rows marked
-            conflict=true disagree with another source: report both values and say they
-            conflict."""
+            """Run one read-only SQL SELECT over this customer's fact tables. Include f.fact_id
+            in the SELECT so each row is numbered and citable. Rows marked conflict=true
+            disagree with another source: report both values and say they conflict."""
+            # The tables paragraph and one line per dictionary field are appended to this
+            # description when the registry is built; see query_table_description().
             with store.session(tenant_id) as s:
                 try:
                     result = s.query(sql)
@@ -115,8 +116,11 @@ def tenant_search_registry(
 
 
 def query_table_description(base_doc: str, entries: Sequence[DictEntry]) -> str:
-    """`base_doc` + the tables paragraph + one `- field (unit): definition` line per entry."""
-    lines = "".join(f"- {e.field} ({e.unit}): {e.definition}\n" for e in entries)
+    """`base_doc` + the tables paragraph + one `- field (unit): definition` line per entry.
+    A field with no single unit (late_fee is USD or percent_of_rent) gets no parentheses."""
+    lines = "".join(
+        f"- {e.field}{f' ({e.unit})' if e.unit else ''}: {e.definition}\n" for e in entries
+    )
     return base_doc + "\n\n" + TABLES_PARAGRAPH + "\n" + lines
 
 

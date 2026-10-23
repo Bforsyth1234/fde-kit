@@ -394,3 +394,18 @@ def test_shared_base_registry_is_copied_not_bound():
     assert reg.names() == ["add", "search_documents", "fetch_document", "query_table"]
     with pytest.raises(ValueError):
         tenant_search_registry(FakeStore(), "summit", registry=reg)
+
+
+
+def test_dictionary_line_omits_empty_unit_and_no_placeholder_leaks():
+    from pathlib import Path
+
+    from fde_kit.rag import tool
+    from fde_kit.rag.tool import query_table_description
+
+    entries = [DictEntry("late_fee", "Fee after grace", ""), DictEntry("grace_days", "Days", "d")]
+    desc = query_table_description("base", entries)
+    assert "- late_fee: Fee after grace" in desc and "late_fee ()" not in desc
+    assert "- grace_days (d): Days" in desc
+    # The model reads the tool's docstring; no template placeholder may be left in it.
+    assert "<DICTIONARY>" not in Path(tool.__file__).read_text()
