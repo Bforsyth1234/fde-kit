@@ -203,6 +203,12 @@ CREATE TABLE IF NOT EXISTS rag_facts (
     conflict_group_id UUID,                         -- NULL = no disagreement on record
     extraction_job_id UUID,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- PR 4. The unit the value was reported to (1000 = "in thousands"); NULL = exact. Two
+    -- numbers agree when they round to the same multiple of the coarser precision (store.py,
+    -- values_agree), so a later filing's rounded repeat is not a conflict.
+    precision       NUMERIC,
+    -- Provenance below the document level, free-form (EDGAR: 'us-gaap:<Tag>@<accession>').
+    source_ref      TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (tenant_id, fact_id),
     FOREIGN KEY (tenant_id, entity_id)
         REFERENCES rag_entities (tenant_id, entity_id) ON DELETE CASCADE,
@@ -219,6 +225,11 @@ CREATE TABLE IF NOT EXISTS rag_facts (
 ) PARTITION BY LIST (tenant_id);
 CREATE INDEX IF NOT EXISTS rag_facts_lookup_idx
     ON rag_facts (tenant_id, entity_id, field, period_start, period_end);
+
+-- PR 3 schemas predate precision and source_ref; adding on the parent cascades to every
+-- partition.
+ALTER TABLE rag_facts ADD COLUMN IF NOT EXISTS precision NUMERIC;
+ALTER TABLE rag_facts ADD COLUMN IF NOT EXISTS source_ref TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS rag_dictionary (
     tenant_id       TEXT NOT NULL REFERENCES rag_tenants (tenant_id) ON DELETE CASCADE,

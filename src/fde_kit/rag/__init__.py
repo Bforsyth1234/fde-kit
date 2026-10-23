@@ -27,6 +27,7 @@ from .store import (
     SearchResult,
     TenantSession,
     TenantStore,
+    values_agree,
 )
 from .tool import tenant_search_registry
 
@@ -57,4 +58,5 @@ __all__ = [
     "make_embedder",
     "migrate",
     "tenant_search_registry",
+    "values_agree",
 ]

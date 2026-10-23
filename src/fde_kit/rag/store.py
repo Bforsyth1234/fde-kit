@@ -39,7 +39,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import date
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from typing import Any, Literal
 
 import psycopg
@@ -74,6 +74,7 @@ __all__ = [
     "chunk_spans",
     "content_hash",
     "fuse",
+    "values_agree",
 ]
 
 SearchMode = Literal["vector", "keyword", "hybrid"]
@@ -160,6 +161,11 @@ class FactRow:
     period_end: date | None = None
     doc_id: str | None = None
     chunk_id: str | None = None
+    precision: int | None = None
+    """What the value was reported to: 1000 = "in thousands", 1 = whole units. None = exact.
+    Numbers only; see `values_agree`."""
+    source_ref: str = ""
+    """Free-form provenance below the document level (EDGAR: 'us-gaap:<Tag>@<accession>')."""
 
 
 @dataclass
@@ -180,6 +186,8 @@ class Fact:
     doc_hash: str | None
     conflict_group_id: str | None
     extraction_job_id: str | None
+    precision: int | None = None
+    source_ref: str = ""
 
     def to_source(self, tenant_id: str | None = None) -> Source:
         return Source(
@@ -235,6 +243,48 @@ def _plain(v: Any) -> Any:
     if isinstance(v, Decimal):
         return int(v) if v == v.to_integral_value() else float(v)
     return v
+
+
+Num = int | float | Decimal
+
+
+def _dec(v: Num) -> Decimal:
+    # A float goes through its repr, which is also what Postgres stores for a float bound
+    # into a NUMERIC column, so a value compares the same before and after a round trip.
+    return v if isinstance(v, Decimal) else Decimal(str(v) if isinstance(v, float) else v)
+
+
+def values_agree(a: Num | str, pa: Num | None, b: Num | str, pb: Num | None) -> bool:
+    """Whether two reported values for the same (entity, field, period) agree.
+
+    Numbers: with `p = max(pa or 1, pb or 1)`, they agree when `round_half_up(a / p) ==
+    round_half_up(b / p)`, i.e. when they are the same at the coarser of the two precisions.
+    Vertex FY2019 revenue 4,162,821,000 (p=1000) and 4,162,800,000 (p=100000) agree; $1,800 and
+    $1,850 rents at p=1 do not. Rounding is half away from zero (Decimal ROUND_HALF_UP), so a
+    negative number rounds as the mirror of its positive: -1850 at p=100 is -19, as 1850 is 19.
+    Arithmetic is Decimal throughout, exact for integers of any size.
+
+    When both precisions are None the comparison is exact equality, PR 3's rule. (The formula
+    alone would use p=1 and make 1.2 and 1.4 agree.)
+
+    Strings agree iff equal. A number and a string never agree. bool is not a number here.
+    """
+    a_num = isinstance(a, int | float | Decimal) and not isinstance(a, bool)
+    b_num = isinstance(b, int | float | Decimal) and not isinstance(b, bool)
+    if not a_num or not b_num:
+        return not a_num and not b_num and a == b
+    da, db = _dec(a), _dec(b)  # type: ignore[arg-type]
+    if pa is None and pb is None:
+        return da == db
+    for prec in (pa, pb):
+        if prec is not None and not _dec(prec) > 0:
+            raise ValueError(f"precision must be positive, got {prec!r}")
+    p = max(_dec(pa) if pa is not None else Decimal(1), _dec(pb) if pb is not None else Decimal(1))
+    with localcontext() as ctx:
+        # Enough digits that the quotient is exact up to the units place for any input.
+        ctx.prec = 60 + max(abs(da.adjusted()), abs(db.adjusted()), abs(p.adjusted()))
+        one = Decimal(1)
+        return (da / p).quantize(one, ROUND_HALF_UP) == (db / p).quantize(one, ROUND_HALF_UP)
 
 
 def fuse(
@@ -484,11 +534,22 @@ class TenantSession:
     def add_facts(self, rows: list[FactRow], *, extraction_job_id: str | None = None) -> list[str]:
         """Insert facts; returns their fact_ids in order.
 
-        Conflict rule: existing facts with the same (entity_id, field, period_start,
-        period_end) and a *different* value share one conflict_group_id with the new row (the
-        existing group's id if any of them has one, else a new uuid). An existing fact with the
-        same value is left alone and the new row is still inserted: two sources agreeing is
-        evidence, not a duplicate, and not a conflict."""
+        Conflict rule (precision-aware since PR 4): the existing facts with the same
+        (entity_id, field, period_start, period_end) are fetched as candidates, and each is
+        compared with the new value by `values_agree` at the coarser of the two precisions.
+        If the new fact disagrees with any candidate, it and every candidate it disagrees with
+        share one conflict_group_id (the existing group's id if any of those has one, else a
+        new uuid). A fact that agrees with every candidate is inserted with no group: two
+        sources agreeing is evidence, not a duplicate, and not a conflict. With every precision
+        None the comparison is exact equality, which is PR 3's rule.
+
+        Agreement with one member of a group does not exempt a fact from that group. With
+        Pfizer FY2019 revenue on record as 51,750M and 41,172M (one group), a repeat of 41,172M
+        rounded to hundreds of millions (41,200,000,000 at p=1e8) agrees with 41,172M but
+        disagrees with 51,750M, so it joins the group. A group means "the values on record for
+        this key are not all the same", not "these are the outliers"; which member is current
+        is for the reader (or the adapter's filing dates) to decide.
+        """
         out: list[str] = []
         for r in rows:
             entity_id = self.resolve_entity(r.entity)
@@ -496,46 +557,48 @@ class TenantSession:
                 raise ValueError(f"unknown entity {r.entity!r} for tenant {self.tenant_id}")
             if isinstance(r.value, bool) or not isinstance(r.value, int | float | str):
                 raise ValueError(f"fact value must be a number or a string, got {r.value!r}")
+            if r.precision is not None:
+                if isinstance(r.value, str):
+                    raise ValueError(f"precision applies to numbers only, got {r.value!r}")
+                if isinstance(r.precision, bool) or not r.precision > 0:
+                    raise ValueError(f"precision must be positive, got {r.precision!r}")
             num = r.value if isinstance(r.value, int | float) else None
             txt = r.value if isinstance(r.value, str) else None
-            existing = self.conn.execute(
+            candidates = self.conn.execute(
                 self.sql("""
-                SELECT fact_id::text, conflict_group_id::text,
-                       (value_num IS NOT DISTINCT FROM %(num)s::numeric
-                        AND value_text IS NOT DISTINCT FROM %(txt)s::text) AS same
+                SELECT fact_id::text, conflict_group_id::text, value_num, value_text, precision
                 FROM @facts
                 WHERE entity_id = %(e)s::uuid AND field = %(f)s::text
                   AND period_start IS NOT DISTINCT FROM %(ps)s::date
                   AND period_end IS NOT DISTINCT FROM %(pe)s::date
                 """),
-                {
-                    "e": entity_id,
-                    "f": r.field,
-                    "ps": r.period_start,
-                    "pe": r.period_end,
-                    "num": num,
-                    "txt": txt,
-                },
+                {"e": entity_id, "f": r.field, "ps": r.period_start, "pe": r.period_end},
             ).fetchall()
-            differing = [row for row in existing if not row[2]]
+            differing = [
+                (fid, grp)
+                for fid, grp, vnum, vtxt, prec in candidates
+                if not values_agree(
+                    r.value, r.precision, vnum if vnum is not None else vtxt, prec
+                )
+            ]
             group: str | None = None
             if differing:
-                group = next((g for _, g, _ in differing if g), None) or str(uuid.uuid4())
+                group = next((g for _, g in differing if g), None) or str(uuid.uuid4())
                 self.conn.execute(
                     self.sql(
                         "UPDATE @facts SET conflict_group_id = %s::uuid "
                         "WHERE fact_id = ANY(%s::uuid[]) "
                         "AND conflict_group_id IS DISTINCT FROM %s::uuid"
                     ),
-                    (group, [f for f, _, _ in differing], group),
+                    (group, [f for f, _ in differing], group),
                 )
             row = self.conn.execute(
                 self.sql("""
                 INSERT INTO @facts (tenant_id, entity_id, field, period_start, period_end,
                                     value_num, value_text, unit, doc_id, chunk_id,
-                                    conflict_group_id, extraction_job_id)
+                                    conflict_group_id, extraction_job_id, precision, source_ref)
                 VALUES (%s, %s::uuid, %s, %s::date, %s::date, %s::numeric, %s::text, %s,
-                        %s::uuid, %s::uuid, %s::uuid, %s::uuid)
+                        %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::numeric, %s)
                 RETURNING fact_id::text
                 """),
                 (
@@ -551,6 +614,8 @@ class TenantSession:
                     r.chunk_id,
                     group,
                     extraction_job_id,
+                    r.precision,
+                    r.source_ref,
                 ),
             ).fetchone()
             assert row is not None
@@ -570,7 +635,8 @@ class TenantSession:
             SELECT f.fact_id::text, f.entity_id::text, e.canonical_name, f.field,
                    f.period_start, f.period_end, f.value_num, f.value_text, f.unit,
                    f.doc_id::text, f.chunk_id::text, d.source, d.content_hash,
-                   f.conflict_group_id::text, f.extraction_job_id::text
+                   f.conflict_group_id::text, f.extraction_job_id::text,
+                   f.precision, f.source_ref
             FROM @facts f
             JOIN @entities e ON e.entity_id = f.entity_id
             LEFT JOIN @docs d ON d.doc_id = f.doc_id
@@ -596,6 +662,8 @@ class TenantSession:
                 doc_hash=r[12] or None,
                 conflict_group_id=r[13],
                 extraction_job_id=r[14],
+                precision=_plain(r[15]) if r[15] is not None else None,
+                source_ref=r[16],
             )
             for r in rows
         ]
