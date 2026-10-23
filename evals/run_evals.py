@@ -3,8 +3,20 @@
     python -m evals.run_evals                     # real model, threshold from settings
     python -m evals.run_evals --provider mock     # offline: replays each case's scripted mock
     python -m evals.run_evals --limit 5 --json out.json
+    python -m evals.run_evals --set rag --provider mock   # the lease-corpus set, tools for real
 
 Exit code is 0 when pass rate >= threshold, 1 otherwise. That exit code is the CI gate.
+
+Two sets. `--set golden` (the default, evals/golden.jsonl) runs against the builtin tools and
+needs nothing but Python. `--set rag` (evals/golden_rag.jsonl) runs over the seeded demo lease
+corpus: each case carries a `tenant`, and the agent gets `tenant_search_registry` for that tenant
+from one `TenantStore` opened for the whole run (settings `rag_url`, else the app role derived
+from `rag_admin_url`; embedder from `--embedder` or settings `rag_embedder`). Seed first with
+`fde rag seed-demo`. In mock mode the script drives the *model*, but `search_documents`,
+`query_table` and `fetch_document` run for real against Postgres, so a rag mock run is a
+tools+harness check: it proves the SQL and queries in the script return what the scripted answer
+cites, under RLS, with the citations resolving to real Sources. The live-model run is the model
+check.
 
 Mock mode exists to test the *harness*, not the model: each case ships a `mock` script that the
 MockProvider replays. If a case passes in mock mode and fails against the real model, the model
@@ -33,16 +45,60 @@ from rich.table import Table
 
 from fde_kit.agent import Agent
 from fde_kit.builtin_tools import registry
-from fde_kit.config import get_settings
+from fde_kit.config import Settings, get_settings
 from fde_kit.llm import LLMProvider, MockProvider, make_provider
 from fde_kit.record import RunRecord, recorded_prompt, replay_session
+from fde_kit.tools import ToolRegistry
 from fde_kit.tracing import init_tracing
 
 from .scorers import SCORERS, JudgeContext
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GOLDEN = Path(__file__).parent / "golden.jsonl"
+GOLDEN_RAG = Path(__file__).parent / "golden_rag.jsonl"
+SETS: dict[str, Path] = {"golden": GOLDEN, "rag": GOLDEN_RAG}
 console = Console()
+
+_rag_store: Any = None
+"""The run's `TenantStore`, opened by `open_rag_store` on first use and shared by every case."""
+
+
+def open_rag_store(settings: Settings | None = None, embedder: str | None = None) -> Any:
+    """Open (once) the store that rag cases build their tenant registries from.
+
+    Connection: settings `rag_url` when set, else the app role derived from `rag_admin_url`
+    (what `fde rag` does). Embedder: `embedder`, else settings `rag_embedder`. Repeated calls
+    return the same store; `close_rag_store()` drops it so a test can reopen with other env.
+    """
+    global _rag_store
+    if _rag_store is None:
+        from fde_kit.rag import TenantStore, app_url_from_admin, make_embedder
+
+        settings = settings or get_settings()
+        url = settings.rag_url or app_url_from_admin(settings.rag_admin_url)
+        _rag_store = TenantStore(url, make_embedder(embedder or settings.rag_embedder))
+    return _rag_store
+
+
+def close_rag_store() -> None:
+    global _rag_store
+    if _rag_store is not None:
+        _rag_store.close()
+        _rag_store = None
+
+
+def case_registry(case: dict[str, Any]) -> ToolRegistry:
+    """The builtin registry, or for a case with a `tenant` the three retrieval tools bound to
+    that tenant. The tenant comes from the case file, never from the model or the prompt."""
+    if "tenant" not in case:
+        return registry
+    from fde_kit.rag import tenant_search_registry
+    from fde_kit.rag.demo_corpus import TENANTS
+
+    tenant = case["tenant"]
+    if tenant not in TENANTS:  # load_cases checks too; this guards hand-built cases
+        raise ValueError(f"{case['id']}: unknown tenant {tenant!r}, not in {sorted(TENANTS)}")
+    return tenant_search_registry(open_rag_store(), tenant)
 
 
 @dataclass
@@ -87,6 +143,14 @@ def load_cases(
             raise ValueError(f"{c['id']}: needs a 'mock' script or a 'replay' run file")
         if "replay" in c and not replay_path(c).is_file():
             raise ValueError(f"{c['id']}: replay file not found: {replay_path(c)}")
+        if "tenant" in c:
+            from fde_kit.rag.demo_corpus import TENANTS
+
+            if c["tenant"] not in TENANTS:
+                raise ValueError(
+                    f"{c['id']}: unknown tenant {c['tenant']!r}; rag cases run over the demo "
+                    f"corpus, tenants {sorted(TENANTS)}"
+                )
     if ids:
         missing = ids - {c["id"] for c in cases}
         if missing:
@@ -98,14 +162,15 @@ def load_cases(
 def run_case(case: dict[str, Any], provider_name: str, judge: LLMProvider | None) -> CaseResult:
     settings = get_settings()
     t0 = time.perf_counter()
+    reg = case_registry(case)
     if "replay" in case:
         # Exact replay of a recorded run, whatever --provider says: the recorded LLM rows are the
         # model, so this checks the record/replay harness, never the live model. The agent gets
         # the record's pinned system prompt so the header it would write matches the parent.
         rec = RunRecord.load(replay_path(case))
-        session = replay_session(rec, registry)
+        session = replay_session(rec, reg)
         agent = Agent(
-            registry,
+            reg,
             provider=session.provider,
             settings=settings,
             system_prompt=rec.header["prompt_text"],
@@ -121,7 +186,8 @@ def run_case(case: dict[str, Any], provider_name: str, judge: LLMProvider | None
                 api_key=settings.anthropic_api_key,
                 workspace_id=settings.anthropic_workspace_id,
             )
-        agent = Agent(registry, provider=provider, settings=settings)
+        # Mock or live, the tools are real: for a rag case they hit Postgres under RLS.
+        agent = Agent(reg, provider=provider, settings=settings)
         result = agent.run(case["prompt"])
     latency = (time.perf_counter() - t0) * 1000
 
@@ -190,8 +256,10 @@ def _percentile(values: list[float], pct: float) -> float:
     return s[k]
 
 
-def print_report(results: list[CaseResult], summary: dict[str, Any], threshold: float) -> None:
-    title = "eval results"
+def print_report(
+    results: list[CaseResult], summary: dict[str, Any], threshold: float, set_name: str = "golden"
+) -> None:
+    title = f"eval results ({set_name})"
     if summary.get("prompt_sha256"):
         title += (
             f"  ·  model {summary['model']}  ·  prompt "
@@ -244,7 +312,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--threshold", type=float, default=settings.eval_pass_threshold)
     p.add_argument("--limit", type=int)
     p.add_argument("--ids", help="comma-separated case ids to run, e.g. calc-02,notool-01")
-    p.add_argument("--golden", type=Path, default=GOLDEN)
+    p.add_argument(
+        "--set",
+        default="golden",
+        choices=sorted(SETS),
+        help="golden: builtin tools, offline; rag: lease corpus, needs a seeded Postgres",
+    )
+    p.add_argument("--golden", type=Path, help="a case file; overrides --set's file")
+    p.add_argument(
+        "--embedder", help="rag set only: 'hash' or 'bge'; default from FDE_RAG_EMBEDDER"
+    )
     p.add_argument("--json", type=Path, help="write full results to this file")
     p.add_argument(
         "--no-judge", action="store_true", help="skip LLM-as-judge checks even with a real provider"
@@ -256,7 +333,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.provider != "mock":
         init_tracing(settings)
     ids = {i.strip() for i in args.ids.split(",") if i.strip()} if args.ids else None
-    cases = load_cases(args.golden, args.limit, ids)
+    cases = load_cases(args.golden or SETS[args.set], args.limit, ids)
+    if args.set == "rag" or any("tenant" in c for c in cases):
+        open_rag_store(settings, args.embedder)
 
     judge: LLMProvider | None = None
     if args.provider != "mock" and not args.no_judge:
@@ -267,9 +346,12 @@ def main(argv: list[str] | None = None) -> int:
             workspace_id=settings.anthropic_workspace_id,
         )
 
-    results = [run_case(c, args.provider, judge) for c in cases]
+    try:
+        results = [run_case(c, args.provider, judge) for c in cases]
+    finally:
+        close_rag_store()
     summary = summarise(results)
-    print_report(results, summary, args.threshold)
+    print_report(results, summary, args.threshold, args.set)
 
     if args.json:
         args.json.write_text(

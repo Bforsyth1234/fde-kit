@@ -39,6 +39,18 @@ jobs:
         run: python -m evals.run_evals --provider mock --threshold 1.0
         env:
           FDE_OTEL_ENABLED: "false"
+      - name: seed the demo lease corpus (hash embedder, offline)
+        run: fde rag seed-demo
+        env:
+          FDE_RAG_ADMIN_URL: postgresql://fde:fde@localhost:5432/fde
+          FDE_RAG_EMBEDDER: hash
+          FDE_OTEL_ENABLED: "false"
+      - name: rag eval (scripted model, real tools against Postgres under RLS)
+        run: python -m evals.run_evals --set rag --provider mock --threshold 1.0
+        env:
+          FDE_RAG_ADMIN_URL: postgresql://fde:fde@localhost:5432/fde
+          FDE_RAG_EMBEDDER: hash
+          FDE_OTEL_ENABLED: "false"
 
   eval:
     # The real gate. Runs only when the repo has an API key secret, so forks and PRs from
