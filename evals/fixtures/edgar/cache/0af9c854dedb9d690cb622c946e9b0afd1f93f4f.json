@@ -1,0 +1,334 @@
+{
+ "url": "https://data.sec.gov/api/xbrl/companyfacts/CIK0000078003.json",
+ "body": {
+  "cik": 78003,
+  "entityName": "PFIZER INC",
+  "facts": {
+   "us-gaap": {
+    "RevenueFromContractWithCustomerExcludingAssessedTax": {
+     "label": "Revenue from Contract with Customer, Excluding Assessed Tax",
+     "description": "Amount, excluding tax collected from customer, of revenue from satisfaction of performance obligation by transferring promised good or service to customer. Tax collected from customer is tax assessed by governmental authority that is both imposed on and concurrent with specific revenue-producing transaction, including, but not limited to, sales, use, value added and excise.",
+     "units": {
+      "USD": [
+       {
+        "start": "2019-01-01",
+        "end": "2019-12-31",
+        "val": 51750000000,
+        "accn": "0000078003-20-000014",
+        "fy": 2019,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2020-02-27"
+       },
+       {
+        "start": "2019-01-01",
+        "end": "2019-12-31",
+        "val": 41172000000,
+        "accn": "0000078003-21-000038",
+        "fy": 2020,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2021-02-25"
+       },
+       {
+        "start": "2019-01-01",
+        "end": "2019-12-31",
+        "val": 40905000000,
+        "accn": "0000078003-22-000027",
+        "fy": 2021,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2022-02-24",
+        "frame": "CY2019"
+       },
+       {
+        "start": "2020-01-01",
+        "end": "2020-12-31",
+        "val": 41908000000,
+        "accn": "0000078003-21-000038",
+        "fy": 2020,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2021-02-25"
+       },
+       {
+        "start": "2020-01-01",
+        "end": "2020-12-31",
+        "val": 41651000000,
+        "accn": "0000078003-22-000027",
+        "fy": 2021,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2022-02-24",
+        "frame": "CY2020"
+       },
+       {
+        "start": "2021-01-01",
+        "end": "2021-12-31",
+        "val": 81288000000,
+        "accn": "0000078003-22-000027",
+        "fy": 2021,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2022-02-24"
+       },
+       {
+        "start": "2021-01-01",
+        "end": "2021-12-31",
+        "val": 73636000000,
+        "accn": "0000078003-24-000039",
+        "fy": 2023,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2024-02-22",
+        "frame": "CY2021"
+       }
+      ]
+     }
+    },
+    "Revenues": {
+     "label": "Revenues",
+     "description": "Amount of revenue recognized from goods sold, services rendered, insurance premiums, or other activities that constitute an earning process. Includes, but is not limited to, investment and interest income before deduction of interest expense when recognized as a component of revenue, and sales and trading gain (loss).",
+     "units": {
+      "USD": [
+       {
+        "start": "2020-01-01",
+        "end": "2020-12-31",
+        "val": 41651000000,
+        "accn": "0000078003-23-000024",
+        "fy": 2022,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2023-02-23",
+        "frame": "CY2020"
+       },
+       {
+        "start": "2021-01-01",
+        "end": "2021-12-31",
+        "val": 81288000000,
+        "accn": "0000078003-23-000024",
+        "fy": 2022,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2023-02-23"
+       },
+       {
+        "start": "2021-01-01",
+        "end": "2021-12-31",
+        "val": 81288000000,
+        "accn": "0000078003-24-000039",
+        "fy": 2023,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2024-02-22",
+        "frame": "CY2021"
+       }
+      ]
+     }
+    },
+    "NetIncomeLoss": {
+     "label": "Net Income (Loss) Attributable to Parent",
+     "description": "The portion of profit or loss for the period, net of income taxes, which is attributable to the parent.",
+     "units": {
+      "USD": [
+       {
+        "start": "2019-01-01",
+        "end": "2019-12-31",
+        "val": 16273000000,
+        "accn": "0000078003-20-000014",
+        "fy": 2019,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2020-02-27"
+       },
+       {
+        "start": "2019-01-01",
+        "end": "2019-12-31",
+        "val": 16273000000,
+        "accn": "0000078003-21-000038",
+        "fy": 2020,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2021-02-25"
+       },
+       {
+        "start": "2019-01-01",
+        "end": "2019-12-31",
+        "val": 16026000000,
+        "accn": "0000078003-22-000027",
+        "fy": 2021,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2022-02-24",
+        "frame": "CY2019"
+       },
+       {
+        "start": "2020-01-01",
+        "end": "2020-12-31",
+        "val": 9616000000,
+        "accn": "0000078003-21-000038",
+        "fy": 2020,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2021-02-25"
+       },
+       {
+        "start": "2020-01-01",
+        "end": "2020-12-31",
+        "val": 9159000000,
+        "accn": "0000078003-22-000027",
+        "fy": 2021,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2022-02-24"
+       },
+       {
+        "start": "2020-01-01",
+        "end": "2020-12-31",
+        "val": 9159000000,
+        "accn": "0000078003-23-000024",
+        "fy": 2022,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2023-02-23",
+        "frame": "CY2020"
+       },
+       {
+        "start": "2021-01-01",
+        "end": "2021-12-31",
+        "val": 21979000000,
+        "accn": "0000078003-22-000027",
+        "fy": 2021,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2022-02-24"
+       },
+       {
+        "start": "2021-01-01",
+        "end": "2021-12-31",
+        "val": 21979000000,
+        "accn": "0000078003-23-000024",
+        "fy": 2022,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2023-02-23"
+       },
+       {
+        "start": "2021-01-01",
+        "end": "2021-12-31",
+        "val": 21979000000,
+        "accn": "0000078003-24-000039",
+        "fy": 2023,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2024-02-22",
+        "frame": "CY2021"
+       }
+      ]
+     }
+    },
+    "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost": {
+     "label": "Research and Development Expense (Excluding Acquired in Process Cost)",
+     "description": "The costs incurred in a planned search or critical investigation aimed at discovery of new knowledge with the hope that such knowledge will be useful in developing a new product or service, a new process or technique, or in bringing about a significant improvement to an existing product or process; or to translate research findings or other knowledge into a plan or design for a new product or process or for a significant improvement to an existing product or process whether intended for sale or the entity's use, during the reporting period charged to research and development projects, excluding in-process research and development acquired in a business combination consummated during the period. Excludes software research and development, which has a separate concept.",
+     "units": {
+      "USD": [
+       {
+        "start": "2019-01-01",
+        "end": "2019-12-31",
+        "val": 8650000000,
+        "accn": "0000078003-20-000014",
+        "fy": 2019,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2020-02-27"
+       },
+       {
+        "start": "2019-01-01",
+        "end": "2019-12-31",
+        "val": 8394000000,
+        "accn": "0000078003-21-000038",
+        "fy": 2020,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2021-02-25"
+       },
+       {
+        "start": "2019-01-01",
+        "end": "2019-12-31",
+        "val": 8385000000,
+        "accn": "0000078003-22-000027",
+        "fy": 2021,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2022-02-24",
+        "frame": "CY2019"
+       },
+       {
+        "start": "2020-01-01",
+        "end": "2020-12-31",
+        "val": 9405000000,
+        "accn": "0000078003-21-000038",
+        "fy": 2020,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2021-02-25"
+       },
+       {
+        "start": "2020-01-01",
+        "end": "2020-12-31",
+        "val": 9393000000,
+        "accn": "0000078003-22-000027",
+        "fy": 2021,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2022-02-24"
+       },
+       {
+        "start": "2020-01-01",
+        "end": "2020-12-31",
+        "val": 8709000000,
+        "accn": "0000078003-23-000024",
+        "fy": 2022,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2023-02-23",
+        "frame": "CY2020"
+       },
+       {
+        "start": "2021-01-01",
+        "end": "2021-12-31",
+        "val": 13829000000,
+        "accn": "0000078003-22-000027",
+        "fy": 2021,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2022-02-24"
+       },
+       {
+        "start": "2021-01-01",
+        "end": "2021-12-31",
+        "val": 10360000000,
+        "accn": "0000078003-23-000024",
+        "fy": 2022,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2023-02-23"
+       },
+       {
+        "start": "2021-01-01",
+        "end": "2021-12-31",
+        "val": 10360000000,
+        "accn": "0000078003-24-000039",
+        "fy": 2023,
+        "fp": "FY",
+        "form": "10-K",
+        "filed": "2024-02-22",
+        "frame": "CY2021"
+       }
+      ]
+     }
+    }
+   }
+  }
+ }
+}

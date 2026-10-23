@@ -14,3 +14,6 @@ rerun.json
 
 # run records: unredacted local evidence (prompts, tool output, answers), one file per run
 runs/
+
+# Local caches (EDGAR responses, durable journal)
+.fde/

@@ -525,6 +525,206 @@ def cmd_rag(args: argparse.Namespace) -> int:
     return 2
 
 
+# --- adapters (PR 4)
+EDGAR_TENANTS = {"pharma-a": "Pharma A", "pharma-b": "Pharma B"}
+"""The EDGAR demo tenants (`fde rag seed-edgar`); their filings come from the manifest."""
+
+UA_MISSING = (
+    "FDE_EDGAR_USER_AGENT is not set. SEC requires a contact in the User-Agent for sec.gov "
+    "requests: export FDE_EDGAR_USER_AGENT='<app name> <contact>', or pass --offline to use "
+    "the committed fixtures."
+)
+
+
+def edgar_fixtures_dir() -> Path:
+    """The committed offline cache (evals/fixtures/edgar/cache): the current directory's copy
+    when run from a checkout, else the one next to the source tree."""
+    rel = Path("evals") / "fixtures" / "edgar" / "cache"
+    for base in (Path.cwd(), Path(__file__).resolve().parents[2]):
+        if (base / rel).is_dir():
+            return base / rel
+    return Path(__file__).resolve().parents[2] / rel
+
+
+def edgar_client(*, offline: bool, settings=None):
+    """Offline: the committed fixtures, no contact needed. Online: the live cache
+    (settings.edgar_cache_dir) and the contact from settings; ValueError when it is empty."""
+    from .rag.adapters import EdgarClient
+
+    settings = settings or get_settings()
+    if offline:
+        return EdgarClient("", cache_dir=edgar_fixtures_dir(), offline=True)
+    ua = (settings.edgar_user_agent or "").strip()
+    if not ua:
+        raise ValueError(UA_MISSING)
+    return EdgarClient(ua, cache_dir=Path(settings.edgar_cache_dir))
+
+
+def edgar_filings(tenant: str, tickers: list[str] | None = None):
+    """The tenant's pinned filings, optionally limited to some tickers (ValueError on a ticker
+    the tenant's manifest does not have)."""
+    from .rag.adapters import filings_for
+
+    filings = filings_for(tenant)
+    if not tickers:
+        return filings
+    wanted = {t.upper() for t in tickers}
+    unknown = wanted - {f.ticker.upper() for f in filings}
+    if unknown:
+        raise ValueError(f"tenant {tenant!r} has no pinned filings for {sorted(unknown)}")
+    return [f for f in filings if f.ticker.upper() in wanted]
+
+
+def ingest_edgar(store, tenant: str, client, tickers: list[str] | None = None):
+    """Ingest a tenant's pinned filings through `adapters.ingest` in one tenant session."""
+    from .rag.adapters import EdgarAdapter, ingest
+
+    adapter = EdgarAdapter(client, edgar_filings(tenant, tickers))
+    with store.session(tenant) as s:
+        return ingest(s, adapter)
+
+
+def seed_edgar(store, admin_url: str, *, offline: bool = True, client=None, migrate: bool = True):
+    """Create the EDGAR tenants and ingest each one's manifest filings. Idempotent: a re-run
+    writes no documents and no facts. Returns {tenant: IngestReport}."""
+    from .rag import create_tenant
+    from .rag import migrate as rag_migrate
+
+    if migrate:
+        rag_migrate(admin_url)
+    client = client or edgar_client(offline=offline)
+    reports = {}
+    for tid, name in EDGAR_TENANTS.items():
+        create_tenant(admin_url, tid, name)
+        reports[tid] = ingest_edgar(store, tid, client)
+    return reports
+
+
+def _print_ingest_reports(reports: dict) -> None:
+    table = Table(title="ingest")
+    table.add_column("tenant", no_wrap=True)
+    for col in ("entities", "docs", "changed", "facts", "conflicts"):
+        table.add_column(col, justify="right")
+    table.add_column("job")
+    for tid, r in reports.items():
+        table.add_row(
+            tid, str(r.entities), str(r.documents), str(r.documents_changed), str(r.facts),
+            str(r.conflict_groups), r.job_id[:8] or "-",
+        )
+    console.print(table)
+
+
+def _adapter_store(args: argparse.Namespace):
+    from . import rag
+
+    _, app = _rag_urls(args)
+    embedder = rag.make_embedder(getattr(args, "embedder", None) or get_settings().rag_embedder)
+    return rag.TenantStore(app, embedder)
+
+
+def cmd_rag_ingest(args: argparse.Namespace) -> int:
+    from rich.markup import escape
+
+    from .rag.adapters import EdgarCacheMiss, LocalFilesAdapter, ingest
+
+    if args.adapter == "edgar":
+        if args.dir or args.entity:
+            console.print("[red]--dir/--entity are for --adapter local_files[/]")
+            return 2
+        try:
+            client = edgar_client(offline=args.offline)
+            edgar_filings(args.tenant, args.ticker)
+        except ValueError as exc:
+            console.print(f"[red]{escape(str(exc))}[/]")
+            return 2
+        with _adapter_store(args) as store:
+            try:
+                report = ingest_edgar(store, args.tenant, client, args.ticker)
+            except EdgarCacheMiss as exc:
+                console.print(f"[red]{escape(str(exc))}[/]")
+                return 1
+        _print_ingest_reports({args.tenant: report})
+        return 0
+
+    if not args.dir:
+        console.print("[red]--adapter local_files needs --dir PATH[/]")
+        return 2
+    if args.ticker or args.offline:
+        console.print("[red]--ticker/--offline are for --adapter edgar[/]")
+        return 2
+    root = Path(args.dir)
+    if not root.is_dir():
+        console.print(f"[red]not a directory[/]: {escape(str(root))}")
+        return 2
+    adapter = LocalFilesAdapter(root, entity=args.entity)
+    with _adapter_store(args) as store, store.session(args.tenant) as s:
+        report = ingest(s, adapter)
+    _print_ingest_reports({args.tenant: report})
+    for rel in adapter.skipped:
+        console.print(f"[yellow]skipped[/] {escape(rel)}")
+    return 0
+
+
+def cmd_rag_seed_edgar(args: argparse.Namespace) -> int:
+    from rich.markup import escape
+
+    from . import rag
+
+    try:
+        client = edgar_client(offline=args.offline)
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/]")
+        return 2
+    admin, _ = _rag_urls(args)
+    rag.migrate(admin)  # before the store opens: its posture check needs the app role
+    with _adapter_store(args) as store:
+        reports = seed_edgar(store, admin, client=client, migrate=False)
+    _print_ingest_reports(reports)
+    return 0
+
+
+def cmd_rag_edgar_drift(args: argparse.Namespace) -> int:
+    from rich.markup import escape
+
+    from .rag.adapters import check_drift
+
+    try:
+        client = edgar_client(offline=False)  # live cache dir, never the fixtures
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/]")
+        return 2
+    problems = check_drift(client)
+    for msg in problems:
+        console.print(f"[red]DRIFT[/] {escape(msg)}")
+    if not problems:
+        console.print("[green]ok[/]: every pinned filing matches the manifest")
+    return 1 if problems else 0
+
+
+def _add_adapter_parsers(rsub) -> None:
+    ri = rsub.add_parser("ingest", help="load a source into one tenant through an adapter")
+    ri.add_argument("--tenant", required=True)
+    ri.add_argument("--adapter", required=True, choices=["edgar", "local_files"])
+    ri.add_argument("--ticker", action="append", metavar="TICKER", help="edgar: only these")
+    ri.add_argument("--offline", action="store_true", help="edgar: the committed fixtures")
+    ri.add_argument("--dir", help="local_files: the directory to ingest")
+    ri.add_argument("--entity", help="local_files: an entity to register for the files")
+    ri.add_argument("--url")
+    ri.add_argument("--embedder")
+    ri.set_defaults(fn=cmd_rag_ingest)
+    se = rsub.add_parser("seed-edgar", help="create pharma-a / pharma-b and ingest the manifest")
+    se.add_argument("--offline", action="store_true", help="the committed fixtures, no network")
+    se.add_argument("--admin-url")
+    se.add_argument("--url")
+    se.add_argument("--embedder")
+    se.set_defaults(fn=cmd_rag_seed_edgar)
+    dr = rsub.add_parser("edgar-drift", help="re-fetch the pinned filings; exit 1 on drift")
+    dr.set_defaults(fn=cmd_rag_edgar_drift)
+
+
+# --- end adapters (PR 4)
+
+
 def _print_sources(result) -> None:
     """Evidence the run saw, marking what the answer actually cited."""
     if not result.sources:
@@ -858,6 +1058,9 @@ def main(argv: list[str] | None = None) -> int:
     rd.add_argument("--url")
     rd.add_argument("--embedder")
     # --- end rag facts (2-D)
+    # --- adapters (PR 4)
+    _add_adapter_parsers(rsub)  # these subcommands set their own fn, overriding cmd_rag
+    # --- end adapters (PR 4)
     rg.set_defaults(fn=cmd_rag)
 
     # --- runs (1-C)

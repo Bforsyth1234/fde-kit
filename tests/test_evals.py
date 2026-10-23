@@ -6,13 +6,17 @@ import pytest
 
 from evals.make_replay_fixtures import FIXTURES, RUNS_DIR, generate
 from evals.run_evals import (
+    EDGAR_TENANTS,
     GOLDEN,
+    GOLDEN_EDGAR,
     GOLDEN_RAG,
+    case_registry,
     close_rag_store,
     load_cases,
     main,
     open_rag_store,
     run_case,
+    seed_edgar_offline,
     summarise,
 )
 from evals.scorers import SCORERS
@@ -193,3 +197,136 @@ def test_golden_rag_passes_offline(monkeypatch):
     by_id = {r.id: r for r in results}
     assert all(by_id[i].cited == 2 for i in ("rag-conflict-01", "rag-conflict-02"))
     assert all(by_id[i].cited == 0 for i in ("rag-xtenant-01", "rag-xtenant-02"))
+
+
+# --- the edgar set (PR 4) ----------------------------------------------------------------
+
+
+EDGAR_CATEGORIES = {
+    "table-fact": 3,
+    "table-conflict": 3,
+    "precision": 2,
+    "doc-lookup": 2,
+    "cross-tenant": 2,
+}
+EDGAR_DOC_PREFIX = "https://www.sec.gov/Archives/edgar/data/"
+
+
+def _manifest_documents() -> set[str]:
+    from fde_kit.rag.adapters import load_manifest
+
+    return {url for e in load_manifest() for url in e.documents}
+
+
+def test_golden_edgar_cases_are_well_formed():
+    """Pure: shape only, plus every cited URL is a pinned manifest document. Whether the
+    scripts return what the answers cite is the Postgres-gated test below."""
+    cases = load_cases(GOLDEN_EDGAR)
+    assert len(cases) == 12
+    assert len({c["id"] for c in cases}) == 12, "duplicate ids"
+    docs = _manifest_documents()
+    by_cat: dict[str, int] = {}
+    for c in cases:
+        assert c["tenant"] in EDGAR_TENANTS, c["id"]
+        assert "mock" in c and "replay" not in c, f"{c['id']}: edgar cases are scripted"
+        assert any(chk["type"] == "cites_only" for chk in c["checks"]), c["id"]
+        by_cat[c["category"]] = by_cat.get(c["category"], 0) + 1
+        for entry in c["mock"]:
+            for call in entry.get("tool_calls", []) if isinstance(entry, dict) else []:
+                assert call["name"] in RAG_TOOLS, c["id"]
+                assert "tenant_id" not in call["input"], c["id"]
+                if call["name"] == "query_table":
+                    # Citable rows: fact_id plus the filing URL as doc_source, stable order.
+                    sql = call["input"]["sql"]
+                    assert "f.fact_id" in sql and "d.source AS doc_source" in sql, c["id"]
+                    assert "ORDER BY" in sql, c["id"]
+        cited = [chk["value"] for chk in c["checks"] if chk["type"] == "cites"]
+        for url in cited:
+            assert url.startswith(EDGAR_DOC_PREFIX) and url in docs, (c["id"], url)
+        if c["category"] == "table-conflict":
+            conflict = [chk for chk in c["checks"] if chk["type"] == "conflict_reported"]
+            assert len(conflict) == 1 and len(conflict[0]["value"]) >= 2, c["id"]
+            assert len(cited) >= 2, f"{c['id']}: a conflict cites every filing"
+        if c["category"] == "precision":
+            assert any(
+                chk["type"] == "regex" and "conflict" in chk["value"] for chk in c["checks"]
+            ), c["id"]
+        if c["category"] == "cross-tenant":
+            assert not cited, c["id"]
+            assert any(chk["type"] == "regex" for chk in c["checks"]), c["id"]
+    assert by_cat == EDGAR_CATEGORIES
+    assert {c["tenant"] for c in cases} == set(EDGAR_TENANTS)
+
+
+@pytest.fixture(scope="module")
+def edgar_store():
+    """Seed pharma-a / pharma-b once from the offline fixtures (idempotent) and open the run's
+    store against them with the hash embedder, as CI does."""
+    if not PG_URL:
+        pytest.skip("FDE_TEST_PG_URL not set")
+    import psycopg
+
+    with psycopg.connect(PG_URL) as conn:
+        try:
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        except psycopg.Error as exc:
+            pytest.skip(f"pgvector unavailable: {exc}")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("FDE_OTEL_ENABLED", "false")
+        mp.setenv("FDE_RAG_ADMIN_URL", PG_URL)
+        mp.delenv("FDE_RAG_URL", raising=False)
+        mp.setenv("FDE_RAG_EMBEDDER", "hash")
+        close_rag_store()
+        try:
+            # The helper migrates before it opens the run's store (the app role must exist).
+            seed_edgar_offline(PG_URL)
+            yield open_rag_store()
+        finally:
+            close_rag_store()
+
+
+def test_golden_edgar_passes_offline(edgar_store):
+    """Scripted model, real tools: every case's search and SQL, run under RLS against the
+    offline-seeded EDGAR corpus, must return what the scripted answer cites."""
+    results = [run_case(c, "mock", judge=None) for c in load_cases(GOLDEN_EDGAR)]
+    failing = [(r.id, r.details) for r in results if not r.passed]
+    assert not failing, failing
+    summary = summarise(results)
+    assert summary["total"] == 12 and summary["passed"] == 12
+    assert summary["pass_rate"] == 1.0 and summary["fabricated_citations"] == 0
+    assert {c: v["passed"] for c, v in summary["by_category"].items()} == EDGAR_CATEGORIES
+    by_id = {r.id: r for r in results}
+    assert all(by_id[i].cited == 0 for i in ("edgar-xtenant-01", "edgar-xtenant-02"))
+
+
+def _tool_outputs(case: dict) -> list[str]:
+    """Run the case's scripted tool calls for real (no model) and return each tool's content."""
+    reg = case_registry(case)
+    out = []
+    for entry in case["mock"]:
+        for call in entry.get("tool_calls", []) if isinstance(entry, dict) else []:
+            res = reg.execute(call["name"], call["input"])
+            assert not res.is_error, (case["id"], res.content)
+            out.append(res.content)
+    return out
+
+
+def test_edgar_precision_cases_have_no_conflict_in_tool_output(edgar_store):
+    """The scorers only see the answer, so check the tool side directly: a rounded repeat of
+    the same figure (Vertex FY2019 revenue, Moderna FY2020 net loss) is not a conflict, while
+    the real restatements in the table-conflict cases are."""
+    cases = load_cases(GOLDEN_EDGAR)
+    precision = [c for c in cases if c["category"] == "precision"]
+    conflicts = [c for c in cases if c["category"] == "table-conflict"]
+    assert len(precision) == 2 and len(conflicts) == 3
+    for c in precision:
+        content = "\n".join(_tool_outputs(c))
+        rows = [line for line in content.splitlines() if line.startswith("[#")]
+        assert len(rows) >= 2, f"{c['id']}: expected repeats across filings: {content}"
+        # Column 3 is value_num: the filings round the same figure differently.
+        assert len({line.split(" | ")[3] for line in rows}) >= 2, (c["id"], content)
+        assert "conflict=true" not in content, f"{c['id']}: {content}"
+    for c in conflicts:
+        content = "\n".join(_tool_outputs(c))
+        rows = [line for line in content.splitlines() if line.startswith("[#")]
+        assert rows and all(line.endswith("conflict=true") for line in rows), (c["id"], content)

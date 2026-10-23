@@ -615,3 +615,151 @@ def test_fetch_of_another_tenants_document_is_unknown(store: TenantStore):
             s.fetch(harbor_doc[0])
         r = s.query(f"SELECT count(*) FROM rag_documents WHERE doc_id = '{harbor_doc[0]}'")
         assert r.rows == [(0,)]
+
+
+# --- precision-aware conflicts (PR 4)
+
+FY2019 = {"period_start": date(2019, 1, 1), "period_end": date(2019, 12, 31)}
+
+
+@pytest.fixture
+def company(store: TenantStore, entities):
+    """A company entity in harbor, removed with its facts afterwards."""
+    with store.session("harbor") as s:
+        eid = s.upsert_entity("company", "Vertex Test", ["VRTX-T"])
+    yield "Vertex Test"
+    with store.session("harbor") as s:
+        s.conn.execute("DELETE FROM rag_facts WHERE entity_id = %s::uuid", (eid,))
+        s.conn.execute("DELETE FROM rag_entities WHERE entity_id = %s::uuid", (eid,))
+
+
+def test_precision_only_difference_forms_no_group(store: TenantStore, company: str):
+    """Vertex FY2019 revenue: exact in two 10-Ks, to $100K in a third. Not a conflict."""
+    with store.session("harbor") as s:
+        ids = s.add_facts(
+            [
+                FactRow(company, "revenue", 4_162_821_000, "USD", **FY2019, precision=1000),
+                FactRow(company, "revenue", 4_162_821_000, "USD", **FY2019, precision=1000),
+                FactRow(company, "revenue", 4_162_800_000, "USD", **FY2019, precision=100_000),
+            ]
+        )
+        got = {f.fact_id: f for f in s.facts(entity=company, field="revenue")}
+        assert set(got) == set(ids)
+        assert [got[i].conflict_group_id for i in ids] == [None, None, None]
+        # The same pair with no precision is PR 3's exact rule: a conflict.
+        a, b = s.add_facts(
+            [
+                FactRow(company, "revenue_exact", 4_162_821_000, "USD", **FY2019),
+                FactRow(company, "revenue_exact", 4_162_800_000, "USD", **FY2019),
+            ]
+        )
+        exact = {f.fact_id: f.conflict_group_id for f in s.facts(field="revenue_exact")}
+        assert exact[a] is not None and exact[a] == exact[b]
+
+
+def test_restatement_chain_then_rounded_repeat_is_one_group(store: TenantStore, company: str):
+    """Pfizer-style FY2019 revenue: 51,750M, recast to 41,172M, then 40,905M, all in millions.
+    Then a repeat of 41,172M rounded to hundreds of millions: it agrees with 41,172M but not
+    with the others, and joins the same group (see the add_facts docstring)."""
+    with store.session("harbor") as s:
+        chain = s.add_facts(
+            [
+                FactRow(company, "revenue", v * 1_000_000, "USD", **FY2019, precision=1_000_000)
+                for v in (51_750, 41_172, 40_905)
+            ]
+        )
+        groups = {f.fact_id: f.conflict_group_id for f in s.facts(field="revenue")}
+        assert set(groups) == set(chain)
+        (group,) = set(groups.values())
+        assert group is not None
+
+        (repeat,) = s.add_facts(
+            [FactRow(company, "revenue", 41_200_000_000, "USD", **FY2019, precision=10**8)]
+        )
+        groups = {f.fact_id: f.conflict_group_id for f in s.facts(field="revenue")}
+        assert groups == {**{f: group for f in chain}, repeat: group}
+
+        # Another period of the same field is a different key: untouched.
+        (other,) = s.add_facts(
+            [
+                FactRow(
+                    company,
+                    "revenue",
+                    41_908_000_000,
+                    "USD",
+                    period_start=date(2020, 1, 1),
+                    period_end=date(2020, 12, 31),
+                    precision=1_000_000,
+                )
+            ]
+        )
+        assert {f.fact_id: f.conflict_group_id for f in s.facts(field="revenue")}[other] is None
+
+
+def test_precision_and_source_ref_round_trip(store: TenantStore, company: str):
+    ref = "us-gaap:Revenues@0000875320-22-000007"
+    with store.session("harbor") as s:
+        a, b, c = s.add_facts(
+            [
+                FactRow(
+                    company,
+                    "revenue",
+                    4_162_800_000,
+                    "USD",
+                    **FY2019,
+                    precision=100_000,
+                    source_ref=ref,
+                ),
+                FactRow(company, "revenue", 4_162_821_000, "USD", **FY2019),
+                FactRow(company, "auditor", "Ernst & Young LLP", **FY2019),
+            ]
+        )
+        got = {f.fact_id: f for f in s.facts(entity="VRTX-T")}
+        assert got[a].precision == 100_000 and isinstance(got[a].precision, int)
+        assert got[a].source_ref == ref and got[a].value == 4_162_800_000
+        assert got[b].precision is None and got[b].source_ref == ""
+        assert got[c].precision is None and got[c].source_ref == ""
+        assert all(f.conflict_group_id is None for f in got.values())
+        assert got[a].to_source("harbor").span == f"fact:{a}"
+    with store.session("harbor") as s:
+        r = s.query(
+            "SELECT f.fact_id, f.precision, f.source_ref FROM rag_facts f "
+            "JOIN rag_entities e ON e.entity_id = f.entity_id "
+            "WHERE e.canonical_name = 'Vertex Test' ORDER BY f.created_at, f.fact_id"
+        )
+        assert r.columns == ["fact_id", "precision", "source_ref"]
+        rows = {row[0]: row[1:] for row in r.rows}
+        assert rows == {a: (100_000, ref), b: (None, ""), c: (None, "")}
+
+
+def test_add_facts_rejects_bad_precision(store: TenantStore, company: str):
+    with store.session("harbor") as s:
+        with pytest.raises(ValueError):
+            s.add_facts([FactRow(company, "revenue", 1, precision=0)])
+        with pytest.raises(ValueError):
+            s.add_facts([FactRow(company, "auditor", "EY", precision=1000)])
+        assert s.facts(entity=company) == []
+
+
+def test_migrate_adds_precision_columns_to_a_pr3_schema(admin_url: str, store):
+    """A PR 3 database lacks precision and source_ref. migrate adds them on the parent and
+    they cascade to every existing partition, with the default filled in."""
+    with psycopg.connect(admin_url, autocommit=True) as conn:
+        conn.execute("ALTER TABLE rag_facts DROP COLUMN precision, DROP COLUMN source_ref")
+    migrate(admin_url)
+    with psycopg.connect(admin_url) as conn:
+        for table in ("rag_facts", *(partition_name("rag_facts", t) for t in TENANTS)):
+            cols = dict(
+                conn.execute(
+                    "SELECT column_name, is_nullable || ':' || data_type "
+                    "FROM information_schema.columns "
+                    "WHERE table_name = %s AND column_name IN ('precision', 'source_ref')",
+                    (table,),
+                ).fetchall()
+            )
+            assert cols == {"precision": "YES:numeric", "source_ref": "NO:text"}, table
+        assert conn.execute(
+            "SELECT count(*) FROM rag_facts WHERE source_ref <> ''"
+        ).fetchone() == (0,)
+    with psycopg.connect(app_url_from_admin(admin_url)) as conn:
+        assert check_posture(conn) == []

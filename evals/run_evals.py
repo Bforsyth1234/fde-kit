@@ -4,10 +4,11 @@
     python -m evals.run_evals --provider mock     # offline: replays each case's scripted mock
     python -m evals.run_evals --limit 5 --json out.json
     python -m evals.run_evals --set rag --provider mock   # the lease-corpus set, tools for real
+    python -m evals.run_evals --set edgar --seed --provider mock   # SEC filings, seeded offline
 
 Exit code is 0 when pass rate >= threshold, 1 otherwise. That exit code is the CI gate.
 
-Two sets. `--set golden` (the default, evals/golden.jsonl) runs against the builtin tools and
+Three sets. `--set golden` (the default, evals/golden.jsonl) runs against the builtin tools and
 needs nothing but Python. `--set rag` (evals/golden_rag.jsonl) runs over the seeded demo lease
 corpus: each case carries a `tenant`, and the agent gets `tenant_search_registry` for that tenant
 from one `TenantStore` opened for the whole run (settings `rag_url`, else the app role derived
@@ -17,6 +18,12 @@ from `rag_admin_url`; embedder from `--embedder` or settings `rag_embedder`). Se
 tools+harness check: it proves the SQL and queries in the script return what the scripted answer
 cites, under RLS, with the citations resolving to real Sources. The live-model run is the model
 check.
+
+`--set edgar` (evals/golden_edgar.jsonl) is the same shape over the pinned SEC EDGAR corpus in
+tenants `pharma-a` / `pharma-b` (FY2019-FY2021 10-Ks, real restatements and rounded repeats).
+`--seed` first seeds those tenants from the committed offline fixtures
+(`seed_edgar_offline`: no network, no contact string); it is idempotent, so re-running it writes
+nothing new.
 
 Mock mode exists to test the *harness*, not the model: each case ships a `mock` script that the
 MockProvider replays. If a case passes in mock mode and fails against the real model, the model
@@ -56,7 +63,14 @@ from .scorers import SCORERS, JudgeContext
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GOLDEN = Path(__file__).parent / "golden.jsonl"
 GOLDEN_RAG = Path(__file__).parent / "golden_rag.jsonl"
-SETS: dict[str, Path] = {"golden": GOLDEN, "rag": GOLDEN_RAG}
+GOLDEN_EDGAR = Path(__file__).parent / "golden_edgar.jsonl"
+SETS: dict[str, Path] = {"golden": GOLDEN, "rag": GOLDEN_RAG, "edgar": GOLDEN_EDGAR}
+EDGAR_TENANTS: dict[str, str] = {
+    "pharma-a": "Pharma A (Pfizer, Gilead, Vertex)",
+    "pharma-b": "Pharma B (Moderna, Regeneron)",
+}
+"""The EDGAR eval tenants; their filings are pinned in `rag/adapters/edgar_manifest.json`."""
+EDGAR_FIXTURES = REPO_ROOT / "evals" / "fixtures" / "edgar" / "cache"
 console = Console()
 
 _rag_store: Any = None
@@ -87,17 +101,47 @@ def close_rag_store() -> None:
         _rag_store = None
 
 
+def known_tenants() -> set[str]:
+    """Tenants a case may name: the demo lease tenants plus the EDGAR tenants."""
+    from fde_kit.rag.demo_corpus import TENANTS
+
+    return set(TENANTS) | set(EDGAR_TENANTS)
+
+
+def seed_edgar_offline(
+    admin_url: str | None = None, store: Any = None, cache_dir: Path = EDGAR_FIXTURES
+) -> dict[str, Any]:
+    """Migrate, create `pharma-a` / `pharma-b`, and ingest each tenant's pinned filings from
+    the offline fixture cache. No network and no contact string: an offline client serves
+    only from `cache_dir`. Idempotent (ingest skips unchanged documents). `store` defaults to
+    the run's store (`open_rag_store`). Returns the IngestReport per tenant."""
+    from fde_kit.rag import create_tenant, migrate
+    from fde_kit.rag.adapters import EdgarAdapter, EdgarClient, filings_for, ingest
+
+    admin_url = admin_url or get_settings().rag_admin_url
+    migrate(admin_url)
+    store = store if store is not None else open_rag_store()
+    client = EdgarClient("", cache_dir=cache_dir, offline=True)
+    reports: dict[str, Any] = {}
+    for tid, name in EDGAR_TENANTS.items():
+        create_tenant(admin_url, tid, name)
+        with store.session(tid) as s:
+            reports[tid] = ingest(s, EdgarAdapter(client, filings_for(tid)))
+    return reports
+
+
 def case_registry(case: dict[str, Any]) -> ToolRegistry:
     """The builtin registry, or for a case with a `tenant` the three retrieval tools bound to
     that tenant. The tenant comes from the case file, never from the model or the prompt."""
     if "tenant" not in case:
         return registry
     from fde_kit.rag import tenant_search_registry
-    from fde_kit.rag.demo_corpus import TENANTS
 
     tenant = case["tenant"]
-    if tenant not in TENANTS:  # load_cases checks too; this guards hand-built cases
-        raise ValueError(f"{case['id']}: unknown tenant {tenant!r}, not in {sorted(TENANTS)}")
+    if tenant not in known_tenants():  # load_cases checks too; this guards hand-built cases
+        raise ValueError(
+            f"{case['id']}: unknown tenant {tenant!r}, not in {sorted(known_tenants())}"
+        )
     return tenant_search_registry(open_rag_store(), tenant)
 
 
@@ -143,14 +187,11 @@ def load_cases(
             raise ValueError(f"{c['id']}: needs a 'mock' script or a 'replay' run file")
         if "replay" in c and not replay_path(c).is_file():
             raise ValueError(f"{c['id']}: replay file not found: {replay_path(c)}")
-        if "tenant" in c:
-            from fde_kit.rag.demo_corpus import TENANTS
-
-            if c["tenant"] not in TENANTS:
-                raise ValueError(
-                    f"{c['id']}: unknown tenant {c['tenant']!r}; rag cases run over the demo "
-                    f"corpus, tenants {sorted(TENANTS)}"
-                )
+        if "tenant" in c and c["tenant"] not in known_tenants():
+            raise ValueError(
+                f"{c['id']}: unknown tenant {c['tenant']!r}; rag cases run over the demo "
+                f"lease corpus or the EDGAR corpus, tenants {sorted(known_tenants())}"
+            )
     if ids:
         missing = ids - {c["id"] for c in cases}
         if missing:
@@ -316,11 +357,17 @@ def main(argv: list[str] | None = None) -> int:
         "--set",
         default="golden",
         choices=sorted(SETS),
-        help="golden: builtin tools, offline; rag: lease corpus, needs a seeded Postgres",
+        help="golden: builtin tools, offline; rag: lease corpus, needs a seeded Postgres; "
+        "edgar: SEC filings in pharma-a/pharma-b, needs Postgres (seed with --seed)",
+    )
+    p.add_argument(
+        "--seed",
+        action="store_true",
+        help="edgar set: first seed pharma-a/pharma-b from the offline fixtures (idempotent)",
     )
     p.add_argument("--golden", type=Path, help="a case file; overrides --set's file")
     p.add_argument(
-        "--embedder", help="rag set only: 'hash' or 'bge'; default from FDE_RAG_EMBEDDER"
+        "--embedder", help="rag/edgar sets only: 'hash' or 'bge'; default from FDE_RAG_EMBEDDER"
     )
     p.add_argument("--json", type=Path, help="write full results to this file")
     p.add_argument(
@@ -334,7 +381,18 @@ def main(argv: list[str] | None = None) -> int:
         init_tracing(settings)
     ids = {i.strip() for i in args.ids.split(",") if i.strip()} if args.ids else None
     cases = load_cases(args.golden or SETS[args.set], args.limit, ids)
-    if args.set == "rag" or any("tenant" in c for c in cases):
+    if args.seed:
+        # Migrates first, so on a fresh database the app role exists before the store opens.
+        from fde_kit.rag import migrate
+
+        migrate(settings.rag_admin_url)
+        store = open_rag_store(settings, args.embedder)
+        for tid, rep in seed_edgar_offline(settings.rag_admin_url, store).items():
+            console.print(
+                f"seeded {tid}: {rep.documents_changed}/{rep.documents} documents written, "
+                f"{rep.facts} facts, {rep.conflict_groups} conflict groups"
+            )
+    if args.set in ("rag", "edgar") or any("tenant" in c for c in cases):
         open_rag_store(settings, args.embedder)
 
     judge: LLMProvider | None = None
