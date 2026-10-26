@@ -136,6 +136,7 @@ fde rag ask --tenant T "q"                # always records to runs/ (prints the 
 fde runs list [--dir runs]                # table: run_id, created_at, runtime, tenant, model, prompt, turns, stopped, parent
 fde runs tree RUN_ID                      # lineage: parents up, forks down (scans the dir)
 fde runs show RUN_ID [--full]             # header + one line per row; --full adds tool inputs (SQL) and outputs
+fde runs drift RUN_ID [--tenant T] [--json]   # is the evidence the run saw still in the database? exit 1 on drift
 fde durable-export WORKFLOW_ID [--out PATH]   # a Temporal run's history, as the same file
 ```
 
@@ -208,6 +209,22 @@ former.
 returned, the answer. Treat it like a trace with `FDE_OTEL_TENANT_CONTENT=1`. The directory is
 gitignored; delete it on your own schedule. `fde run` records only when `FDE_RECORD_RUNS=1` or
 `--record` is given; `fde rag ask` always records and prints the path.
+
+**Drift.** Replay answers "what did the agent see then"; `fde runs drift RUN_ID` answers "is
+that still true now". It looks every Source on the run's `tool` rows up again (numbered as the
+run's `[n]` citations) and reports one status each: `unchanged`; `superseded` (the document was
+re-ingested: old and current version, hash and doc_id); `gone` (document, passage or fact
+deleted); `value_changed` (a fact's value or unit differs, or a body changed in place);
+`new_conflict` (a fact the run saw without `conflict=true` is now in a conflict group); and
+`unchecked` for Sources that are not database records (e.g. `lookup_policy`), with the reason.
+Search passages are judged through their document, since a re-ingest deletes the old chunks. A
+fact's value at record time is read back from the recorded `query_table` output, so it is
+compared only when that SQL selected `value_num`/`value_text`; otherwise the detail says so.
+It runs inside `store.session(tenant)` for the run header's tenant: `--tenant` is only for runs
+recorded without one, and a different tenant is refused, because under RLS it would see none of
+the run's rows. Exit 0 no drift, 1 drift (`superseded`, `gone`, `value_changed`,
+`new_conflict`), 2 usage error; `--json` for machines. It reports and never re-answers. Library:
+`fde_kit.rag.drift.check_drift(RunRecord.load(path), store)` returns a `DriftReport`.
 
 A durable run exports to the same file. `fde durable-export WORKFLOW_ID` walks the workflow's
 event history: the start event gives the header and the `user` row, each `llm_call` and
