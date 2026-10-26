@@ -988,15 +988,27 @@ not exist yet.
 
 ## Baseline results
 
-Golden set (20 cases at the time; the two `citation` cases were added later and have no live
-baseline yet) against `claude-sonnet-5-5`, single run, 2026-10-18:
+All three sets against `claude-sonnet-5-5`, prompt `default@9abfef4b5539`, single run each,
+October 2026:
 
-| Metric | Value |
-| --- | --- |
-| Pass rate | **19 / 20 (95%)** |
-| By category | calculator 8/8 · lookup 5/5 · lookup-miss 1/1 · date 1/1 · date+calc 1/1 · multi-tool 2/2 · no-tool 1/2 |
-| Latency | p50 2.8 s · p95 8.9 s per case (2–3 round-trips each) |
-| Tokens | ~30k in / ~1.9k out for the full set (tool schemas are re-sent every turn) |
+| Set | Pass rate | By category | Latency p50 / p95 | Tokens in / out |
+| --- | --- | --- | --- | --- |
+| golden | **24 / 25 (96%)** | calculator 8/8 · lookup 5/5 · lookup-miss 1/1 · date 1/1 · date+calc 1/1 · multi-tool 2/2 · citation 2/2 · replay 3/3 · no-tool 1/2 | 3.2 s / 5.3 s | 35.9k / 2.0k |
+| rag (leases) | **12 / 12** | doc-lookup 4/4 · table-fact 4/4 · table-conflict 2/2 · cross-tenant 2/2 | 4.9 s / 5.9 s | 68.2k / 5.5k |
+| edgar (SEC filings) | **12 / 12** | table-fact 3/3 · table-conflict 3/3 · precision 2/2 · doc-lookup 2/2 · cross-tenant 2/2 | 4.1 s / 7.5 s | 62.3k / 4.6k |
+
+No fabricated citations in any set. In every cross-tenant case the model searched, found
+nothing, and said so. The other tenant's figure appears in no format.
+
+**The first live rag/edgar run scored 8/12 and 5/12, and every failure was the eval's fault.**
+The checks were string matches written against the mock answers. "$51.750 billion" failed a
+check for `51,750`, "December 1, 2026" failed `2026-12-01`, "I couldn't find" was missing from a
+phrase list of refusals, and "not a real conflict" failed a regex that banned the word
+"conflict". The fix (see Check types above) compares numbers and dates by value, makes the leak
+check *stricter* (it now catches `$81.3 billion` as well as `81,288`), and moves wording to judge
+rubrics. One more false failure followed: the judge flagged a claim the addendum states word for
+word as an "outside fact", because it only saw the answer. The judge now sees the tool outputs
+the model saw.
 
 **Known failure — `notool-01`.** Asked for a one-sentence definition, the model returns two
 well-formed sentences, reproducibly. The judge fails it on the length constraint while noting the
