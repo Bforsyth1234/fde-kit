@@ -105,7 +105,8 @@ def tenant_search_registry(
             whether it conflicts; you do not need to join documents yourself. Rows marked
             conflict=true disagree with another source: report every value and say they
             conflict. When conflicting rows were "reported as" different line items, say so:
-            that is a reclassification, not a correction of the same figure."""
+            that is a reclassification, not a correction of the same figure. A row ending
+            "(unverified: fact_id not found)" has no source and cannot be cited."""
             # The tables paragraph, an example query and one line per dictionary field are
             # appended to this description when the registry is built; see
             # query_table_description().
@@ -198,14 +199,18 @@ def fact_ids_in(result: QueryResult) -> list[str]:
     return [str(row[k]) for row in result.rows if row[k] is not None]
 
 
+UNVERIFIED_NOTE = " (unverified: fact_id not found)"
+
+
 def format_query_result(
-    result: QueryResult, *, tenant_id: str | None = None, facts: Mapping[str, Fact] | None = None
+    result: QueryResult, *, tenant_id: str | None = None, facts: Mapping[str, Fact]
 ) -> ToolResult:
     """Render a `QueryResult` as a compact table with a `[#i]` and a Source per fact row.
 
-    A row gets a marker and a Source only if the SQL selected `fact_id`. Its provenance comes
-    from `facts` (looked up from the database by `query_table`), not from the columns the model
-    happened to select:
+    A row gets a marker and a Source only if the SQL selected `fact_id` and that id is in
+    `facts` (looked up from the database by `query_table`, in the same tenant session). Its
+    provenance comes from the database record, never from the columns the model selected:
+    the model's SQL decides which facts come back, not where they came from.
 
     - Source = `Fact.to_source`: uri is the document's URL, title "<entity> <field> <period>",
       doc_id, the document's content hash, span `fact:<fact_id>`.
@@ -216,22 +221,15 @@ def format_query_result(
       selected. This is what lets the model say which filing each number came from without a
       second query.
 
-    A fact_id that is not in `facts` (not a real fact id, or called without a lookup) falls back
-    to the columns: `doc_source`/`source` for uri (else `fact:<fact_id>`), `entity` + `field`
-    for title, `doc_id`, `doc_hash`/`content_hash`, and `conflict_group_id` for the marker.
-    Rows without a `fact_id` column (e.g. `SELECT count(*)`) get no marker and no Source.
+    A fact_id that is not in `facts` (a literal the SQL made up, or another tenant's id that RLS
+    hid from the lookup) gets no marker and no Source, so it cannot be cited; its line ends with
+    ` (unverified: fact_id not found)`. Rows without a `fact_id` column (e.g. `SELECT count(*)`)
+    get no marker and no Source. `facts` is required: there is no fallback to the columns.
     """
-    facts = facts or {}
     cols = list(result.columns)
     idx = {c: i for i, c in enumerate(cols)}
     has_fact = "fact_id" in idx
     conflict_col = idx.get("conflict_group_id")
-
-    def col(row: tuple, *names: str) -> Any:
-        for n in names:
-            if n in idx and row[idx[n]] is not None:
-                return row[idx[n]]
-        return None
 
     lines = [" | ".join(cols)]
     sources: list[Source] = []
@@ -240,11 +238,12 @@ def format_query_result(
         line = " | ".join("" if v is None else str(v) for v in row)
         conflict = conflict_col is not None and row[conflict_col] is not None
         if has_fact and row[idx["fact_id"]] is not None:
-            n += 1
-            line = f"[#{n}] {line}"
-            fact_id = str(row[idx["fact_id"]])
-            fact = facts.get(fact_id)
-            if fact is not None:
+            fact = facts.get(str(row[idx["fact_id"]]))
+            if fact is None:
+                line += UNVERIFIED_NOTE
+            else:
+                n += 1
+                line = f"[#{n}] {line}"
                 sources.append(fact.to_source(tenant_id))
                 label = fact.doc_title or fact.doc_source
                 reported_as = reported_line_item(fact.source_ref)
@@ -253,22 +252,6 @@ def format_query_result(
                 elif label:
                     line += f" (source: {label})"
                 conflict = conflict or fact.conflict_group_id is not None
-            else:
-                entity, field = col(row, "entity"), col(row, "field")
-                doc_hash = col(row, "doc_hash", "content_hash")
-                doc_id = col(row, "doc_id")
-                uri = col(row, "doc_source", "source")
-                sources.append(
-                    Source(
-                        source_id=fact_id,
-                        uri=str(uri) if uri is not None else f"fact:{fact_id}",
-                        title=" ".join(str(x) for x in (entity, field) if x is not None),
-                        doc_id=str(doc_id) if doc_id is not None else None,
-                        content_hash=str(doc_hash) if doc_hash is not None else None,
-                        span=f"fact:{fact_id}",
-                        tenant_id=tenant_id,
-                    )
-                )
         if conflict:
             line += " conflict=true"
         lines.append(line)

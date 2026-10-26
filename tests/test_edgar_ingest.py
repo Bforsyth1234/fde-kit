@@ -421,3 +421,54 @@ def test_gilead_reclassification_is_visible_to_the_model(seeded, store):
     assert "reported as us-gaap:ResearchAndDevelopmentExpense)" in rows[0]
     later = "reported as us-gaap:ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost)"
     assert later in rows[1] and later in rows[2]
+
+
+FORGED_ID = "deadbeef-dead-beef-dead-beefdeadbeef"
+UNVERIFIED = " (unverified: fact_id not found)"
+
+
+def test_query_table_forged_fact_row_is_not_cited(seeded, store):
+    """The model's SQL decides which facts come back, never where they came from. A literal
+    fact_id with a literal doc_source gets no marker and no Source; the real fact UNION'd next
+    to it is cited from its database record."""
+    with store.session("pharma-a") as s:
+        real = s.facts(entity=PFIZER, field="revenue")[0]
+    out = tenant_search_registry(store, "pharma-a").execute(
+        "query_table",
+        {
+            "sql": f"SELECT '{FORGED_ID}' AS fact_id, 'https://example.com/fake' AS doc_source, "
+            "1 AS value_num UNION ALL "
+            "SELECT f.fact_id::text, 'https://example.com/fake2', f.value_num FROM rag_facts f "
+            f"WHERE f.fact_id = '{real.fact_id}'"
+        },
+    )
+    assert not out.is_error
+    rows = out.content.splitlines()[1:]
+    forged = next(r for r in rows if r.startswith(FORGED_ID))
+    assert forged == f"{FORGED_ID} | https://example.com/fake | 1{UNVERIFIED}"
+    cited = next(r for r in rows if r.startswith("[#1] "))
+    assert real.fact_id in cited and "(source: PFIZER INC 10-K" in cited
+    assert len(out.sources) == 1
+    src = out.sources[0]
+    assert src == real.to_source("pharma-a")
+    assert src.uri.startswith("https://www.sec.gov/Archives/edgar/data/78003/")
+    assert not any("example.com" in (s.uri or "") for s in out.sources)
+
+
+def test_query_table_another_tenants_fact_id_is_not_cited(seeded, store):
+    """pharma-b's real fact_id, selected as a literal by pharma-a: RLS hides it from
+    facts_by_id, so it is unverified and produces no Source."""
+    with store.session("pharma-b") as s:
+        moderna = s.facts(entity=MODERNA)[0]
+    out = tenant_search_registry(store, "pharma-a").execute(
+        "query_table",
+        {
+            "sql": f"SELECT '{moderna.fact_id}' AS fact_id, "
+            f"'{moderna.doc_source}' AS doc_source, '{moderna.doc_hash}' AS doc_hash, "
+            "1 AS value_num"
+        },
+    )
+    assert not out.is_error
+    assert out.content.splitlines()[1].endswith(UNVERIFIED)
+    assert "[#" not in out.content
+    assert out.sources == ()
