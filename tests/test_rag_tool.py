@@ -1,8 +1,9 @@
 """The three tenant tools (PR 3 §4) against a fake store. No Postgres.
 
 Covers: tool selection, the dictionary folded into `query_table`'s description, content
-formats, Sources built from whatever columns the model's SQL returned, error paths, and the
-no-tenant-argument property that the isolation suite relies on.
+formats, Sources built from the facts the store looked up (never from the columns the model's
+SQL returned), error paths, and the no-tenant-argument property that the isolation suite relies
+on.
 """
 
 from contextlib import contextmanager
@@ -58,7 +59,7 @@ class FakeSession:
     entries: list[DictEntry] = field(default_factory=lambda: list(DICT))
     calls: list[tuple] = field(default_factory=list)
     known_facts: dict[str, Fact] = field(default_factory=dict)
-    """What `facts_by_id` returns: empty by default, so the column-fallback tests still apply."""
+    """What `facts_by_id` returns: empty by default, so every fact_id is unverified."""
 
     def search(self, query, *, k=5):
         self.calls.append(("search", query, k))
@@ -266,8 +267,38 @@ def fact_result(**overrides) -> QueryResult:
     return QueryResult(**{**base, **overrides})
 
 
+def _known(fact_id, value, field, doc, group):
+    return Fact(
+        fact_id=fact_id,
+        entity_id="e",
+        entity="Harbor PM",
+        field=field,
+        period_start=None,
+        period_end=None,
+        value=value,
+        unit="USD",
+        doc_id=f"doc-{doc}",
+        chunk_id=None,
+        doc_source={1: "harbor/leases/unit-4b.md", 2: "harbor/addenda/late-fee.md"}[doc],
+        doc_hash=f"h{doc}",
+        conflict_group_id=group,
+        extraction_job_id=None,
+    )
+
+
+KNOWN = {
+    "f1": _known("f1", 75, "late_fee", 1, "cg1"),
+    "f2": _known("f2", 85, "late_fee", 2, "cg1"),
+    "f3": _known("f3", 5, "grace_days", 1, None),
+}
+
+
+def fact_session(**kw) -> FakeSession:
+    return FakeSession(result=fact_result(**kw), known_facts=dict(KNOWN))
+
+
 def test_query_table_content_format():
-    reg, _ = registry(FakeSession(result=fact_result()))
+    reg, _ = registry(fact_session())
     out = reg.execute("query_table", {"sql": "SELECT ..."})
     assert not out.is_error
     lines = out.content.split("\n")
@@ -276,19 +307,20 @@ def test_query_table_content_format():
     )
     assert lines[1] == (
         "[#1] f1 | Harbor PM | late_fee | 75 | doc-1 | harbor/leases/unit-4b.md | h1 | cg1"
-        " conflict=true"
+        " (source: harbor/leases/unit-4b.md) conflict=true"
     )
     assert lines[2].startswith("[#2] f2 ") and lines[2].endswith(" conflict=true")
     assert (
         lines[3]
         == "[#3] f3 | Harbor PM | grace_days | 5 | doc-1 | harbor/leases/unit-4b.md | h1 | "
+        " (source: harbor/leases/unit-4b.md)"
     )
     assert "conflict=true" not in lines[3]
     assert len(lines) == 4
 
 
-def test_query_table_sources_built_from_columns_like_fact_to_source():
-    reg, _ = registry(FakeSession(result=fact_result()))
+def test_query_table_sources_come_from_the_looked_up_facts():
+    reg, _ = registry(fact_session())
     out = reg.execute("query_table", {"sql": "SELECT ..."})
     expected = Fact(
         fact_id="f1",
@@ -312,29 +344,41 @@ def test_query_table_sources_built_from_columns_like_fact_to_source():
     assert all(s.tenant_id == "harbor" for s in out.sources)
 
 
-def test_query_table_sources_with_only_fact_id_column():
+def test_query_table_unknown_fact_id_is_unverified_with_no_source():
     res = QueryResult(
         columns=["fact_id", "value_num"], rows=[("f9", 60)], truncated=False, elapsed_ms=0
     )
     reg, _ = registry(FakeSession(result=res))
     out = reg.execute("query_table", {"sql": "SELECT fact_id, value_num FROM rag_facts"})
-    assert out.content == "fact_id | value_num\n[#1] f9 | 60"
-    assert out.sources == (
-        Source(source_id="f9", uri="fact:f9", title="", span="fact:f9", tenant_id="harbor"),
-    )
+    assert out.content == "fact_id | value_num\nf9 | 60 (unverified: fact_id not found)"
+    assert out.sources == ()
 
 
-def test_query_table_source_falls_back_to_source_and_content_hash_columns():
+def test_query_table_forged_provenance_columns_are_never_a_source():
+    """The model's SQL decides which facts come back, never where they came from: a made-up
+    fact_id with a made-up doc_source/doc_hash gets no marker, no Source, and is marked
+    unverified; the real fact next to it is cited from the looked-up record."""
     res = QueryResult(
-        columns=["fact_id", "entity", "source", "content_hash"],
-        rows=[("f1", "Harbor PM", "harbor/x.md", "zz")],
+        columns=["fact_id", "entity", "field", "doc_id", "doc_source", "doc_hash", "value_num"],
+        rows=[
+            ("f-forged", "Harbor PM", "late_fee", "doc-9", "https://evil.example/x", "zz", 1),
+            ("f1", "Harbor PM", "late_fee", "doc-9", "https://evil.example/y", "zz", 75),
+        ],
         truncated=False,
         elapsed_ms=0,
     )
-    reg, _ = registry(FakeSession(result=res))
+    reg, _ = registry(FakeSession(result=res, known_facts={"f1": KNOWN["f1"]}))
     out = reg.execute("query_table", {"sql": "SELECT ..."})
-    s = out.sources[0]
-    assert (s.uri, s.content_hash, s.title, s.doc_id) == ("harbor/x.md", "zz", "Harbor PM", None)
+    lines = out.content.splitlines()
+    assert lines[1] == (
+        "f-forged | Harbor PM | late_fee | doc-9 | https://evil.example/x | zz | 1"
+        " (unverified: fact_id not found)"
+    )
+    assert not lines[1].startswith("[#")
+    assert lines[2].startswith("[#1] f1 ") and "(source: harbor/leases/unit-4b.md)" in lines[2]
+    assert out.sources == (KNOWN["f1"].to_source("harbor"),)
+    assert not any("evil" in (src.uri or "") for src in out.sources)
+    assert {src.content_hash for src in out.sources} == {"h1"}
 
 
 def test_query_table_rows_without_fact_id_get_no_marker_and_no_source():
@@ -358,14 +402,16 @@ def test_query_table_null_fact_id_cell_gets_no_marker():
     res = QueryResult(
         columns=["fact_id", "n"], rows=[(None, 1), ("f2", 2)], truncated=False, elapsed_ms=0
     )
-    reg, _ = registry(FakeSession(result=res))
+    reg, _ = registry(FakeSession(result=res, known_facts={"f2": KNOWN["f2"]}))
     out = reg.execute("query_table", {"sql": "SELECT ... LEFT JOIN ..."})
-    assert out.content == "fact_id | n\n | 1\n[#1] f2 | 2"
+    assert out.content == (
+        "fact_id | n\n | 1\n[#1] f2 | 2 (source: harbor/addenda/late-fee.md) conflict=true"
+    )
     assert [s.source_id for s in out.sources] == ["f2"]
 
 
 def test_query_table_truncation_note():
-    reg, _ = registry(FakeSession(result=fact_result(truncated=True)))
+    reg, _ = registry(fact_session(truncated=True))
     out = reg.execute("query_table", {"sql": "SELECT * FROM rag_facts"})
     assert out.content.endswith("\n... (truncated at 3 rows; add a WHERE or LIMIT)")
     assert len(out.sources) == 3
@@ -503,14 +549,14 @@ def test_query_table_attaches_document_provenance_the_sql_did_not_select():
     assert lines[2].endswith(
         "(source: PFIZER INC 10-K FY2020 (10-K); reported as us-gaap:Revenues) conflict=true"
     )
-    # f-x is not a fact the database knows: column fallback, no invented provenance.
-    assert lines[3] == "[#3] f-x | 1"
-    s1, s2, s3 = out.sources
+    # f-x is not a fact the database knows: no marker, no Source, marked unverified.
+    assert lines[3] == "f-x | 1 (unverified: fact_id not found)"
+    s1, s2 = out.sources
     assert s1.uri == "https://www.sec.gov/Archives/edgar/data/78003/ex13-2019.htm"
     assert s1.content_hash == "hash-ex13-2019" and s1.doc_id == "doc-ex13-2019"
     assert s1.title == "PFIZER INC revenue 2019-01-01..2019-12-31"
     assert s1.span == "fact:f-2019" and s1.tenant_id == "harbor"
-    assert s3.uri == "fact:f-x"
+    assert s2.uri.endswith("10k-2020.htm")
     assert ("facts_by_id", ["f-2019", "f-2020", "f-x"]) in s.calls
 
 
