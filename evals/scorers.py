@@ -267,16 +267,36 @@ def conflict_reported(result: AgentResult, values: list[Any], _: JudgeContext) -
 
 
 _JUDGE_SYSTEM = (
-    "You are a strict grader. You will be given a task prompt, a model's answer, and a rubric. "
+    "You are a strict grader. You will be given a task prompt, the tool outputs the model was "
+    "shown (its evidence, with [n] citation numbers), the model's answer, and a rubric. A claim "
+    "the evidence supports is grounded, even if it sounds like general knowledge; a claim the "
+    "evidence does not support is an outside fact. "
     "Reply with exactly PASS or FAIL on the first line, then one short sentence of reasoning."
 )
+EVIDENCE_CHARS = 12_000
+"""Cap on tool output passed to the judge, so a long filing cannot blow up a grading call."""
+
+
+def evidence(result: AgentResult, limit: int = EVIDENCE_CHARS) -> str:
+    """The tool outputs the model saw, in order, as one block for the judge. Truncated to
+    `limit` characters with a marker, so the judge knows it is not seeing everything."""
+    parts = [
+        f"[{tr.get('name', 'tool')}]\n{tr.get('content', '')}"
+        for step in result.steps
+        for tr in step.tool_results
+    ]
+    text = "\n\n".join(parts) or "(no tools were called)"
+    if len(text) > limit:
+        text = text[:limit] + f"\n... [truncated, {len(text) - limit} more characters]"
+    return text
 
 
 def judge(result: AgentResult, rubric: str, ctx: JudgeContext) -> CheckOutcome:
     if ctx.provider is None:
         return CheckOutcome(True, "judge: skipped (no judge provider)")
     user = (
-        f"TASK PROMPT:\n{ctx.prompt}\n\nMODEL ANSWER:\n{result.output}\n\n"
+        f"TASK PROMPT:\n{ctx.prompt}\n\nEVIDENCE (tool outputs the model saw):\n"
+        f"{evidence(result)}\n\nMODEL ANSWER:\n{result.output}\n\n"
         f"RUBRIC:\n{rubric}\n\nDoes the answer satisfy the rubric?"
     )
     resp = ctx.provider.complete(
