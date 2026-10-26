@@ -919,6 +919,9 @@ def cmd_runs(args: argparse.Namespace) -> int:
         walk(target[1]["run_id"], depth)
         return 0
 
+    if args.runs_cmd == "drift":
+        return _cmd_runs_drift(args, runs, dir_)
+
     if args.runs_cmd == "show":
         target = _find_run(runs, args.run_id)
         if target is None:
@@ -939,6 +942,67 @@ def cmd_runs(args: argparse.Namespace) -> int:
                     console.print(line, markup=False, soft_wrap=True)
         return 0
     return 2
+
+
+_DRIFT_STYLE = {
+    "unchanged": "green",
+    "superseded": "yellow",
+    "gone": "red",
+    "value_changed": "red",
+    "new_conflict": "yellow",
+    "unchecked": "dim",
+}
+
+
+def _cmd_runs_drift(args: argparse.Namespace, runs: list, dir_: Path) -> int:
+    """`fde runs drift RUN_ID`: is the evidence the run saw still what the database holds?
+    Exit 0 no drift, 1 drift, 2 usage error. Logic in fde_kit.rag.drift."""
+    from rich.markup import escape
+
+    target = _find_run(runs, args.run_id)
+    if target is None:
+        console.print(f"[red]unknown run[/] {escape(args.run_id)} (looked in {dir_})")
+        return 2
+    try:
+        from . import rag
+        from .rag.drift import TenantError, check_drift, resolve_tenant
+        from .record import RunRecord
+    except ModuleNotFoundError as exc:
+        console.print(f"[red]{exc.name} not installed[/]: pip install 'fde-kit[rag]'")
+        return 2
+    rec = RunRecord.load(target[0])
+    try:
+        resolve_tenant(rec, args.tenant)
+    except TenantError as exc:
+        console.print(f"[red]refused[/]: {escape(str(exc))}", soft_wrap=True)
+        return 2
+    _, app = _rag_urls(args)
+    # Drift never embeds anything (no search runs), so the cheap embedder is always enough.
+    with rag.TenantStore(app, rag.HashEmbedder()) as store:
+        report = check_drift(rec, store, args.tenant)
+
+    if args.json:
+        sys.stdout.write(json.dumps(report.to_dict(), indent=2, default=str) + "\n")
+        return 1 if report.drifted else 0
+    table = Table(title=f"drift: {report.run_id} (tenant {report.tenant_id})", show_header=True)
+    table.add_column("#", justify="right")
+    table.add_column("source")
+    table.add_column("tool")
+    table.add_column("status")
+    table.add_column("detail")
+    for i in report.items:
+        style = _DRIFT_STYLE.get(i.status, "")
+        status = i.status + (f" (+{', '.join(i.flags)})" if i.flags else "")
+        table.add_row(
+            str(i.number),
+            escape(i.title or i.uri),
+            i.tool,
+            f"[{style}]{status}[/]",
+            escape(i.detail),
+        )
+    console.print(table)
+    console.print(report.summary(), markup=False)
+    return 1 if report.drifted else 0
 
 
 FULL_CHARS = 1200
@@ -1130,6 +1194,14 @@ def main(argv: list[str] | None = None) -> int:
     rsh.add_argument(
         "--full", action="store_true", help="also print tool inputs/outputs (SQL, results)"
     )
+    rdr = rusub.add_parser(
+        "drift", help="is the evidence a run saw still in the database? exit 1 on drift"
+    )
+    rdr.add_argument("run_id")
+    rdr.add_argument("--dir")
+    rdr.add_argument("--tenant", help="default: the run header's tenant_id (must match it)")
+    rdr.add_argument("--json", action="store_true", help="machine-readable results")
+    rdr.add_argument("--url", help="app database URL (default: $FDE_RAG_URL or from admin URL)")
     ru.set_defaults(fn=cmd_runs)
 
     args = p.parse_args(argv)
