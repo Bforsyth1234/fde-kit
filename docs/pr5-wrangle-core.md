@@ -267,8 +267,8 @@ The profile proposes; the spec decides. Apply never reads the profile.
 
 ### 7.3 Entity resolution — `wrangle/resolve.py`
 
-`norm_key(s)`: casefold, NFKC, drop the characters `- _ . # / ,` and spaces, strip leading zeros
-from each digit run. So `DET-07` → `det7`, `Plant 07` → `plant7`, `1007` → `1007`.
+`norm_key(s)`: casefold, NFKC, strip leading zeros from each digit run, then drop the characters
+`- _ . # / ,` and spaces (zeros first, so `10-07` and `100-7` stay distinct). So `DET-07` → `det7`, `Plant 07` → `plant7`, `1007` → `1007`.
 
 For each part with `resolve.crosswalk`:
 
@@ -393,7 +393,8 @@ The rejects file and the report are written either way, so a refused load always
 ## 9. CLI — `fde wrangle`
 
 New top-level group in `cli.py`. `profile`, `check`, `dry-run` and `approve` need only the
-`wrangle` extra; `apply` also needs `rag`.
+`wrangle` extra (which includes psycopg, because facts are built as `FactRow`s) and no database;
+`apply` also needs `rag` and Postgres.
 
 ```
 fde wrangle profile FILE [--sheet S] [--json]

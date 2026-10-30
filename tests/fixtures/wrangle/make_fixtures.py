@@ -504,7 +504,7 @@ def formulas_expected() -> tuple[list[dict], list[dict]]:
                     "cell": ref,
                     "level": "cell",
                     "stage": "measure",
-                    "reason": "formula has no cached value",
+                    "reason": "formula without cached value",
                 }
             )
             continue

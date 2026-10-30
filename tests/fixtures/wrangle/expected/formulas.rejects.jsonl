@@ -1,2 +1,2 @@
-{"file": "formulas.xlsx", "sheet": "Calc", "cell": "D4", "level": "cell", "stage": "measure", "reason": "formula has no cached value"}
+{"file": "formulas.xlsx", "sheet": "Calc", "cell": "D4", "level": "cell", "stage": "measure", "reason": "formula without cached value"}
 {"file": "formulas.xlsx", "sheet": "Calc", "cell": "D6", "level": "cell", "raw": "#DIV/0!", "stage": "measure", "reason": "error cell"}

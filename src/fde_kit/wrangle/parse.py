@@ -123,7 +123,16 @@ def _normalise_map(values: Mapping[str, str]) -> dict[str, str]:
 THOUSANDS = (",", ".", "'", " ", None)
 DECIMALS = (".", ",")
 CURRENCY_SYMBOLS = "$€£¥"
-_CURRENCY = rf"(?:[{re.escape(CURRENCY_SYMBOLS)}]|[A-Z]{{3}})"
+# Only real ISO 4217 codes count. Any three capital letters would read a plant code like
+# `DET-07` as the "currency" DET and the number -07.
+ISO_CURRENCY_CODES = frozenset(
+    """AED ARS AUD BGN BRL CAD CHF CLP CNY COP CZK DKK EGP EUR GBP HKD HUF IDR ILS INR ISK JPY
+    KES KRW KWD MAD MXN MYR NGN NOK NZD PEN PHP PKR PLN QAR RON RSD RUB SAR SEK SGD THB TRY TWD
+    UAH USD VND ZAR""".split()
+)
+_CURRENCY = (
+    rf"(?:[{re.escape(CURRENCY_SYMBOLS)}]|(?:{'|'.join(sorted(ISO_CURRENCY_CODES))})(?![A-Za-z]))"
+)
 _LEAD_CURRENCY = re.compile(rf"^([+\-−]?)\s*{_CURRENCY}\s*")
 _TRAIL_CURRENCY = re.compile(rf"\s*{_CURRENCY}$")
 # The characters each declared thousands separator stands for in real exports.

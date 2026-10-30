@@ -29,7 +29,7 @@ rag = [
     "psycopg[binary,pool]>=3.1",
     "fastembed>=0.4",
 ]
-wrangle = ["openpyxl>=3.1", "pyyaml>=6.0", "rapidfuzz>=3.6"]
+wrangle = ["openpyxl>=3.1", "pyyaml>=6.0", "rapidfuzz>=3.6", "psycopg[binary]>=3.1"]
 dev = [
     "temporalio>=1.8",
     "psycopg[binary,pool]>=3.1",

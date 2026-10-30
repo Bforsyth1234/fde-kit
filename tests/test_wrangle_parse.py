@@ -659,3 +659,15 @@ def test_parse_error_is_not_a_value_error():
 def test_constant_may_follow_a_typed_op():
     ops = [{"op": "number"}, {"op": "constant", "value": "x"}]
     assert run_ops("12", ops) == "x"
+
+
+@pytest.mark.parametrize("raw", ["DET-07", "ABC 12", "PLT-1007", "XYZ1,000"])
+def test_number_does_not_read_codes_as_currency(raw: str) -> None:
+    with pytest.raises(ParseError):
+        parse_number(raw)
+
+
+@pytest.mark.parametrize(("raw", "want"), [("EUR 1.234,50", "1234.50"), ("-USD 12", "-12")])
+def test_number_still_strips_iso_codes(raw: str, want: str) -> None:
+    thousands, decimal = (".", ",") if "," in raw and "." in raw else (",", ".")
+    assert parse_number(raw, thousands=thousands, decimal=decimal) == Decimal(want)
