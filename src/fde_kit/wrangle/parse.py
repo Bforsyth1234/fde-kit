@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import calendar
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from functools import partial
@@ -271,13 +271,47 @@ def to_fact_value(d: Decimal) -> int | Decimal:
 
 # ---------------------------------------------------------------------------------- date
 
+Formats = str | Sequence[str]
+"""One strptime format, or several tried in order: the first that parses wins."""
+
+
+def check_formats(op: str, fmt: object) -> tuple[str, ...]:
+    """`format` as given in a spec (a string or a non-empty list of strings) -> a tuple, or
+    ValueError. Order is kept: it is the order the formats are tried in."""
+    if isinstance(fmt, str):
+        return (fmt,)
+    if isinstance(fmt, Sequence) and not isinstance(fmt, (bytes, bytearray)):
+        items = list(fmt)
+        if not items:
+            raise ValueError(f"{op}: format list is empty")
+        for f in items:
+            if not isinstance(f, str):
+                raise ValueError(f"{op}: format must be a string or a list of strings, got {f!r}")
+        if len(set(items)) != len(items):
+            raise ValueError(f"{op}: format list repeats a format")
+        return tuple(items)
+    raise ValueError(f"{op}: format must be a string or a list of strings, got {fmt!r}")
+
+
+def strptime_first(s: str, formats: tuple[str, ...]) -> datetime | None:
+    """The first format that parses all of `s` (strptime always consumes the whole string), or
+    None. Formats are not checked against each other: the first that fits wins, so list the
+    stricter one first if two could both read a value."""
+    for f in formats:
+        try:
+            return datetime.strptime(s, f)
+        except ValueError:
+            continue
+    return None
+
 
 _EXCEL_EPOCH = date(1899, 12, 31)
 _EXCEL_MAX_SERIAL = 2958465  # 9999-12-31
 
 
-def parse_date(raw: str, *, format: str | None = None, excel_serial: bool = False) -> date:
-    """`format` (strptime) or `excel_serial` (1900 date system), exactly one.
+def parse_date(raw: str, *, format: Formats | None = None, excel_serial: bool = False) -> date:
+    """`format` (strptime, or a list tried in order) or `excel_serial` (1900 date system),
+    exactly one.
 
     Excel serials: 1 is 1900-01-01. Excel counts a 1900-02-29 that never existed (serial 60,
     a Lotus 1-2-3 bug it kept); 60 is a reject and serials above it are shifted back a day. A
@@ -300,17 +334,17 @@ def parse_date(raw: str, *, format: str | None = None, excel_serial: bool = Fals
             raise ParseError("date: excel serial is 1900-02-29, which doesn't exist")
         return _EXCEL_EPOCH + timedelta(days=days if days < 60 else days - 1)
     assert format is not None
-    try:
-        return datetime.strptime(s, format).date()
-    except ValueError as e:
-        raise ParseError("date: unparseable") from e
+    d = strptime_first(s, check_formats("date", format))
+    if d is None:
+        raise ParseError("date: unparseable")
+    return d.date()
 
 
-def _check_date_params(format: str | None, excel_serial: bool) -> None:
+def _check_date_params(format: Formats | None, excel_serial: bool) -> None:
     if (format is None) == (not excel_serial):
         raise ValueError("date: give exactly one of `format` or `excel_serial: true`")
-    if format is not None and not isinstance(format, str):
-        raise ValueError(f"date: format must be a string, got {format!r}")
+    if format is not None:
+        check_formats("date", format)
 
 
 # -------------------------------------------------------------------------------- period
@@ -388,15 +422,16 @@ def parse_period(
     raw: str,
     *,
     grain: str,
-    format: str | None = None,
+    format: Formats | None = None,
     pattern: str | None = None,
     fy_start_month: int = 1,
 ) -> Period:
     """(start, end), both inclusive.
 
-    - `format` (strptime): the date it gives is expanded to the `grain` period containing it.
-      `%b-%y` with grain month -> first..last day of that month. With `%Y` and grain year, the
-      year read is the fiscal year (Jan 1 of year Y is always in FY Y).
+    - `format` (strptime, or a list tried in order; the first that parses wins): the date it
+      gives is expanded to the `grain` period containing it. `%b-%y` with grain month ->
+      first..last day of that month. With `%Y` and grain year, the year read is the fiscal year
+      (Jan 1 of year Y is always in FY Y).
     - `pattern` with tokens `{q}`, `{yy}` (20yy), `{yyyy}`: fiscal quarter or fiscal year.
     """
     _check_period_params(grain, format, pattern, fy_start_month)
@@ -404,11 +439,10 @@ def parse_period(
     if not s:
         raise ParseError("period: empty")
     if format is not None:
-        try:
-            d = datetime.strptime(s, format).date()
-        except ValueError as e:
-            raise ParseError("period: unparseable") from e
-        return period_of(d, grain, fy_start_month)
+        parsed = strptime_first(s, check_formats("period", format))
+        if parsed is None:
+            raise ParseError("period: unparseable")
+        return period_of(parsed.date(), grain, fy_start_month)
     assert pattern is not None
     m = compile_period_pattern(pattern, grain).fullmatch(s)
     if m is None:
@@ -434,11 +468,13 @@ def _check_period_grain(grain: str, fy_start_month: int) -> None:
 
 
 def _check_period_params(
-    grain: str, format: str | None, pattern: str | None, fy_start_month: int
+    grain: str, format: Formats | None, pattern: str | None, fy_start_month: int
 ) -> None:
     _check_period_grain(grain, fy_start_month)
     if (format is None) == (pattern is None):
         raise ValueError("period: give exactly one of `format` or `pattern`")
+    if format is not None:
+        check_formats("period", format)
     if pattern is not None:
         compile_period_pattern(pattern, grain)
 
@@ -498,6 +534,11 @@ def _str_param(op: str, name: str, v: object, *, optional: bool = False) -> str 
     return v
 
 
+def _formats_param(op: str, v: object) -> tuple[str, ...] | None:
+    """`format`: absent, one strptime string, or a non-empty list of them (tried in order)."""
+    return None if v is None else check_formats(op, v)
+
+
 def _build(op: str, p: dict[str, Any]) -> Op:
     if op == "text":
         case = p["case"]
@@ -535,12 +576,12 @@ def _build(op: str, p: dict[str, Any]) -> Op:
             },
         )
     if op == "date":
-        fmt = _str_param(op, "format", p["format"], optional=True)
+        fmt = _formats_param(op, p["format"])
         excel = _bool_param(op, "excel_serial", p["excel_serial"])
         _check_date_params(fmt, excel)
         return partial(parse_date, format=fmt, excel_serial=excel)
     if op == "period":
-        fmt = _str_param(op, "format", p["format"], optional=True)
+        fmt = _formats_param(op, p["format"])
         pattern = _str_param(op, "pattern", p["pattern"], optional=True)
         grain = _str_param(op, "grain", p["grain"])
         assert grain is not None

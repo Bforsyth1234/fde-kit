@@ -1,0 +1,26 @@
+spec: county_pop
+version: 1
+dictionary: ../dictionary.yaml
+source:
+  encoding: latin-1
+  delimiter: ","
+  skip_rows:
+    - {column: SUMLEV, matches: "^040$"}   # state rows; counties are 050
+entity:
+  kind: county
+  parts:
+    - column: STNAME
+      resolve: {policy: open}
+    - column: CTYNAME
+      resolve: {policy: open}
+  template: "{0}/{1}"
+period:
+  unpivot:
+    columns: {from: POPESTIMATE2020, to: POPESTIMATE2025}
+    ops: [{op: regex, pattern: "POPESTIMATE(\\d{4})"}, {op: period, format: "%Y", grain: year}]
+measures:
+  - field: population
+    ops: [{op: number}]
+notes: |
+  The file is Latin-1 (`Doña Ana County` is byte 0xF1), not UTF-8. Connecticut's "counties"
+  in this vintage are its nine planning regions.

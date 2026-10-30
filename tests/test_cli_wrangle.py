@@ -306,3 +306,27 @@ def test_apply_loads_when_gates_pass(out, monkeypatch, project):
     row = _line_with(text, "abcdef01")
     assert [c.strip() for c in row.split("│")[1:7]] == ["8", "1", "1", "35", "3", "0"]
     assert "job kind wrangle-draft:planner_forecast@" in text
+
+
+def test_profile_csv_encoding_guessed_or_given(out, tmp_path):
+    p = tmp_path / "counties.csv"
+    p.write_bytes("STNAME,CTYNAME,POP\nNew Mexico,Doña Ana County,1\nX,Y,2\n".encode("latin-1"))
+    assert cli.main(["wrangle", "profile", str(p)]) == 0
+    text = out()
+    assert "encoding cp1252" in text
+    assert "warning" in text and "decoded as cp1252" in text
+
+
+def test_profile_csv_encoding_flag(capsys, tmp_path):
+    p = tmp_path / "counties.csv"
+    p.write_bytes("STNAME,CTYNAME,POP\nNew Mexico,Doña Ana County,1\nX,Y,2\n".encode("latin-1"))
+    assert cli.main(["wrangle", "profile", str(p), "--encoding", "latin-1", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["encoding"] == "latin-1" and data["warnings"] == []
+
+
+def test_profile_csv_wrong_encoding_flag(out, tmp_path):
+    p = tmp_path / "counties.csv"
+    p.write_bytes("A,B\nDoña,1\n".encode("latin-1"))
+    assert cli.main(["wrangle", "profile", str(p), "--encoding", "utf-8"]) == 1
+    assert "byte offset" in out() and "source.encoding" in out()

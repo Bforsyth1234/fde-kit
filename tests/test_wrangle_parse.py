@@ -681,3 +681,82 @@ def test_number_does_not_read_codes_as_currency(raw: str) -> None:
 def test_number_still_strips_iso_codes(raw: str, want: str) -> None:
     thousands, decimal = (".", ",") if "," in raw and "." in raw else (",", ".")
     assert parse_number(raw, thousands=thousands, decimal=decimal) == Decimal(want)
+
+
+# --- format lists (date and period) ---------------------------------------------------------
+
+MRTS_FORMATS = ["%b. %Y", "%b %Y"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "want"),
+    [
+        ("Jan. 2024", (date(2024, 1, 1), date(2024, 1, 31))),
+        ("May 2024", (date(2024, 5, 1), date(2024, 5, 31))),  # no dot: the second format
+        ("Sep. 2024", (date(2024, 9, 1), date(2024, 9, 30))),
+    ],
+)
+def test_period_format_list_first_that_parses_wins(raw, want):
+    assert parse_period(raw, format=MRTS_FORMATS, grain="month") == want
+    ops = [{"op": "period", "format": MRTS_FORMATS, "grain": "month"}]
+    assert run_ops(raw, ops) == want
+
+
+@pytest.mark.parametrize("raw", ["Jan 2024x", "Sept. 2024", "2024-01", ""])
+def test_period_format_list_rejects_what_no_format_reads(raw):
+    with pytest.raises(ParseError) as e:
+        parse_period(raw, format=MRTS_FORMATS, grain="month")
+    assert e.value.reason in ("period: unparseable", "period: empty")
+
+
+def test_period_format_list_order_decides_between_two_that_fit():
+    """Each format must consume the whole value, so a list only overlaps where two formats
+    genuinely read the same text two ways; then the first listed wins."""
+    assert parse_period("01/02/2024", format=["%d/%m/%Y", "%m/%d/%Y"], grain="day")[0] == date(
+        2024, 2, 1
+    )
+    assert parse_period("01/02/2024", format=["%m/%d/%Y", "%d/%m/%Y"], grain="day")[0] == date(
+        2024, 1, 2
+    )
+    assert parse_period("13/02/2024", format=["%m/%d/%Y", "%d/%m/%Y"], grain="day")[0] == date(
+        2024, 2, 13
+    )
+
+
+def test_date_format_list():
+    fmts = ["%Y-%m-%d", "%d.%m.%Y"]
+    assert parse_date("2026-03-15", format=fmts) == date(2026, 3, 15)
+    assert parse_date(" 15.03.2026 ", format=fmts) == date(2026, 3, 15)
+    with pytest.raises(ParseError, match="date: unparseable"):
+        parse_date("15/03/2026", format=fmts)
+    assert run_ops("15.03.2026", [{"op": "date", "format": fmts}]) == date(2026, 3, 15)
+
+
+def test_period_one_digit_month_reads_with_percent_m():
+    """`%m` accepts `1`..`12` without a leading zero, which a YEAR+MONTH join relies on."""
+    assert parse_period("2024-1", format="%Y-%m", grain="month") == (
+        date(2024, 1, 1),
+        date(2024, 1, 31),
+    )
+    assert parse_period("2024-12", format="%Y-%m", grain="month")[1] == date(2024, 12, 31)
+    for bad in ("2024-13", "2024-0", "2024-"):
+        with pytest.raises(ParseError):
+            parse_period(bad, format="%Y-%m", grain="month")
+
+
+@pytest.mark.parametrize(
+    "ops",
+    [
+        [{"op": "period", "format": [], "grain": "month"}],
+        [{"op": "period", "format": ["%Y", 4], "grain": "year"}],
+        [{"op": "period", "format": ["%Y", "%Y"], "grain": "year"}],
+        [{"op": "period", "format": {"a": "%Y"}, "grain": "year"}],
+        [{"op": "date", "format": []}],
+        [{"op": "date", "format": ["%Y"], "excel_serial": True}],
+    ],
+    ids=range(6),
+)
+def test_format_list_spec_errors(ops):
+    with pytest.raises(ValueError) as e:
+        compile_ops(ops)
+    assert not isinstance(e.value, ParseError)

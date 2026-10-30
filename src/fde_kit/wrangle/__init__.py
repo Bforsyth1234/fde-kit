@@ -8,7 +8,7 @@ See docs/pr5-wrangle-core.md.
 from .apply import ApplyResult, SpecMismatch, gate, parse_source_ref, run, write_outputs
 from .labels import header_fingerprint, header_labels
 from .parse import ParseError, run_ops
-from .profile import Profile, profile
+from .profile import Profile, profile, profile_file
 from .read import Cell, Grid, read_grid
 from .resolve import Resolver, check_crosswalk, norm_key
 from .spec import LoadedSpec, MappingSpec, SpecError, approve, is_approved, load_project_spec
@@ -34,6 +34,7 @@ __all__ = [
     "norm_key",
     "parse_source_ref",
     "profile",
+    "profile_file",
     "read_grid",
     "run",
     "run_ops",

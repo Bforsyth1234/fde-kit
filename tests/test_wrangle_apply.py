@@ -45,6 +45,8 @@ SOURCES = {
     "legacy_report": "legacy_report.csv",
     "formulas": "formulas.xlsx",
 }
+
+
 # §7.6 fixes the read-failure wording; the fixture's advisory reason predates it.
 def _spec(name: str) -> Path:
     return PROJECT / "specs" / f"{name}.yaml"
@@ -979,3 +981,190 @@ def test_native_rule_applies_after_leading_text_ops() -> None:
     fn = cell_pipeline([{"op": "text"}, {"op": "number", "thousands": ".", "decimal": ","}])
     assert fn(Cell(row=2, col=3, raw="1234.5", kind="number")) == Decimal("1234.5")
     assert fn(Cell(row=2, col=3, raw=" 1.234,5 ", kind="text")) == Decimal("1234.5")
+
+
+# --- nulls, sections, multi-column periods --------------------------------------------------
+
+_NULLS_SPEC = """spec: mini
+dictionary: ../dictionary.yaml
+source: {header_rows: [1]}
+entity:
+  kind: item
+  parts: [{column: Item, resolve: {policy: open}}]
+period:
+  unpivot:
+    columns: {from: "2026-01", to: "2026-02"}
+    ops: [{op: period, format: "%Y-%m", grain: month}]
+measures:
+  - {field: line_total_usd, ops: [{op: number}], nulls: ["--", "(S)"]}
+"""
+
+
+def test_nulls_are_empty_cells_counted_by_placeholder(tmp_path: Path) -> None:
+    csv_path = tmp_path / "n.csv"
+    csv_path.write_text(
+        'Item,2026-01,2026-02\nA,1,--\nB, (S) ,2\nC,(S),\nD,(D),3\n"(S)",4,5\n',
+        encoding="utf-8",
+    )
+    spec = _mini_project(tmp_path, _NULLS_SPEC)
+    result = run(spec, [csv_path])
+    got = sorted((f.row.entity, f.row.period_start.month, f.row.value) for f in result.facts)
+    # `(D)` isn't listed, so it's a reject, not a silent null; nulls don't apply to entities.
+    assert got == [("(S)", 1, 4), ("(S)", 2, 5), ("A", 1, 1), ("B", 2, 2), ("D", 2, 3)]
+    f = result.report["files"][0]
+    assert f["null_skipped"] == {"(S)": 2, "--": 1} and f["empty_skipped"] == 1
+    assert list(f["null_skipped"]) == ["(S)", "--"]  # sorted, so the report is stable
+    assert [(r["cell"], r["raw"], r["reason"]) for r in result.rejects] == [
+        ("B5", "(D)", "number: parentheses not allowed")
+    ]
+
+    # `empty: reject` rejects a placeholder as it would an empty cell, naming the placeholder.
+    _edit(spec, 'nulls: ["--", "(S)"]}', 'nulls: ["--", "(S)"], empty: reject}')
+    strict = run(spec, [csv_path])
+    nulls = [r for r in strict.rejects if r["op"] == "nulls"]
+    assert [(r["cell"], r["raw"], r["reason"], r["stage"]) for r in nulls] == [
+        ("C2", "--", "null placeholder", "measure"),
+        ("B3", " (S) ", "null placeholder", "measure"),
+        ("B4", "(S)", "null placeholder", "measure"),
+    ]
+    assert strict.report["files"][0]["null_skipped"] == {}
+
+    # Without `nulls` the same cells are number rejects: no placeholder is implied.
+    _edit(spec, ', nulls: ["--", "(S)"], empty: reject}', "}")
+    plain = run(spec, [csv_path])
+    assert plain.report["rejects"]["by_reason"] == {
+        "number: parentheses not allowed": 3,
+        "number: unparseable": 1,
+    }
+    assert plain.report["files"][0]["null_skipped"] == {}
+
+
+_TWO_TABLES = (
+    "Kind,2026-01\n"
+    "NOT ADJUSTED,\n"
+    "Total,100\n"
+    "Food,40\n"
+    "ADJUSTED(2),\n"
+    "Total,110\n"
+    "Food,44\n"
+    "(2) Adjusted for seasonal variation,\n"
+)
+_SECTION_SPEC = """spec: mini
+dictionary: ../dictionary.yaml
+source:
+  header_rows: [1]
+  {bounds}
+  skip_rows: [{{blank: ["2026-01"]}}]
+entity:
+  kind: kind
+  parts: [{{column: Kind, resolve: {{policy: open}}}}]
+period:
+  unpivot:
+    columns: {{from: "2026-01", to: "2026-01"}}
+    ops: [{{op: period, format: "%Y-%m", grain: month}}]
+measures:
+  - {{field: line_total_usd, ops: [{{op: number}}]}}
+"""
+
+
+def _section_run(tmp_path: Path, name: str, bounds: str) -> ApplyResult:
+    csv_path = tmp_path / "two.csv"
+    csv_path.write_text(_TWO_TABLES, encoding="utf-8")
+    spec = _mini_project(tmp_path / name, _SECTION_SPEC.format(bounds=bounds))
+    return run(spec, [csv_path])
+
+
+def _cells(result: ApplyResult) -> list[tuple[str, object, str]]:
+    return [(r.fact.row.entity, r.fact.row.value, r.cell) for f in result.files for r in f.facts]
+
+
+def test_start_after_and_stop_before_pick_one_table(tmp_path: Path) -> None:
+    both = _section_run(tmp_path, "nsa", 'stop_before: {column: Kind, matches: "^ADJUSTED"}')
+    assert _cells(both) == [
+        ("Total", 100, "two!B3"),
+        ("Food", 40, "two!B4"),
+    ]
+    f = both.report["files"][0]
+    assert f["section"] == {"stop_before_row": 5}
+    assert f["rows_read"] == 3 and f["rows_skipped"] == {"skip_rows[0]": 1}  # NOT ADJUSTED
+
+    sa = _section_run(tmp_path, "sa", 'start_after: {column: Kind, matches: "^ADJUSTED"}')
+    assert _cells(sa) == [
+        ("Total", 110, "two!B6"),
+        ("Food", 44, "two!B7"),
+    ]
+    assert sa.report["files"][0]["section"] == {"start_after_row": 5}
+    assert sa.report["conflicts_within_load"] == []
+
+    # Both bounds: the first stop_before *after* the start counts, not one above it.
+    nsa = _section_run(
+        tmp_path,
+        "nsa2",
+        'start_after: {column: Kind, matches: "^NOT ADJUSTED$"}\n'
+        '  stop_before: {column: Kind, matches: "^(ADJUSTED|Total)"}',
+    )
+    assert _cells(nsa) == []  # Total (row 3) stops it at once
+    assert nsa.report["files"][0]["section"] == {"start_after_row": 2, "stop_before_row": 3}
+
+    # Without bounds the two tables load into the same keys: a conflict, which is the problem.
+    neither = _section_run(tmp_path, "neither", "")
+    assert len(neither.report["conflicts_within_load"]) == 2
+    assert "section" not in neither.report["files"][0]
+
+
+def test_section_bound_that_matches_nothing_is_spec_mismatch(tmp_path: Path) -> None:
+    with pytest.raises(SpecMismatch, match="source.start_after: no row"):
+        _section_run(tmp_path, "a", 'start_after: {column: Kind, matches: "^SEASONAL"}')
+    with pytest.raises(SpecMismatch, match="source.stop_before: no row"):
+        _section_run(tmp_path, "b", 'stop_before: {column: Kind, matches: "^Kind$"}')  # header
+    with pytest.raises(SpecMismatch, match="source.start_after column 'Nope'"):
+        _section_run(tmp_path, "c", 'start_after: {column: Nope, matches: "x"}')
+
+
+def test_period_from_two_columns(tmp_path: Path) -> None:
+    csv_path = tmp_path / "gen.csv"
+    csv_path.write_text(
+        "YEAR,MONTH,STATE,MWH\n2024,1,CT,10\n2024, 12 ,CT,20\n2024,13,CT,30\n2024,,CT,40\n"
+        ",,CT,50\n",
+        encoding="utf-8",
+    )
+    spec = _mini_project(
+        tmp_path,
+        """spec: mini
+dictionary: ../dictionary.yaml
+source: {header_rows: [1]}
+entity:
+  kind: state
+  parts: [{column: STATE, resolve: {policy: open}}]
+period:
+  column:
+    name: [YEAR, MONTH]
+    ops: [{op: period, format: "%Y-%m", grain: month}]
+measures: [{field: line_total_usd, column: MWH, ops: [{op: number}]}]
+""",
+    )
+    result = run(spec, [csv_path])
+    recs = [r for f in result.files for r in f.facts]
+    assert [(r.fact.row.value, r.fact.row.period_start, r.fact.row.period_end) for r in recs] == [
+        (10, date(2024, 1, 1), date(2024, 1, 31)),
+        (20, date(2024, 12, 1), date(2024, 12, 31)),  # each value is whitespace-cleaned
+    ]
+    assert [(r.period_from, r.period_cells) for r in recs] == [
+        ("A2+B2", ("A2", "B2")),
+        ("A3+B3", ("A3", "B3")),
+    ]
+    # The joined value is what the ops saw, so a reject shows it.
+    assert [(r["row"], r["raw"], r["stage"], r["reason"]) for r in result.rejects] == [
+        (4, "2024-13", "period", "period: unparseable"),
+        (5, "2024-", "period", "period: unparseable"),
+        (6, "", "period", "period: empty"),
+    ]
+    paths = write_outputs(result, tmp_path / "out")
+    preview = _jsonl(paths["preview"])
+    assert preview[0]["period_from"] == "A2+B2" and preview[0]["period_cells"] == ["A2", "B2"]
+
+    # A single name keeps the old trail: one cell.
+    _edit(spec, "    name: [YEAR, MONTH]\n", "    name: YEAR\n")
+    _edit(spec, 'format: "%Y-%m", grain: month', 'format: "%Y", grain: year')
+    one = [r for f in run(spec, [csv_path]).files for r in f.facts]
+    assert one[0].period_from == "A2" and one[0].period_cells == ("A2",)

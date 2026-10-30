@@ -612,3 +612,184 @@ def test_currency_values_are_numbers_but_codes_are_not():
     assert _col(p, "amt").type == "number"
     assert _col(p, "amt").number_format.currency
     assert _col(p, "code").type == "text"
+
+
+# ------------------------------------------------------------------------- real files
+
+REAL = FIX / "real"
+
+
+@pytest.mark.parametrize(
+    ("name", "sheet", "header_rows"),
+    [
+        # Rows 1-2 are full-width merged titles; row 4 is years stored as numbers under the
+        # merged "Population Estimate (as of July 1)" label.
+        ("NST-EST2025-POP.xlsx", None, [3, 4]),
+        # Sectors merged over pairs of columns in row 3, months in row 4.
+        ("table_5_06_a.xlsx", None, [3, 4]),
+        # "NAICS Code" / "Kind of Business" in A4:B4, months in C5:O5; row 6 "NOT ADJUSTED" is a
+        # section label.
+        ("mrtssales92-present.xlsx", "2024", [4, 5]),
+        # Four title rows (one blank), then a long table whose data rows are half text.
+        ("generation_monthly.extract.xlsx", None, [5]),
+    ],
+)
+def test_real_file_header_rows(name, sheet, header_rows):
+    p = profile(read_grid(REAL / name, sheet))
+    assert p.header_rows == header_rows
+    assert p.header_found and p.warnings == []
+    assert p.data.start == header_rows[-1] + 1
+
+
+def test_real_nst_labels_and_unpivot():
+    p = profile(read_grid(REAL / "NST-EST2025-POP.xlsx"))
+    assert [t.row for t in p.title_rows] == [1, 2]
+    labels = [c.label for c in p.columns]
+    assert labels[:2] == ["Geographic Area", "April 1, 2020 Estimates Base"]
+    assert labels[2] == "Population Estimate (as of July 1) / 2020"
+    (u,) = p.unpivot_candidates
+    assert (u.columns, u.pattern, u.grain) == (list("CDEFGH"), "{yyyy}", "year")
+
+
+def test_real_mrts_split_header_labels():
+    p = profile(read_grid(REAL / "mrtssales92-present.xlsx", "2024"))
+    labels = [c.label for c in p.columns]
+    assert labels[:4] == ["NAICS Code", "Kind of Business", "Jan. 2024", "Feb. 2024"]
+    assert labels[-1] == "TOTAL"
+
+
+def test_real_generation_category_totals_are_not_sum_candidates():
+    """Its `Total` rows (in ENERGY SOURCE, not the first cell) come before the rows they total;
+    zeros and `x + 0` coincidences must not turn hundreds of rows into skip candidates."""
+    p = profile(read_grid(REAL / "generation_monthly.extract.xlsx"))
+    assert p.skip_candidates == []
+    assert [c.label for c in p.columns][-1] == "GENERATION (Megawatthours)"
+    assert _col(p, "GENERATION (Megawatthours)").type == "number"
+
+
+def test_year_row_without_merge_is_data():
+    rows: list[list[object]] = [["Area", "Base", "Est"], ["US", 2020, 2021], ["NE", 2022, 2023]]
+    assert profile(_grid(rows)).header_rows == [1]
+    merged = profile(_grid([["Area", "Base", "Est", ""], ["", "", 2020, 2021], ["US", 5, 6, 7]]))
+    assert merged.header_rows == [1]
+    with_merge = profile(
+        _grid(
+            [["Area", "Base", "Est", ""], ["", "", 2020, 2021], ["US", 5, 6, 7], ["NE", 1, 2, 3]],
+            merged=[(1, 3, 1, 4)],
+        )
+    )
+    assert with_merge.header_rows == [1, 2]
+    assert [c.label for c in with_merge.columns] == ["Area", "Base", "Est / 2020", "Est / 2021"]
+
+
+def test_full_width_merged_title_is_not_an_upper_header():
+    rows: list[list[object]] = [["Annual report", "", ""], ["Site", "Jan", "Feb"], ["A", 1, 2]]
+    p = profile(_grid(rows, merged=[(1, 1, 1, 3)]))
+    assert p.header_rows == [2]
+    assert [t.row for t in p.title_rows] == [1]
+
+
+def test_split_header_over_two_rows():
+    rows: list[list[object]] = [
+        ["Code", "Business", "", ""],
+        ["", "", "Jan", "Feb"],
+        ["", "NOT ADJUSTED", "", ""],
+        ["441", "Cars", 10, 11],
+        ["442", "Furniture", 3, 4],
+    ]
+    p = profile(_grid(rows))
+    assert p.header_rows == [1, 2]
+    assert [c.label for c in p.columns] == ["Code", "Business", "Jan", "Feb"]
+    # A one-cell row above a header with an empty first column is a title, not an upper row.
+    q = profile(_grid([["Report", "", ""], ["", "Jan", "Feb"], ["A", 1, 2], ["B", 3, 4]]))
+    assert q.header_rows == [2]
+
+
+def test_long_table_with_text_dimensions_finds_header():
+    rows: list[list[object]] = [["Monthly generation"], ["Source: survey"], [""]]
+    rows.append(["YEAR", "STATE", "PRODUCER", "SOURCE", "MWh"])
+    for st in ("CT", "RI"):
+        for src in ("Total", "Coal", "Gas"):
+            rows.append([2024, st, "Total Electric Power Industry", src, 100])
+    p = profile(_grid(rows))
+    assert p.header_rows == [4]
+
+
+# ----------------------------------------------------------------------------- encoding
+
+
+def test_profile_file_falls_back_to_cp1252_with_warning():
+    from fde_kit.wrangle.profile import profile_file
+
+    p = profile_file(REAL / "co-est2025-alldata.slice.csv")
+    assert p.encoding == "cp1252"
+    assert p.warnings and "decoded as cp1252" in p.warnings[0]
+    assert "source.encoding: cp1252" in p.warnings[0]
+    body = p.model_dump_json(exclude={"profile_sha256"})
+    assert p.profile_sha256 == hashlib.sha256(body.encode()).hexdigest()
+
+    given = profile_file(REAL / "co-est2025-alldata.slice.csv", encoding="latin-1")
+    assert given.encoding == "latin-1" and given.warnings == []
+
+
+def test_profile_file_utf8_and_xlsx_encodings(tmp_path):
+    from fde_kit.wrangle.profile import profile_file
+
+    p = tmp_path / "u.csv"
+    p.write_text("k,v\na,1\nb,2\n", encoding="utf-8")
+    prof = profile_file(p)
+    assert prof.encoding == "utf-8-sig" and prof.warnings == []
+    assert profile_file(FIX / "planner_forecast.xlsx", "Plan").encoding is None
+    with pytest.raises(ValueError, match="CSV files only"):
+        profile_file(FIX / "planner_forecast.xlsx", encoding="latin-1")
+
+
+# --------------------------------------------------------------------------------- perf
+
+
+def test_profile_is_linear_on_a_long_table():
+    """20k rows used to take minutes: the sum rule re-added every earlier row for each row."""
+    import time
+
+    rows: list[list[object]] = [["Generation by state"], [""]]
+    rows.append(["YEAR", "MONTH", "STATE", "SOURCE", "MWh", "Share"])
+    i = 0
+    while len(rows) < 20_000:
+        i += 1
+        month = i % 12 + 1
+        for src, mwh in (("Total", 300 + i), ("Coal", 0), ("Gas", 100 + i), ("Wind", 200)):
+            rows.append([2024, month, f"S{i % 50:02d}", src, mwh, round(mwh / (300 + i), 4)])
+    g = _grid(rows)
+    t = time.perf_counter()
+    p = profile(g)
+    elapsed = time.perf_counter() - t
+    assert p.header_rows == [3]
+    assert p.data.rows == len(rows) - 3
+    assert len(p.skip_candidates) < 10
+    assert elapsed < 6, f"profile of {len(rows)} rows took {elapsed:.1f}s"
+
+
+@pytest.mark.parametrize(
+    "raw", ["0", "-0", "007", "-1234567", "99999999999999999999", "1.5", "-0.0", "00.50", "-12.250"]
+)
+def test_plain_number_fast_path_matches_parser(raw):
+    import importlib
+
+    from fde_kit.wrangle.parse import ParseError, parse_number
+
+    prof_mod = importlib.import_module("fde_kit.wrangle.profile")
+    for th, dec in prof_mod.NUMBER_STYLES:
+        try:
+            want = parse_number(
+                raw,
+                thousands=th,
+                decimal=dec,
+                parens_negative=True,
+                trailing_minus=True,
+                currency=True,
+                percent=True,
+            )
+        except ParseError:
+            want = None
+        got = prof_mod._parse_style(raw, (th, dec))
+        assert (str(got), got) == (str(want), want), (raw, th, dec)

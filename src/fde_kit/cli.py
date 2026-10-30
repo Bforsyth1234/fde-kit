@@ -781,15 +781,15 @@ def cmd_wrangle_profile(args: argparse.Namespace) -> int:
     from rich.markup import escape
 
     try:
-        from .wrangle import profile, read_grid
+        from .wrangle import profile_file
     except ModuleNotFoundError as exc:
         console.print(WRANGLE_MISSING.format(name=exc.name))
         return 2
     if _wrangle_files([args.file]) is None:
         return 2
     try:
-        prof = profile(read_grid(args.file, args.sheet))
-    except ValueError as exc:  # unknown sheet, a sheet name given for a CSV, unreadable file
+        prof = profile_file(args.file, args.sheet, encoding=args.encoding)
+    except ValueError as exc:  # unknown sheet or encoding, a sheet name given for a CSV, ...
         console.print(f"[red]{escape(str(exc))}[/]")
         return 1
     if args.json:
@@ -803,6 +803,8 @@ def cmd_wrangle_profile(args: argparse.Namespace) -> int:
         f"data rows {prof.data.start}-{prof.data.end} ({prof.data.rows} non-empty)"
     )
     console.print(f"header_fingerprint {prof.header_fingerprint}")
+    if prof.encoding is not None:
+        console.print(f"encoding {prof.encoding}")
     for tr in prof.title_rows:
         text = "  ".join(f"{c.ref}={c.value}" for c in tr.cells)
         console.print(f"title row {tr.row}: {escape(text)}")
@@ -908,6 +910,9 @@ def cmd_wrangle_approve(args: argparse.Namespace) -> int:
     return 0
 
 
+WRANGLE_SHOWN_CONFLICTS = 20
+
+
 def _print_wrangle_result(result) -> None:
     from rich.markup import escape
 
@@ -929,6 +934,15 @@ def _print_wrangle_result(result) -> None:
             str(len(fr.facts)),
         )
     console.print(table)
+    for f in rep["files"]:
+        sec = f.get("section") or {}
+        if sec:
+            bounds = "  ".join(f"{k} {v}" for k, v in sec.items())
+            console.print(f"section {escape(f['sheet'])}: {bounds}")
+        nulls = f.get("null_skipped") or {}
+        if nulls:
+            shown = "  ".join(f"{escape(k)!r} {v}" for k, v in nulls.items())
+            console.print(f"placeholders skipped as empty: {shown}")
     rj = rep["rejects"]
     console.print(
         f"facts {rep['facts']}  rejects {rj['total']} (rate {rj['rate']:.4f})  "
@@ -945,8 +959,11 @@ def _print_wrangle_result(result) -> None:
         )
     conflicts = rep["conflicts_within_load"]
     console.print(f"conflicts within load: {len(conflicts)}")
-    for c in conflicts:
+    for c in conflicts[:WRANGLE_SHOWN_CONFLICTS]:
         console.print(f"  {escape(' / '.join(c['key']))}: {escape(', '.join(c['cells']))}")
+    if len(conflicts) > WRANGLE_SHOWN_CONFLICTS:
+        more = len(conflicts) - WRANGLE_SHOWN_CONFLICTS
+        console.print(f"  ... and {more} more (all of them are in report.json with --out)")
 
 
 def _print_gate(reasons: list[str], max_reject_rate: float, *, now: bool) -> None:
@@ -1073,6 +1090,10 @@ def _add_wrangle_parsers(sub) -> None:
     pr = wsub.add_parser("profile", help="what is in a sheet: header, types, totals, layout")
     pr.add_argument("file")
     pr.add_argument("--sheet", help="XLSX sheet (default: the first)")
+    pr.add_argument(
+        "--encoding",
+        help="CSV encoding (default: try utf-8-sig, then cp1252, then latin-1, and say which)",
+    )
     pr.add_argument("--json", action="store_true", help="print the profile model as JSON")
     pr.set_defaults(fn=cmd_wrangle_profile)
     ck = wsub.add_parser("check", help="validate a spec and its crosswalks; print the bundle hash")

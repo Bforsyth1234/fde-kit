@@ -13,6 +13,7 @@ the kit; this is what happened when it ran.
 - [Retrieval numbers](#retrieval-numbers)
 - [Durable runs: what a crash does at each point](#durable-runs-what-a-crash-does-at-each-point)
 - [Wrangling messy tables](#wrangling-messy-tables)
+- [Wrangling real government files](#wrangling-real-government-files)
 - [Costs and limits](#costs-and-limits)
 
 ## Live eval results
@@ -332,10 +333,57 @@ Limits, all deliberate for now:
   plant-month) aren't supported. Summing needs provenance to a *set* of cells.
 - **Composite entities, not dimensions.** Plant × part is the entity `Detroit Stamping 07/P-1234`.
   "All parts at Plant 7" is a `LIKE` on the canonical name, which works but is only a convention.
-- **`add_facts` is two statements per fact,** so it's fine at thousands of facts and unmeasured
-  beyond that.
+- **`add_facts` is two statements per fact:** measured at about 6 ms a fact on real data (next section).
 - **Every sheet is embedded as a document** (about 700 chunks for a 10k-row sheet).
 - **Crosswalks own their entities' aliases;** loading one replaces aliases another adapter set.
+
+## Wrangling real government files
+
+The fixtures above test the mess we planned. So we ran the loader on five public files we didn't
+design: Census state and county population, Census Monthly Retail Trade, and two EIA electricity
+tables (sources and checksums in `tests/fixtures/wrangle/real/README.md`).
+
+**What held up.** Every number that loaded was right. 19,330 facts from the first pass were
+checked against their cells using openpyxl and `csv` directly, not the wrangle reader: 0
+mismatches. Where the loader couldn't express a file, the reject gate refused instead of loading
+something wrong.
+
+**What broke, and what changed:**
+
+| Found on | Problem | Now |
+| --- | --- | --- |
+| EIA 5.6.A, Census retail | `--`, `NM`, `(S)` as values: 40% rejects on one table, gate refuses | `nulls:` per measure; counted per placeholder, never a default list (`NA` is Namibia) |
+| Census retail | NOT ADJUSTED and ADJUSTED tables on one sheet: 363 false conflicts | `source.start_after` / `stop_before`; a bound that matches nothing is a mismatch, not a guess |
+| Census retail | `May 2024` beside `Jan. 2024`: a whole month rejected | `format:` may be a list |
+| EIA generation | year and month in two columns: inexpressible | `period.column.name` may be a list, joined with `-` |
+| Census county CSV | Latin-1 bytes: raw `UnicodeDecodeError` | clear error naming the byte and `source.encoding`; `profile` guesses and says so, `apply` never guesses |
+| EIA generation (19 MB) | one 25k-row sheet: **76 s, 2.8 GB**, and it crashed an 8 GB sandbox | streaming reader of that sheet only: **1.0 s, 125 MB**, grid byte-identical on all 41 fixture sheets |
+| EIA generation | profile was quadratic: 0.08 s at 2k rows, 5.8 s at 4k, killed after 8 min at 25k | running sums: **1.8 s** at 25k rows |
+| 3 of 5 files | profile picked the wrong header rows (years stored as numbers; a full-width title taken as a header; labels split over two rows; four one-cell title rows) | right on all four XLSX files, with tests |
+
+After the fixes, seven specs over these files load into Postgres with 0 rejects and 0 conflicts
+(2,713 facts), and `tests/test_wrangle_real.py` re-checks every fact against an independent read of
+the file on every CI run.
+
+**Measured, not fixed: load speed.** `add_facts` checks for conflicts and inserts one fact at a time.
+The full county file (18,864 facts) took **109 s** into Postgres, about 6 ms a fact. That's fine
+for exports in the thousands, and slow at 100k. The next step is batching the conflict lookup per
+(entity, field).
+
+**What real files still can't say:**
+
+- **The same thing named two ways inside one file:** "Beer, wine, and liquor stores" in one table,
+  "Beer, wine and liquor stores" in the next. Open entities only merge by case; a crosswalk fixes it.
+- **No hierarchy.** Regions beside states, divisions beside states, NAICS parents beside children all
+  load as flat entities, so summing a column double-counts.
+- **No per-fact status.** `Aug. 2026(p)` (preliminary) and EIA's "not meaningful" vs "not
+  applicable" are stripped or skipped, not recorded on the fact.
+- **"As of July 1" can't be an instant.** A year label gives the year, and no op builds
+  `YYYY-07-01`.
+- **One sheet per spec.** Census retail has one sheet per year, 35 of them, so that's 35 specs, or
+  one spec per year generated from a template.
+- **The XLSX reader uses an openpyxl internal** (`openpyxl.worksheet._reader`), so the dependency is
+  pinned to `>=3.1,<3.2`.
 
 ## Costs and limits
 

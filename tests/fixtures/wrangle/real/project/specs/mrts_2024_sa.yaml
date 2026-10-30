@@ -1,0 +1,28 @@
+spec: mrts_2024_sa
+version: 1
+dictionary: ../dictionary.yaml
+source:
+  sheet: "2024"
+  header_rows: [4, 5]
+  start_after: {column: Kind of Business, matches: "^ADJUSTED"}       # "ADJUSTED(2)", row 71
+  skip_rows:
+    - {blank: ["Jan. 2024"]}                                           # footnotes below the table
+entity:
+  kind: kind_of_business
+  parts:
+    - column: Kind of Business
+      ops: [{op: regex, pattern: "^(.+?)(?:\\(\\d+\\))?$"}]
+      resolve: {policy: open}
+period:
+  unpivot:
+    columns: {from: "Jan. 2024", to: "Dec. 2024"}
+    ops: [{op: period, format: ["%b. %Y", "%b %Y"], grain: month}]
+measures:
+  - field: retail_sales_sa
+    ops: [{op: number}]
+    scale: 1000000
+    nulls: ["(S)", "(NA)"]
+notes: |
+  The ADJUSTED table (rows 72-109) of the 2024 sheet, in millions of dollars. Footnote (2):
+  adjusted for seasonal variation and holiday and trading-day differences, not for price
+  changes.

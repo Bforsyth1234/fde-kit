@@ -1,0 +1,23 @@
+spec: eia_residential
+version: 1
+dictionary: ../dictionary.yaml
+source:
+  sheet: Table_5_06_A
+  header_rows: [3, 4]
+  skip_rows:
+    - {blank: ["Residential / August 2026", "Residential / August 2025"]}   # the notes row 67
+entity:
+  kind: region
+  parts:
+    - column: Census Division and State
+      resolve: {policy: open}
+period:
+  unpivot:
+    columns: {from: "Residential / August 2026", to: "Residential / August 2025"}
+    ops: [{op: regex, pattern: ".* / (.+)"}, {op: period, format: "%B %Y", grain: month}]
+measures:
+  - field: residential_price
+    ops: [{op: number}]
+notes: |
+  Division rows (New England, ...) and U.S. Total load as regions beside the states.
+  August 2026 is preliminary, August 2025 final (table notes).

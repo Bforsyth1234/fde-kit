@@ -189,42 +189,91 @@ def _xlsx_cell(row: int, col: int, value: object, is_formula: bool) -> Cell:
 
 
 def _read_xlsx(p: Path, sheet: str | None, sha: str) -> Grid:
+    """Stream one sheet's XML once.
+
+    The workbook is opened `read_only=True, data_only=True`, which parses the shared strings and
+    styles but no sheet; then only the requested sheet is parsed, by openpyxl's own sheet parser,
+    so cell values are exactly what `load_workbook(data_only=True)` gives. The same pass notes the
+    cells that hold a formula but no cached value (`<f>` with no or an empty `<v>`) and the
+    sheet's `<mergeCells>`, which read-only worksheets don't expose. Memory is the grid itself,
+    not openpyxl's worksheet model, and nothing is read twice.
+    """
     try:
         import openpyxl
+        from openpyxl.utils.cell import range_boundaries
+        from openpyxl.worksheet._reader import FORMULA_TAG, WorkSheetParser
     except ImportError as e:  # pragma: no cover - depends on the install
         raise ImportError("reading XLSX needs openpyxl: pip install 'fde-kit[wrangle]'") from e
 
-    # Not read_only: merged_cells needs the full worksheet model.
-    values_wb = openpyxl.load_workbook(p, read_only=False, data_only=True)
-    names = values_wb.sheetnames
-    name = sheet if sheet is not None else names[0]
-    if name not in names:
-        raise ValueError(f"{p.name} has no sheet {name!r}; available sheets: {names}")
-    ws = values_wb[name]
+    class _Parser(WorkSheetParser):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.no_cached_value: set[tuple[int, int]] = set()
 
-    # The cached values can't tell "empty" from "formula never calculated"; the formulas can.
-    formulas_wb = openpyxl.load_workbook(p, read_only=False, data_only=False)
-    formula_cells = {
-        (c.row, c.column)
-        for r in formulas_wb[name].iter_rows()
-        for c in r
-        if c.data_type == "f" or (isinstance(c.value, str) and c.value.startswith("="))
-    }
-    formulas_wb.close()
+        def parse_cell(self, element):
+            cell = super().parse_cell(element)
+            if cell["value"] is None and element.find(FORMULA_TAG) is not None:
+                self.no_cached_value.add((cell["row"], cell["column"]))
+            return cell
 
-    rows: list[list[Cell]] = []
-    max_row, max_col = ws.max_row, ws.max_column
-    for r_idx, r in enumerate(
-        ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col), start=1
-    ):
-        rows.append(
-            [
-                _xlsx_cell(r_idx, c_idx, c.value, (r_idx, c_idx) in formula_cells)
-                for c_idx, c in enumerate(r, start=1)
-            ]
-        )
-    merged = sorted((m.min_row, m.min_col, m.max_row, m.max_col) for m in ws.merged_cells.ranges)
-    values_wb.close()
+    wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
+    try:
+        names = wb.sheetnames
+        name = sheet if sheet is not None else names[0]
+        if name not in names:
+            raise ValueError(f"{p.name} has no sheet {name!r}; available sheets: {names}")
+        ws = wb[name]
+        if not hasattr(ws, "_get_source"):  # a chartsheet
+            raise ValueError(f"{p.name}: sheet {name!r} is not a worksheet")
+        sparse: dict[tuple[int, int], Cell] = {}
+        with ws._get_source() as src:
+            parser = _Parser(
+                src,
+                ws._shared_strings,
+                data_only=True,
+                epoch=wb.epoch,
+                date_formats=wb._date_formats,
+                timedelta_formats=wb._timedelta_formats,
+            )
+            for _, row in parser.parse():
+                for c in row:
+                    r_idx, c_idx = c["row"], c["column"]
+                    sparse[(r_idx, c_idx)] = _xlsx_cell(
+                        r_idx, c_idx, c["value"], (r_idx, c_idx) in parser.no_cached_value
+                    )
+            merge_refs = parser.merged_cells.mergeCell if parser.merged_cells else []
+    finally:
+        wb.close()
+
+    merged = []
+    for mc in merge_refs:
+        min_col, min_row, max_col, max_row = range_boundaries(mc.ref)
+        merged.append((min_row, min_col, max_row, max_col))
+        # As openpyxl's full model does: only the top-left cell of a merged range keeps a value.
+        if (max_row - min_row + 1) * (max_col - min_col + 1) <= len(sparse):
+            for r_idx in range(min_row, max_row + 1):
+                for c_idx in range(min_col, max_col + 1):
+                    if (r_idx, c_idx) != (min_row, min_col):
+                        sparse.pop((r_idx, c_idx), None)
+        else:
+            for key in [k for k in sparse if min_row <= k[0] <= max_row]:
+                if min_col <= key[1] <= max_col and key != (min_row, min_col):
+                    del sparse[key]
+    merged.sort()
+
+    # Size from the non-empty cells only, so styled-but-empty cells far out don't widen the grid.
+    height = width = 0
+    for (r_idx, c_idx), cell in sparse.items():
+        if cell.kind != "empty":
+            height = max(height, r_idx)
+            width = max(width, c_idx)
+    rows = [
+        [
+            sparse.get((r_idx, c_idx)) or Cell(r_idx, c_idx, "", "empty")
+            for c_idx in range(1, width + 1)
+        ]
+        for r_idx in range(1, height + 1)
+    ]
     return Grid(path=str(p), sheet=name, file_sha256=sha, rows=_trim(rows), merged=merged)
 
 
@@ -237,7 +286,16 @@ def sniff_delimiter(sample: str) -> str:
 
 
 def _read_csv(p: Path, data: bytes, sha: str, encoding: str, delimiter: str | None) -> Grid:
-    text = data.decode(encoding)
+    try:
+        text = data.decode(encoding)
+    except UnicodeDecodeError as e:
+        bad = data[e.start : e.start + 1].hex()
+        raise ValueError(
+            f"{p}: not valid {encoding} at byte offset {e.start} (byte 0x{bad}); "
+            "set `source.encoding` in the spec to the file's encoding (e.g. latin-1 or cp1252)"
+        ) from e
+    except LookupError as e:
+        raise ValueError(f"{p}: unknown encoding {encoding!r}") from e
     if delimiter is None:
         delimiter = sniff_delimiter(text[:SNIFF_BYTES])
     rows: list[list[Cell]] = []

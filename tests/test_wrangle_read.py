@@ -259,3 +259,60 @@ def test_csv_sheet_must_match_stem(tmp_path):
     assert read_grid(p, "data").sheet == "data"
     with pytest.raises(ValueError, match="CSV"):
         read_grid(p, "Plan")
+
+
+def test_csv_wrong_encoding_is_a_clear_error(tmp_path):
+    p = tmp_path / "counties.csv"
+    p.write_bytes("STNAME,CTYNAME\nNew Mexico,Doña Ana County\n".encode("latin-1"))
+    offset = p.read_bytes().index(b"\xf1")
+    with pytest.raises(ValueError) as e:
+        read_grid(p)
+    msg = str(e.value)
+    assert str(p) in msg and f"byte offset {offset}" in msg and "0xf1" in msg
+    assert "source.encoding" in msg and "latin-1" in msg and "cp1252" in msg
+    assert isinstance(e.value.__cause__, UnicodeDecodeError)
+    assert read_grid(p, encoding="latin-1").cell(2, 2).raw == "Doña Ana County"
+
+
+def test_csv_unknown_encoding(tmp_path):
+    p = tmp_path / "x.csv"
+    p.write_text("a\n1\n")
+    with pytest.raises(ValueError, match="unknown encoding 'no-such-codec'"):
+        read_grid(p, encoding="no-such-codec")
+
+
+def test_xlsx_merged_hidden_values_dropped_and_far_empty_cells_ignored(tmp_path):
+    """Only a merged range's top-left value is kept (as openpyxl's full model does), and an
+    empty but styled cell far out doesn't widen or lengthen the grid."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "Title"
+    ws["B1"] = "hidden under the merge"
+    ws.merge_cells("A1:C1")
+    ws["A2"] = 1
+    ws["Z500"].number_format = "0.00"  # styled, no value
+    ws["AA2"] = "   "  # whitespace only: empty
+    path = tmp_path / "m.xlsx"
+    wb.save(path)
+    g = read_grid(path)
+    assert g.merged == [(1, 1, 1, 3)]
+    assert g.cell(1, 2) == Cell(1, 2, "", "empty")
+    assert len(g.rows) == 2 and {len(r) for r in g.rows} == {1}  # trimmed to the values
+
+
+def test_xlsx_reads_only_the_requested_sheet(tmp_path, monkeypatch):
+    """The full worksheet model is never built (it took 2.8 GB on a 19 MB workbook)."""
+    real = openpyxl.load_workbook
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(openpyxl, "load_workbook", spy)
+    wb = openpyxl.Workbook()
+    wb.active["A1"] = "x"
+    path = tmp_path / "s.xlsx"
+    wb.save(path)
+    read_grid(path)
+    assert calls == [{"read_only": True, "data_only": True}]

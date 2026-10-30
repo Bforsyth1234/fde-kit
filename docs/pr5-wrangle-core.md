@@ -142,6 +142,8 @@ source:
   skip_rows:
     - {column: Site, matches: "(?i)^(sub)?total"}
     - {blank: [Site]}
+  start_after: {column: Site, matches: "^FORECAST$"}   # optional; data begins after this row
+  stop_before: {column: Site, matches: "^ACTUALS"}     # optional; data ends before this row
 
 entity:
   kind: plant_part                    # single-column: kind of that column's entities
@@ -160,6 +162,7 @@ period:                               # exactly one of: column, cell, unpivot
     # or: matching: "^[A-Z][a-z]{2}-\\d{2}$"
     ops: [{op: regex, pattern: "Forecast / (.+)"}, {op: period, format: "%b-%y", grain: month}]
   # column: {name: Ship Date, ops: [{op: date, format: "%d/%m/%Y"}], grain: month}
+  # column: {name: [YEAR, MONTH], ops: [{op: period, format: "%Y-%m", grain: month}]}  # "2024-1"
   # cell:   {ref: B2, ops: [{op: regex, pattern: "Period: (.+)"}, {op: period, format: "%b %Y", grain: month}]}
 
 measures:
@@ -170,6 +173,7 @@ measures:
     precision: 1000                   # default: scale when scale > 1, else None (exact)
     unit: units                       # default: the dictionary's unit
     empty: skip                       # skip | reject; default skip
+    nulls: ["--", "(S)"]              # placeholders treated as empty; default none (§7.4)
 
 notes: |                              # free text; assumptions a reviewer should check
   Header says "(000s)". Site names match the plants crosswalk exactly.
@@ -182,7 +186,13 @@ approval:                             # written by `fde wrangle approve`, never 
 
 Validation beyond types: unpivot excludes `measure.column` (and vice versa); every dictionary
 field and crosswalk named exists; a regex compiles and has exactly one group when a later op
-needs its output; `template` placeholders match `parts`; there is at most one unpivot.
+needs its output; `template` placeholders match `parts`; there is at most one unpivot;
+`start_after`/`stop_before` regexes compile; `nulls` entries are non-blank, unpadded and
+distinct; a `period.column.name` list is non-empty with no column twice.
+
+**Bundle hash and later settings.** `start_after`, `stop_before` and `nulls` enter the bundle
+hash only when set (a non-empty `nulls`), so a spec that doesn't use them hashes exactly as it
+did before they existed and its approval stays valid. Setting one is an edit like any other.
 
 **Text values.** A measure whose last op is `text` or `map` produces a text fact (`value_text`).
 `precision` with a text measure is a validation error.
@@ -199,8 +209,8 @@ no expressions.
 | `regex` | `pattern` (one group) | str → str | `re.fullmatch` unless the pattern starts with `^` or ends with an unescaped `$` (then `re.search`); `([^,]+)` and `\$(\d+)` are fullmatched; no match is a reject |
 | `map` | `values: {from: to}`, `default` (absent = reject) | str → str | exact match after `text` defaults |
 | `number` | `thousands` (`,` `.` `'` ` ` or none), `decimal` (`.`/`,`), `parens_negative` (false), `trailing_minus` (false), `currency` (strip `$€£¥` and ISO codes, true), `percent` (false: `12%` → reject; true → 0.12) | str → Decimal | strict: after the declared stripping, the rest must be a valid number; `1,234.5` with `thousands: "."` is a reject |
-| `date` | `format` (strptime) **or** `excel_serial: true` | str → date | XLSX date cells arrive as ISO strings (§7.1); as a first op they skip `format` (native cells, §7.4) |
-| `period` | `format` **or** `pattern` like `Q{q} FY{yy}`; `grain` day/month/quarter/year/instant; `fy_start_month` (1) | str → (start, end) | month → first and last day; FY26 with `fy_start_month: 10` = 2025-10-01..2026-09-30; `instant` → start = end = the date |
+| `date` | `format` (strptime, or a list of them) **or** `excel_serial: true` | str → date | XLSX date cells arrive as ISO strings (§7.1); as a first op they skip `format` (native cells, §7.4) |
+| `period` | `format` (strptime, or a list of them) **or** `pattern` like `Q{q} FY{yy}`; `grain` day/month/quarter/year/instant; `fy_start_month` (1) | str → (start, end) | month → first and last day; FY26 with `fy_start_month: 10` = 2025-10-01..2026-09-30; `instant` → start = end = the date |
 | `constant` | `value` | any → str | for a fixed period or label |
 
 Numbers stay `Decimal` through `scale`, then become `int` if integral, else stay `Decimal`.
@@ -229,13 +239,18 @@ class Grid:
     merged: list[tuple[int, int, int, int]]
 ```
 
-- XLSX via `openpyxl.load_workbook(read_only=False, data_only=True)`. A formula cell whose cached
-  value is `None` is `formula_no_value`, and is a reject wherever a spec reads it, **never** a 0.
+- XLSX via `openpyxl.load_workbook(read_only=True, data_only=True)`, then one streaming pass of
+  openpyxl's sheet parser over the requested sheet only: cell values are what the full model
+  gives, and the same pass records formula cells with no cached value and the sheet's
+  `<mergeCells>` (a 25k-row sheet of a 19 MB workbook: 1 s and 125 MB, was 76 s and 2.8 GB).
+  A formula cell whose cached value is `None` is `formula_no_value`, and is a reject wherever a
+  spec reads it, **never** a 0.
   `#N/A`, `#REF!` and the like are `error`.
 - In a merged range only the top-left cell has a value. `read` does **not** fill the others;
   header joining (§7.2) does that for header rows only, where it's always meant.
 - CSV via the `csv` module; encoding `utf-8-sig` by default; delimiter sniffed from the first
-  64 KB unless set. Every CSV cell is `text` or `empty`.
+  64 KB unless set. Every CSV cell is `text` or `empty`. Bytes that don't decode are a
+  `ValueError` naming the file and byte offset and pointing at `source.encoding`.
 
 ### 7.2 Profile — `wrangle/profile.py`
 
@@ -243,15 +258,26 @@ class Grid:
 input, same bytes out.
 
 - **Header:** pick the first row `r` within the first 30 where ≥ 60% of non-empty cells are
-  text, and rows `r+1..r+5` are each ≥ 60% non-text in the columns that are non-empty. If row
-  `r-1` has merged ranges spanning those columns, it's an upper header and the result is
+  text, and rows `r+1..r+5` are each ≥ 60% non-text in the columns that are non-empty, or some
+  column is text in row `r` and numeric in every one of them (a long table with text
+  dimensions). Total-label rows and one-cell section labels are left out of that look-ahead,
+  and a one-cell row over a wider table is a title, never the header. If row `r+1` is
+  year-like numbers under a range merged across them in row `r`, the result is `[r, r+1]`. If
+  row `r-1` has merged ranges spanning those columns (but not all of them: that is a title),
+  or holds ≥ 2 text cells only in columns where row `r` is empty (a split header), it's an
+  upper header and the result is
   `header_rows = [r-1, r]`. Labels are joined `"Upper / Lower"` with merged values filled across.
-  Rows above are `title_rows` (kept verbatim; periods and units often live there).
+  Rows above are `title_rows` (kept verbatim; periods and units often live there). The full
+  rules are in the module docstring.
 - **Data region:** from the row after the header to the last row before 3 consecutive empty rows.
   Text below it is `notes_rows`.
 - **Skip candidates:** rows whose first non-empty cell matches `(?i)^(sub|grand )?total`, and rows
   where ≥ 2 numeric cells each equal the sum of the same column over the rows since the
-  previous candidate (±0.5 units).
+  previous candidate (±0.5 units). A column counts only with a non-zero cell and ≥ 2 non-zero
+  cells in the window; sums are running totals, so this is linear in the rows.
+- **Encoding:** `Profile.encoding` is the CSV encoding used (None for XLSX). `profile_file` /
+  `fde wrangle profile` without `--encoding` try utf-8-sig, cp1252, latin-1 and warn when they
+  fell back. The profile may guess; apply never does (it uses `source.encoding`).
 - **Per column:** `label`, inferred type, `null_rate`, `distinct`, `unique` (bool), `top` (10
   values with counts), `samples` (10 cell refs and values), and:
   - `number_format`: thousands, decimal, parens/trailing-minus seen, currency seen, % seen
@@ -304,16 +330,52 @@ For each file → `Grid` (the sheet named by the spec):
 
 1. Check `header_fingerprint` if set. Mismatch → `SpecMismatch` (whole file refused, not rejects).
 2. Build column labels from `header_rows`. A spec column name not found → `SpecMismatch`.
-3. For each data row from `data_starts`: apply `skip_rows` (counted, not rejected). Then the
-   entity parts → resolve; then the period. If either fails, **one row-level reject**, and none of
-   that row's measures load.
-4. For each measure cell (each unpivoted cell, or the measure column): an empty cell with
-   `empty: skip` is counted; otherwise run `ops`, then `scale` → `RawFact`. Failure →
-   **cell-level reject**.
+3. For each data row from `data_starts`, within the section (below): apply `skip_rows` (counted,
+   not rejected). Then the entity parts → resolve; then the period. If either fails, **one
+   row-level reject**, and none of that row's measures load.
+4. For each measure cell (each unpivoted cell, or the measure column): an empty cell, or one
+   holding a `nulls` placeholder, with `empty: skip` is counted; otherwise run `ops`, then
+   `scale` → `RawFact`. Failure → **cell-level reject**.
 5. **Within one document** (file + sheet), the same `(entity, field, period)` twice: equal
    values are `duplicates_dropped` (first kept). Different values both load, and `add_facts`
    puts them in a conflict group. The report names both cells. Across documents nothing is
    dropped: `add_facts` decides agreement and conflict at ingest, as between loads.
+
+**Sections (two tables on one sheet).** `source.start_after` and `source.stop_before` are each
+`{column, matches}`: the column is named by its joined label, and a row matches when that
+cell's raw text matches the regex (`re.search`), the same test as a `skip_rows` match rule.
+Scanning starts at `data_starts`. Rows up to and including the first `start_after` match are not
+data; the data then ends before the first `stop_before` match after it. Rows outside the section
+are not read (not in `rows_read`, not skipped, not rejected). A bound that matches no row is a
+`SpecMismatch`: loading on without it would read the wrong table, or both. The file's report
+entry gets `"section": {"start_after_row": n, "stop_before_row": m}` (only the bounds the spec
+sets; absent when it sets neither). One spec per table: `stop_before: ^ADJUSTED` loads the
+first, `start_after: ^ADJUSTED` the second.
+
+**Null placeholders.** A measure's `nulls` lists strings that mean "no value" in this source
+(EIA `--`; Census `(S)`, `(NA)`, `(D)`, `(X)`). A measure cell whose stripped `Cell.raw` equals
+one is treated as an empty cell: with `empty: skip` it is counted per placeholder under the
+file's `null_skipped` (`{"(S)": 84}`), and with `empty: reject` it is a cell-level reject with
+`op: "nulls"`, reason `"null placeholder"` and the cell's raw text. Error and
+formula-without-value cells are read failures first, never nulls. There is **no default list**
+and nulls are per measure, not per entity or period: what's a null in one source is data in
+another (`NA` is Namibia, `(D)` can be a real label, `--` a real code), and a placeholder the
+spec didn't name should stay a visible reject, not vanish.
+
+**Period from several columns.** `period.column.name` may be a list of labels. For each row,
+their cells' values (whitespace-cleaned: stripped, runs collapsed) are joined with `-` (no
+padding) into one text value, and the period ops run on that: `YEAR` 2024 and `MONTH` 1 give
+`2024-1`, which `{op: period, format: "%Y-%m", grain: month}` reads (strptime's `%m` accepts
+`1`..`12` without a leading zero). The joined value is text, so the native-cell rule doesn't
+apply to it. If every part is empty the value is empty; if one is, the join (`2024-`) fails
+to parse; an error or formula-without-value cell among them is a read failure. A period reject
+shows the joined value as `raw`. Every source cell is in the trail: `FactRecord.period_cells`
+(`("A6", "B6")`) and `period_from` `"A6+B6"`; the preview JSON carries both.
+
+**Format lists.** `date` and `period` accept `format` as one strptime string or a list tried in
+order; the first that parses wins (strptime must consume the whole value, so `%b. %Y` never
+half-reads `May 2024`). Use it when one source spells labels more than one way: MRTS writes
+`Jan. 2024` but `May 2024`, so `format: ["%b. %Y", "%b %Y"]`.
 
 **Native cells.** When a pipeline's (entity part, period, measure) **first** op is `number` and
 the cell's kind is `number`, the value is `Decimal(raw)` and only the remaining ops run, so a
@@ -354,7 +416,7 @@ distinct fields.
 {"spec": "planner_forecast", "bundle_sha256": "…", "approved": true,
  "files": [{"path": "…", "sheet": "Plan", "file_sha256": "…", "rows_read": 412,
             "rows_skipped": {"skip_rows[0]": 20, "skip_rows[1]": 3},
-            "empty_skipped": 37}],
+            "empty_skipped": 37, "null_skipped": {"--": 4}}],
  "facts": 4632, "duplicates_dropped": 0,
  "rejects": {"total": 14, "rate": 0.003,
              "by_reason": {"unknown entity": 12, "number: unparseable": 2}},
@@ -403,6 +465,12 @@ one `store.session(tenant)`, so the load is one transaction.
   `formula_no_value` cell. Reasons for read failures are `"error cell"` and `"formula without
   cached value"`; others are `ParseError.reason` or `unknown entity` / `ambiguous entity`.
 - **Duplicates.** "First kept" means the first row's cell is the fact's `source_ref`.
+- **Later additions (real-data gaps).** `nulls`, `start_after`/`stop_before`, a `format` list and
+  a `period.column.name` list (§7.4) came from loading real government files
+  (`tests/fixtures/wrangle/real/`). `op` in a reject may also be `"nulls"`. The report's file
+  entries always carry `null_skipped` (`{}` when nothing matched) and carry `section` only when
+  the spec sets a bound. The join separator for multi-column periods is `-`
+  (`spec.PERIOD_JOIN`).
 
 ## 8. Gates (FROZEN)
 
@@ -455,6 +523,14 @@ expected/<spec>.facts.jsonl              # every expected fact with its cell
 `formulas.xlsx` is the only committed binary. openpyxl can't write cached formula values, and
 that's the case worth testing. `make_fixtures.py` documents the `soffice --headless
 --convert-to xlsx` command that produced it, and the test asserts its sha256.
+
+`real/` holds US government files (see its README; `SHA256SUMS` pins them) and
+`real/project/` a dictionary and one spec per load: `state_pop`, `eia_residential`,
+`eia_transport`, `county_pop`, `mrts_2024_nsa`, `mrts_2024_sa`, `generation_ct_ri`.
+`tests/test_wrangle_real.py` runs each and checks **every** fact against an independent read of
+the file (openpyxl or `csv`, not the wrangle reader or ops), the report's counts (0 rejects,
+0 conflicts, `null_skipped`, and the 12 justified `duplicates_dropped` in MRTS NSA where NAICS
+4522 and 45221 are both "Department stores"), and hand-checked anchors.
 
 ## 11. Tests
 

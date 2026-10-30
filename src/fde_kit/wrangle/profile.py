@@ -17,13 +17,24 @@ Heuristics, including the choices §7.2 leaves open:
   are non-text. A date written as text (`30/04/2025`) is text for the header rule. Because
   `parse_number` strips a leading ISO currency code, a letter run is accepted only as one
   3-letter code set off by whitespace (`EUR 1.234`), so `DET-07` is text, not -7.
-- **Header.** The first row `r` in rows 1..30 where >= 60% of non-empty cells are text and each
-  non-empty row among `r+1..r+5` is >= 60% non-text (at least one such row must exist; empty
-  rows, and rows whose first cell is a total label, are ignored: `Total | | | 1540` is 50%
-  text and would otherwise hide a header above a short table). If row `r-1` holds a merged
-  range at least two columns wide that ends above `r` and covers a column with a label in row
-  `r`, the header is `[r-1, r]`. When no row passes, the first non-empty row is used and a
-  warning says so.
+- **Header.** The first row `r` in rows 1..30 where >= 60% of non-empty cells are text and the
+  non-empty rows among `r+1..r+5` look like data (at least one such row must exist). Left out
+  of that look-ahead: rows whose first cell is a total label (`Total | | | 1540` is 50% text and
+  would otherwise hide a header above a short table) and, under a header of >= 2 cells, rows
+  with one text cell (a section label such as `NOT ADJUSTED`). The rows look like data when
+  each is >= 60% non-text, or when some column has a text label in row `r` and a numeric cell
+  in every one of them (a long table's text dimensions make its data rows mostly text, but the
+  measure column still sets the header apart). A row with one non-empty cell over a wider
+  table is never the header: it is a title, merged or not. Then, first match wins:
+  - row `r+1` holds >= 2 cells, all year-like numbers (4 digits, 1800..2200), each under one
+    merged range of row `r` at least two columns wide -> `[r, r+1]` (`2020 .. 2025` under
+    `Population Estimate (as of July 1)`; without the merge such a row is data);
+  - row `r-1` holds a merged range at least two columns wide that ends above `r`, covers a
+    column with a label in row `r`, and does not span all of row `r`'s labelled columns (one
+    that does is a title, like `Annual Estimates ...` merged across A2:H2) -> `[r-1, r]`;
+  - row `r-1` holds >= 2 cells, all text, in columns where row `r` is empty (`NAICS Code |
+    Kind of Business` in A:B over months in C:O) -> `[r-1, r]`.
+  When no row passes, the first non-empty row is used and a warning says so.
 - **Labels** come from `labels.header_labels` (§7.6), shared with apply.
 - **Data region.** From the row after the header to the last non-empty row before 3 consecutive
   empty rows (or the end of the sheet). Every non-empty row after that is a notes row.
@@ -32,8 +43,15 @@ Heuristics, including the choices §7.2 leaves open:
   that column over a window of >= 2 earlier rows (reason `sum`). Two windows are tried: the
   rows since the previous candidate (a subtotal), and all non-candidate rows since the start of
   the region (a grand total that follows the last subtotal). A one-row window is not used: a row
-  that repeats the row before it is a duplicate, not a subtotal. Numeric columns here are the
-  ones whose cells are >= 95% numeric over the whole region.
+  that repeats the row before it is a duplicate, not a subtotal. For the same reason a column
+  counts only when its cell is non-zero and the window has >= 2 non-zero cells in it (`0 = 0 +
+  0` and `x = x + 0` prove nothing, and long tables are full of zeros). Sums are running
+  totals, so the rule is linear in the number of rows. Numeric columns here are the ones whose
+  cells are >= 95% numeric over the whole region.
+- **Encoding.** `profile(grid)` records the `encoding` it is given (None for XLSX).
+  `profile_file` reads the file itself; for a CSV with no encoding given it tries
+  `PROFILE_ENCODINGS` (utf-8-sig, cp1252, latin-1) and warns when it fell back. The profile may
+  guess; apply never does.
 - **Column stats** (`null_rate`, `distinct`, `unique`, `top`, `samples`, type, formats) are over
   the data region's non-empty rows minus skip candidates, so a `Subtotal` row doesn't spoil a
   key. Values are compared verbatim (a trailing space makes a different value: messes show).
@@ -82,11 +100,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from fde_kit.wrangle.labels import LABEL_JOIN, header_fingerprint, header_labels
 from fde_kit.wrangle.parse import ParseError, compile_period_pattern, parse_date, parse_number
-from fde_kit.wrangle.read import Cell, Grid, col_letter
+from fde_kit.wrangle.read import CSV_SUFFIXES, Cell, Grid, col_letter, read_grid
 
 HEADER_WINDOW = 30
 HEADER_TEXT_SHARE = 0.6
 HEADER_LOOKAHEAD = 5
+YEAR_MIN, YEAR_MAX = 1800, 2200
 EMPTY_ROWS_END = 3
 SHARE = 0.95
 SUM_TOLERANCE = Decimal("0.5")
@@ -94,6 +113,8 @@ TOP_N = 10
 SAMPLES_N = 10
 KEY_COLUMNS = 10
 UNPIVOT_MIN = 3
+# What `profile_file` tries on a CSV when no encoding is given; latin-1 decodes any bytes.
+PROFILE_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 
 # (thousands, decimal), in tie-break order.
 NUMBER_STYLES: list[tuple[str, str]] = [(",", "."), (".", ","), ("'", "."), (" ", ",")]
@@ -151,6 +172,8 @@ _SCALE_RULES: list[tuple[re.Pattern[str], int]] = [
     ),
 ]
 _BARE_DIGITS = re.compile(r"\d+")
+_PLAIN_INT = re.compile(r"-?[0-9]+")
+_PLAIN_DEC = re.compile(r"-?[0-9]+\.[0-9]+")
 _LETTERS = re.compile(r"[^\W\d_]+")
 
 ColumnType = Literal["empty", "text", "number", "date", "bool", "mixed"]
@@ -255,6 +278,8 @@ class Profile(_Model):
     """The file's base name (no directories, so the profile is the same wherever it's read)."""
     sheet: str
     file_sha256: str
+    encoding: str | None
+    """The encoding a CSV was decoded with (given, or guessed by `profile_file`); None for XLSX."""
     n_rows: int
     n_cols: int
     header_rows: list[int]
@@ -281,6 +306,13 @@ def _nonempty(row: list[Cell]) -> list[Cell]:
 
 
 def _parse_style(raw: str, style: tuple[str, str]) -> Decimal | None:
+    # Fast paths, checked against parse_number: every style reads a bare integer the same, and
+    # the "." decimal styles read a bare `-1.25` as Decimal("-1.25") (and -0.0 as 0.0).
+    if _PLAIN_INT.fullmatch(raw):
+        return Decimal(int(raw))
+    if style[1] == "." and _PLAIN_DEC.fullmatch(raw):
+        d = Decimal(raw)
+        return abs(d) if d == 0 else d
     if not _plausible_number(raw):
         return None
     try:
@@ -357,13 +389,19 @@ def _find_header(grid: Grid) -> tuple[list[int], bool]:
         cells = _nonempty(grid.rows[r - 1])
         if not cells or _text_share(cells) < HEADER_TEXT_SHARE:
             continue
-        below = [
-            _nonempty(grid.rows[i - 1]) for i in range(r + 1, min(r + HEADER_LOOKAHEAD, n) + 1)
-        ]
-        below = [b for b in below if b and not TOTAL_LABEL.match(b[0].raw.strip())]
-        if not below or any(1 - _text_share(b) < HEADER_TEXT_SHARE for b in below):
+        below = _lookahead(grid, r, len(cells))
+        if not below:
             continue
-        if r > 1 and _upper_header(grid, r):
+        if len(cells) == 1 and max(len(b) for b in below) > 1:
+            continue  # one cell over a wider table: a title, however it is merged
+        if not (
+            all(1 - _text_share(b) >= HEADER_TEXT_SHARE for b in below)
+            or _contrasting_column(cells, below)
+        ):
+            continue
+        if _year_row_under(grid, r):
+            return [r, r + 1], True
+        if r > 1 and (_upper_header(grid, r) or _split_upper(grid, r)):
             return [r - 1, r], True
         return [r], True
     for r, row in enumerate(grid.rows, start=1):
@@ -372,13 +410,92 @@ def _find_header(grid: Grid) -> tuple[list[int], bool]:
     return [], False
 
 
+def _lookahead(grid: Grid, r: int, width: int) -> list[list[Cell]]:
+    """The non-empty rows among `r+1..r+5` that can tell a header from data: rows whose first
+    cell is a total label are left out (`Total | | | 1540` is 50% text and would otherwise hide
+    a header above a short table), and so are one-cell rows under a wider header (a section
+    label such as `NOT ADJUSTED`)."""
+    n = len(grid.rows)
+    out = []
+    for i in range(r + 1, min(r + HEADER_LOOKAHEAD, n) + 1):
+        b = _nonempty(grid.rows[i - 1])
+        if not b or TOTAL_LABEL.match(b[0].raw.strip()):
+            continue
+        if len(b) == 1 and width > 1 and _is_text(b[0]):
+            continue
+        out.append(b)
+    return out
+
+
+def _contrasting_column(header: list[Cell], below: list[list[Cell]]) -> bool:
+    """Some column is labelled with text in the header row and numeric in every row below it.
+    A long table has text dimensions (`STATE`, `ENERGY SOURCE`) in most of its columns, so its
+    data rows are often mostly text; the measure column still sets the header apart."""
+    for h in header:
+        if not _is_text(h):
+            continue
+        cells = [next((c for c in b if c.col == h.col), None) for b in below]
+        if all(c is not None and _is_numeric(c) for c in cells):
+            return True
+    return False
+
+
+def _is_title_merge(grid: Grid, rng: tuple[int, int, int, int], r: int) -> bool:
+    """A merged range that spans every labelled column of header row `r` holds a title (`Annual
+    Estimates of ...` across A1:H1), not an upper header."""
+    _, min_col, _, max_col = rng
+    cols = [c.col for c in _nonempty(grid.rows[r - 1])]
+    return min_col <= min(cols) and max_col >= max(cols)
+
+
 def _upper_header(grid: Grid, r: int) -> bool:
     labelled = {c.col for c in _nonempty(grid.rows[r - 1])}
-    for min_row, min_col, max_row, max_col in grid.merged:
+    for rng in grid.merged:
+        min_row, min_col, max_row, max_col = rng
         if (
             min_row <= r - 1 <= max_row < r
             and max_col > min_col
             and any(min_col <= c <= max_col for c in labelled)
+            and not _is_title_merge(grid, rng, r)
+        ):
+            return True
+    return False
+
+
+def _split_upper(grid: Grid, r: int) -> bool:
+    """A header split over two rows that fill different columns: `NAICS Code | Kind of
+    Business` in A4:B4 and the months in C5:O5. Row `r-1` must have >= 2 cells, all text, and
+    share no column with row `r`."""
+    upper = _nonempty(grid.rows[r - 2])
+    if len(upper) < 2 or not all(_is_text(c) for c in upper):
+        return False
+    return not {c.col for c in upper} & {c.col for c in _nonempty(grid.rows[r - 1])}
+
+
+def _year_like(cell: Cell) -> bool:
+    raw = cell.raw.strip()
+    return (
+        cell.kind in ("number", "text")
+        and raw.isdigit()
+        and len(raw) == 4
+        and (YEAR_MIN <= int(raw) <= YEAR_MAX)
+    )
+
+
+def _year_row_under(grid: Grid, r: int) -> bool:
+    """Row `r+1` is a lower header of years stored as numbers (`2020 .. 2025`) under a label
+    merged across them in row `r` (`Population Estimate (as of July 1)` over C3:H3). Without the
+    merge, a row of year-like numbers is data."""
+    if r + 1 > len(grid.rows):
+        return False
+    years = _nonempty(grid.rows[r])
+    if len(years) < 2 or not all(_year_like(c) for c in years):
+        return False
+    for min_row, min_col, max_row, max_col in grid.merged:
+        if (
+            min_row <= r <= max_row < r + 1
+            and max_col > min_col
+            and all(min_col <= c.col <= max_col for c in years)
         ):
             return True
     return False
@@ -490,38 +607,57 @@ def _data_region(grid: Grid, start: int) -> tuple[int, list[int]]:
     return end, notes
 
 
+class _Sums:
+    """Running per-column sums over a window of rows: O(1) per row and column, so the sum rule
+    is linear in the sheet instead of re-adding the window for every row."""
+
+    def __init__(self, cols: list[int]) -> None:
+        self.rows = 0
+        self.total = dict.fromkeys(cols, Decimal(0))
+        self.nonzero = dict.fromkeys(cols, 0)
+
+    def add(self, values: dict[int, Decimal | None]) -> None:
+        self.rows += 1
+        for c, v in values.items():
+            if v is not None and v != 0:
+                self.total[c] += v
+                self.nonzero[c] += 1
+
+    def matches(self, values: dict[int, Decimal | None]) -> list[int]:
+        """Columns whose value equals the window's sum. A one-row window is never a sum (a row
+        that repeats the row before it is a duplicate), and a column needs >= 2 non-zero
+        addends and a non-zero value: zeros adding up to zero, or `x + 0 = x`, prove nothing,
+        and long tables are full of both."""
+        if self.rows < 2:
+            return []
+        return [
+            c
+            for c, v in values.items()
+            if v is not None
+            and v != 0
+            and self.nonzero[c] >= 2
+            and abs(self.total[c] - v) <= SUM_TOLERANCE
+        ]
+
+
 def _skip_candidates(
     grid: Grid, rows: list[int], numeric_cols: dict[int, tuple[str, str]], labels: list[str]
 ) -> list[SkipCandidate]:
     out: list[SkipCandidate] = []
-    window: list[int] = []
-    kept: list[int] = []
-
-    def value(r: int, c: int) -> Decimal | None:
-        return _cell_value(grid.cell(r, c), numeric_cols[c])
-
-    def sum_matches(r: int, span: list[int]) -> list[int]:
-        if len(span) < 2:
-            return []
-        hits = []
-        for c in numeric_cols:
-            v = value(r, c)
-            if v is None:
-                continue
-            vals = [x for x in (value(i, c) for i in span) if x is not None]
-            if vals and abs(sum(vals, Decimal(0)) - v) <= SUM_TOLERANCE:
-                hits.append(c)
-        return hits
+    cols = list(numeric_cols)
+    window = _Sums(cols)  # rows since the previous candidate: a subtotal
+    kept = _Sums(cols)  # every non-candidate row so far: a grand total after the last subtotal
 
     for r in rows:
         cells = _nonempty(grid.rows[r - 1])
         first = cells[0].raw.strip()
+        values = {c: _cell_value(grid.cell(r, c), numeric_cols[c]) for c in cols}
         reasons: list[Literal["label", "sum"]] = []
         if TOTAL_LABEL.match(first):
             reasons.append("label")
-        hits = sum_matches(r, window)
+        hits = window.matches(values)
         if len(hits) < 2:
-            hits = sum_matches(r, kept)
+            hits = kept.matches(values)
         if len(hits) >= 2:
             reasons.append("sum")
         else:
@@ -535,10 +671,10 @@ def _skip_candidates(
                     sum_columns=[labels[c - 1] or col_letter(c) for c in hits],
                 )
             )
-            window = []
+            window = _Sums(cols)
         else:
-            window.append(r)
-            kept.append(r)
+            window.add(values)
+            kept.add(values)
     return out
 
 
@@ -663,8 +799,64 @@ def _unpivot_candidates(labels: list[str]) -> list[UnpivotCandidate]:
 # ----------------------------------------------------------------------------- profile
 
 
-def profile(grid: Grid) -> Profile:
-    """Profile one sheet. Deterministic: the same grid gives byte-identical JSON."""
+def profile_file(
+    path: str | Path,
+    sheet: str | None = None,
+    *,
+    encoding: str | None = None,
+    delimiter: str | None = None,
+) -> Profile:
+    """Read and profile one sheet. For a CSV with no `encoding` given, try `PROFILE_ENCODINGS` in
+    order and record the one that decoded it, with a warning when it wasn't the first: the
+    profile may guess an encoding; apply never does (it uses the spec's `source.encoding`)."""
+    p = Path(path)
+    if p.suffix.lower() not in CSV_SUFFIXES:
+        if encoding is not None or delimiter is not None:
+            raise ValueError(f"{p.name}: encoding and delimiter apply to CSV files only")
+        return profile(read_grid(p, sheet))
+    if encoding is not None:
+        return profile(
+            read_grid(p, sheet, encoding=encoding, delimiter=delimiter), encoding=encoding
+        )
+    first_error: ValueError | None = None
+    for enc in PROFILE_ENCODINGS:
+        try:
+            grid = read_grid(p, sheet, encoding=enc, delimiter=delimiter)
+        except ValueError as e:
+            if not isinstance(e.__cause__, UnicodeDecodeError):
+                raise
+            first_error = first_error or e
+            continue
+        prof = profile(grid, encoding=enc)
+        if first_error is None:
+            return prof
+        cause = first_error.__cause__
+        assert isinstance(cause, UnicodeDecodeError)
+        return _sealed(
+            prof.model_copy(
+                update={
+                    "warnings": [
+                        f"not valid {PROFILE_ENCODINGS[0]} (byte offset {cause.start}); "
+                        f"decoded as {enc}, which is a guess: check the text, then set "
+                        f"`source.encoding: {enc}` in the spec (apply does not guess)",
+                        *prof.warnings,
+                    ]
+                }
+            )
+        )
+    raise first_error  # pragma: no cover - latin-1, the last one, decodes any bytes
+
+
+def _sealed(profile_: Profile) -> Profile:
+    digest = hashlib.sha256(
+        profile_.model_dump_json(exclude={"profile_sha256"}).encode("utf-8")
+    ).hexdigest()
+    return profile_.model_copy(update={"profile_sha256": digest})
+
+
+def profile(grid: Grid, *, encoding: str | None = None) -> Profile:
+    """Profile one sheet. Deterministic: the same grid gives byte-identical JSON. `encoding` is
+    recorded as is (the grid doesn't know how its CSV was decoded)."""
     width = len(grid.rows[0]) if grid.rows else 0
     warnings: list[str] = []
 
@@ -763,6 +955,7 @@ def profile(grid: Grid) -> Profile:
         file=Path(grid.path).name,
         sheet=grid.sheet,
         file_sha256=grid.file_sha256,
+        encoding=encoding,
         n_rows=len(grid.rows),
         n_cols=width,
         header_rows=header_rows,
@@ -778,10 +971,7 @@ def profile(grid: Grid) -> Profile:
         header_fingerprint=header_fingerprint(labels),
         warnings=warnings,
     )
-    digest = hashlib.sha256(
-        profile_.model_dump_json(exclude={"profile_sha256"}).encode("utf-8")
-    ).hexdigest()
-    return profile_.model_copy(update={"profile_sha256": digest})
+    return _sealed(profile_)
 
 
 def _keys(

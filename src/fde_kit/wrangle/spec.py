@@ -66,6 +66,7 @@ except ImportError:  # pragma: no cover - exercised only without the rag/dev ext
 
 __all__ = [
     "OP_NAMES",
+    "PERIOD_JOIN",
     "TEXT_OPS",
     "Approval",
     "Crosswalk",
@@ -80,6 +81,7 @@ __all__ = [
     "PeriodCell",
     "PeriodColumn",
     "Resolve",
+    "SectionBound",
     "SkipBlank",
     "SkipMatch",
     "Source",
@@ -174,6 +176,20 @@ SkipRule = Annotated[
 ]
 
 
+class SectionBound(_Model):
+    """A row that bounds the data: `column`'s raw text matches the regex (`re.search`), the same
+    test as a `skip_rows` match rule. Used by `start_after` and `stop_before`."""
+
+    column: str
+    matches: str
+
+    @field_validator("matches")
+    @classmethod
+    def _compiles(cls, v: str) -> str:
+        _compile(v, "matches")
+        return v
+
+
 class Source(_Model):
     sheet: str | None = None
     """XLSX: the sheet to read (required there). CSV: omit; the sheet is the file stem."""
@@ -189,6 +205,12 @@ class Source(_Model):
     delimiter: str | None = None
     """CSV only; None means sniffed."""
     skip_rows: list[SkipRule] = Field(default_factory=list)
+    start_after: SectionBound | None = None
+    """Data begins after the first row (from `first_data_row`) that matches; that row and the
+    ones above it are not data. Not found -> `SpecMismatch`."""
+    stop_before: SectionBound | None = None
+    """Data ends before the first row after the start that matches. Not found ->
+    `SpecMismatch`. Together they pick one table out of a sheet that stacks several."""
 
     @field_validator("header_rows")
     @classmethod
@@ -307,10 +329,30 @@ class Entity(_Model):
 Grain = Literal["day", "month", "quarter", "year", "instant"]
 
 
+PERIOD_JOIN = "-"
+"""Joins the cleaned values of a multi-column `period.column.name` before the ops run."""
+
+
 class PeriodColumn(_Model):
-    name: str
+    name: str | list[str]
+    """One column label, or several whose cleaned values are joined with `PERIOD_JOIN`
+    (`YEAR` 2024 and `MONTH` 1 -> `2024-1`) before the ops run."""
     ops: Ops
     grain: Grain | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _names(cls, v: str | list[str]) -> str | list[str]:
+        if isinstance(v, list):
+            if not v:
+                raise ValueError("period.column.name list is empty")
+            if len(set(v)) != len(v):
+                raise ValueError("period.column.name lists a column twice")
+        return v
+
+    @property
+    def names(self) -> list[str]:
+        return [self.name] if isinstance(self.name, str) else list(self.name)
 
 
 class PeriodCell(_Model):
@@ -371,6 +413,24 @@ class Measure(_Model):
     precision: int | float | None = Field(default=None, gt=0)
     unit: str | None = None
     empty: Literal["skip", "reject"] = "skip"
+    nulls: list[str] = Field(default_factory=list)
+    """Placeholders that mean "no value" in this source (`--`, `(S)`, `(NA)`): a cell whose
+    stripped raw text equals one is treated as empty (so `empty` decides skip or reject) and
+    counted per placeholder. No default list: what's a null in one source is data in another."""
+
+    @field_validator("nulls")
+    @classmethod
+    def _nulls(cls, v: list[str]) -> list[str]:
+        for token in v:
+            if not token.strip():
+                raise ValueError("nulls: a placeholder can't be blank (blank cells are empty)")
+            if token != token.strip():
+                raise ValueError(
+                    f"nulls: {token!r} has surrounding whitespace; cells are compared stripped"
+                )
+        if len(set(v)) != len(v):
+            raise ValueError("nulls: a placeholder is listed twice")
+        return v
 
     @property
     def is_text(self) -> bool:
@@ -460,8 +520,22 @@ class MappingSpec(_Model):
         return self
 
     def hash_payload(self) -> dict[str, Any]:
-        """The spec as it enters the bundle hash: JSON-mode, aliases, no approval."""
-        return self.model_dump(mode="json", by_alias=True, exclude={"approval"})
+        """The spec as it enters the bundle hash: JSON-mode, aliases, no approval.
+
+        Settings added after the first release (`source.start_after`, `source.stop_before`,
+        `measures[].nulls`) enter only when set, so a spec that doesn't use them hashes as it
+        did before they existed and its approval stays valid."""
+        out = self.model_dump(mode="json", by_alias=True, exclude={"approval"})
+        for key in _LATER_SOURCE_KEYS:
+            if out["source"].get(key) is None:
+                out["source"].pop(key, None)
+        for m in out["measures"]:
+            if not m.get("nulls"):
+                m.pop("nulls", None)
+        return out
+
+
+_LATER_SOURCE_KEYS = ("start_after", "stop_before")
 
 
 # --- loading --------------------------------------------------------------------------------

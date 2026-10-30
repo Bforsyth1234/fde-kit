@@ -449,3 +449,83 @@ def test_approve_refuses_invalid_spec(tmp_path):
 
     with pytest.raises(ValueError, match="non-empty"):
         approve(write_project(tmp_path / "ok"), by="  ")
+
+
+# --- nulls, sections, multi-column periods --------------------------------------------------
+
+
+def test_measure_nulls_validate(tmp_path):
+    ok = spec_with(measures__0__nulls=["--", "(S)"])
+    assert MappingSpec.model_validate(ok).measures[0].nulls == ["--", "(S)"]
+    for bad in (["  "], [" (S)"], ["--", "--"], "--", [3]):
+        with pytest.raises(ValidationError):
+            MappingSpec.model_validate(spec_with(measures__0__nulls=bad))
+    # Measures only: the entity and the period have no `nulls`.
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        MappingSpec.model_validate(spec_with(entity__parts__0__nulls=["--"]))
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        MappingSpec.model_validate(spec_with(period__unpivot__nulls=["--"]))
+
+
+def test_source_sections_validate():
+    bound = {"column": "Kind of Business", "matches": "^ADJUSTED"}
+    spec = MappingSpec.model_validate(
+        spec_with(source__start_after=bound, source__stop_before=bound)
+    )
+    assert spec.source.start_after.column == "Kind of Business"
+    assert spec.source.stop_before.matches == "^ADJUSTED"
+    for bad in (
+        {"column": "Site", "matches": "("},  # doesn't compile
+        {"column": "Site"},
+        {"column": "Site", "matches": "x", "blank": ["Site"]},  # extra=forbid
+    ):
+        with pytest.raises(ValidationError):
+            MappingSpec.model_validate(spec_with(source__start_after=bad))
+
+
+def test_period_column_name_list_validates():
+    def with_column(name):
+        return spec_with(
+            period={
+                "column": {
+                    "name": name,
+                    "ops": [{"op": "period", "format": "%Y-%m", "grain": "month"}],
+                }
+            },
+            measures__0__column="Qty",
+        )
+
+    spec = MappingSpec.model_validate(with_column(["YEAR", "MONTH"]))
+    assert spec.period.column.names == ["YEAR", "MONTH"]
+    assert MappingSpec.model_validate(with_column("Ship Date")).period.column.names == ["Ship Date"]
+    for bad in ([], ["YEAR", "YEAR"], ["YEAR", 3]):
+        with pytest.raises(ValidationError):
+            MappingSpec.model_validate(with_column(bad))
+
+
+def test_new_settings_enter_the_bundle_hash_only_when_set(tmp_path):
+    """A spec that doesn't use nulls / start_after / stop_before hashes as it did before they
+    existed (explicit defaults included), so existing approvals stay valid; setting one
+    changes the hash like any other edit."""
+    base_spec = MappingSpec.model_validate(SPEC)
+    payload = base_spec.hash_payload()
+    assert "start_after" not in payload["source"] and "stop_before" not in payload["source"]
+    assert all("nulls" not in m for m in payload["measures"])
+
+    base = load_project_spec(write_project(tmp_path / "a")).bundle_sha256
+    explicit = spec_with(measures__0__nulls=[])
+    assert load_project_spec(write_project(tmp_path / "b", explicit)).bundle_sha256 == base
+    bound = {"column": "Site", "matches": "^Total"}
+    for i, changed in enumerate(
+        (
+            spec_with(measures__0__nulls=["--"]),
+            spec_with(source__start_after=bound),
+            spec_with(source__stop_before=bound),
+        )
+    ):
+        h = load_project_spec(write_project(tmp_path / f"c{i}", changed)).bundle_sha256
+        assert h != base
+    # Two nulls lists differing only in order are different specs (order is kept as written).
+    one = load_project_spec(write_project(tmp_path / "d", spec_with(measures__0__nulls=["a", "b"])))
+    two = load_project_spec(write_project(tmp_path / "e", spec_with(measures__0__nulls=["b", "a"])))
+    assert one.bundle_sha256 != two.bundle_sha256

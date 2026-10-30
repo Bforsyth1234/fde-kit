@@ -8,11 +8,14 @@ For each file the spec's sheet is read into a `Grid`, then:
 1. `header_fingerprint`, if the spec sets one, must match (`force=True` skips only this check).
 2. Column labels are built from `header_rows` (`labels.header_labels`); a column the spec names
    that isn't there is a `SpecMismatch`, and the whole file is refused.
-3. Each data row: `skip_rows` (counted, not rejected), then the entity parts are resolved and
-   the period parsed. A failure there is one **row-level** reject and none of the row's measures
-   load. A row with every cell empty is passed over silently.
-4. Each measure cell: empty + `empty: skip` is counted; otherwise ops then `scale` -> a fact, or
-   a **cell-level** reject.
+3. The data rows run from `first_data_row`, narrowed by `start_after` / `stop_before` when the
+   spec sets them (a bound that matches no row is a `SpecMismatch`). Each data row: `skip_rows`
+   (counted, not rejected), then the entity parts are resolved and the period parsed. A failure
+   there is one **row-level** reject and none of the row's measures load. A row with every cell
+   empty is passed over silently.
+4. Each measure cell: empty, or a placeholder from the measure's `nulls` (counted per
+   placeholder in `null_skipped`), + `empty: skip` is skipped; otherwise ops then `scale` -> a
+   fact, or a **cell-level** reject.
 5. The same (entity, field, period) twice in one document (file + sheet): an equal value is
    dropped (the first cell is kept); a different value loads too, and the report names every
    cell involved. Across documents nothing is dropped: `add_facts` decides agreement and
@@ -60,7 +63,7 @@ from .labels import header_fingerprint, header_labels
 from .parse import ParseError, apply_text, compile_ops, period_of, to_fact_value
 from .read import XLSX_SUFFIXES, Cell, Grid, col_letter, parse_ref, read_grid
 from .resolve import STRATEGIES, FuzzyMatch, Resolver
-from .spec import LoadedSpec, Measure, SkipBlank, SpecError, load_project_spec
+from .spec import PERIOD_JOIN, LoadedSpec, Measure, SkipBlank, SpecError, load_project_spec
 
 __all__ = [
     "ApplyResult",
@@ -116,7 +119,11 @@ class FactRecord:
     """"Sheet!A1"."""
     entity_cells: tuple[str, ...]
     period_from: str
-    """The period's cell ("B7"), or for an unpivoted cell its column label."""
+    """The period's cell ("B7"), its cells joined with "+" when `period.column.name` lists
+    several ("A6+B6"), or for an unpivoted cell its column label."""
+    period_cells: tuple[str, ...] = ()
+    """Every cell the period was read from ("A6", "B6"); empty for an unpivoted cell, whose
+    period comes from its column label."""
 
 
 @dataclass
@@ -132,6 +139,10 @@ class FileResult:
     rows_read: int = 0
     rows_skipped: dict[str, int] = field(default_factory=dict)
     empty_skipped: int = 0
+    null_skipped: dict[str, int] = field(default_factory=dict)
+    """Measure cells skipped as a `nulls` placeholder, by placeholder."""
+    section: dict[str, int] | None = None
+    """With `start_after` / `stop_before`: the rows that matched them."""
 
 
 @dataclass
@@ -455,7 +466,10 @@ class _Run:
                 r, rx = rule
                 skip_cols.append((kind, (cols.find(r.column, "skip_rows column"), rx)))
         per = spec.period
-        period_col = cols.find(per.column.name, "period column") if per.column else None
+        period_cols = (
+            [cols.find(n, "period column") for n in per.column.names] if per.column else []
+        )
+        first_row, last_row = self._section(grid, cols, shown)
         unpivot_cols: list[int] = []
         if per.unpivot is not None:
             if per.unpivot.columns is not None:
@@ -492,6 +506,12 @@ class _Run:
             document=document,
             rows_skipped={f"skip_rows[{i}]": 0 for i in range(len(self.c.skips))},
         )
+        if src.start_after is not None or src.stop_before is not None:
+            fr.section = {}
+            if src.start_after is not None:
+                fr.section["start_after_row"] = first_row - 1
+            if src.stop_before is not None:
+                fr.section["stop_before_row"] = last_row + 1
         ref_suffix = f"@wrangle:{spec.spec}/{self.loaded.bundle_sha12}/{grid.file_sha256[:12]}"
 
         # Periods that don't depend on the row: a fixed cell, or each unpivoted column's label.
@@ -510,7 +530,7 @@ class _Run:
 
         entities: dict[str, RawEntity] = {}
         self.seen = {}
-        for r in range(src.first_data_row, len(grid.rows) + 1):
+        for r in range(first_row, last_row + 1):
             row = grid.rows[r - 1]
             if all(c.kind == "empty" for c in row):
                 continue
@@ -548,15 +568,16 @@ class _Run:
             # Period for the row (column or fixed cell); unpivot is per cell, below.
             row_period: tuple[date, date] | None = None
             err: ParseError | None = None
-            period_from = ""
-            if period_col is not None:
+            period_cells: tuple[str, ...] = ()
+            if period_cols:
                 assert self.c.period_column is not None
-                pcell = grid.cell(r, period_col)
+                pcell = self._period_cell(grid, r, period_cols)
                 row_period, err = self._period(pcell, self.c.period_column)
-                period_from = pcell.ref
+                period_cells = tuple(f"{col_letter(c)}{r}" for c in period_cols)
             elif fixed is not None:
                 pcell, row_period, err = fixed
-                period_from = pcell.ref
+                period_cells = (pcell.ref,)
+            period_from = "+".join(period_cells)
             if err is not None:
                 self._row_reject(fr, r, pcell, "period", err.op or "", err.reason)
                 continue
@@ -565,12 +586,18 @@ class _Run:
                 targets = [mcol] if mcol is not None else unpivot_cols
                 for col in targets:
                     cell = grid.cell(r, col)
-                    if cell.kind == "empty" and m.empty == "skip":
-                        fr.empty_skipped += 1
+                    null = self._null(cell, m)
+                    if (cell.kind == "empty" or null is not None) and m.empty == "skip":
+                        if null is None:
+                            fr.empty_skipped += 1
+                        else:
+                            fr.null_skipped[null] = fr.null_skipped.get(null, 0) + 1
                         continue
+                    pcells = period_cells
                     if row_period is not None:
                         period, pfrom = row_period, period_from
                     else:
+                        pcells = ()
                         lp = label_periods[col]
                         if isinstance(lp, ParseError):
                             self._cell_reject(
@@ -578,6 +605,11 @@ class _Run:
                             )
                             continue
                         period, pfrom = lp, labels[col - 1]
+                    if null is not None:  # empty: reject
+                        self._cell_reject(
+                            fr, cell, cell.raw, "measure", "nulls", "null placeholder"
+                        )
+                        continue
                     value = self._measure_value(fr, cell, m, fn)
                     if value is None:
                         continue
@@ -595,7 +627,9 @@ class _Run:
                         source_ref=cell_name + ref_suffix,
                     )
                     fr.facts.append(
-                        FactRecord(RawFact(source, row_), shown, cell_name, entity_cells, pfrom)
+                        FactRecord(
+                            RawFact(source, row_), shown, cell_name, entity_cells, pfrom, pcells
+                        )
                     )
                     if (
                         entity.casefold() not in self.crosswalk_canonicals
@@ -613,6 +647,64 @@ class _Run:
             if len(vs) > 1
         )
         return fr
+
+    def _section(self, grid: Grid, cols: _Columns, shown: str) -> tuple[int, int]:
+        """(first, last) data row, inclusive: `first_data_row` to the grid's end, narrowed by
+        `start_after` and `stop_before`. A bound that matches no row is a `SpecMismatch`, since
+        loading on regardless would read the wrong table (or both)."""
+        src = self.spec.source
+        first, last = src.first_data_row, len(grid.rows)
+        if src.start_after is not None:
+            hit = self._first_match(grid, cols, src.start_after, first, last, "start_after")
+            if hit is None:
+                raise SpecMismatch(
+                    shown,
+                    f"source.start_after: no row from {first} has {src.start_after.column!r} "
+                    f"matching {src.start_after.matches!r}",
+                )
+            first = hit + 1
+        if src.stop_before is not None:
+            hit = self._first_match(grid, cols, src.stop_before, first, last, "stop_before")
+            if hit is None:
+                raise SpecMismatch(
+                    shown,
+                    f"source.stop_before: no row from {first} has {src.stop_before.column!r} "
+                    f"matching {src.stop_before.matches!r}",
+                )
+            last = hit - 1
+        return first, last
+
+    @staticmethod
+    def _first_match(grid: Grid, cols: _Columns, bound, lo: int, hi: int, what: str) -> int | None:
+        col = cols.find(bound.column, f"source.{what} column")
+        rx = re.compile(bound.matches)
+        for r in range(lo, hi + 1):
+            if rx.search(grid.cell(r, col).raw) is not None:
+                return r
+        return None
+
+    @staticmethod
+    def _period_cell(grid: Grid, r: int, period_cols: list[int]) -> Cell:
+        """The period column's cell; with several columns, a text cell (at the first one) whose
+        raw is their whitespace-cleaned values joined with `PERIOD_JOIN`. An error or
+        formula-without-value cell among them is returned as is, so it rejects as a read."""
+        cells = [grid.cell(r, c) for c in period_cols]
+        if len(cells) == 1:
+            return cells[0]
+        for c in cells:
+            if c.kind in _READ_FAILURES:
+                return c
+        if all(c.kind == "empty" for c in cells):
+            return Cell(r, period_cols[0], "", "empty")
+        return Cell(r, period_cols[0], PERIOD_JOIN.join(apply_text(c.raw) for c in cells), "text")
+
+    @staticmethod
+    def _null(cell: Cell, m: Measure) -> str | None:
+        """The `nulls` placeholder this cell holds, or None."""
+        if not m.nulls or cell.kind in _READ_FAILURES or cell.kind == "empty":
+            return None
+        s = cell.raw.strip()
+        return s if s in m.nulls else None
 
     def _skipped(self, grid: Grid, r: int, skip_cols, fr: FileResult) -> bool:
         for i, (kind, how) in enumerate(skip_cols):
@@ -715,6 +807,8 @@ def run(
                 "rows_read": f.rows_read,
                 "rows_skipped": dict(f.rows_skipped),
                 "empty_skipped": f.empty_skipped,
+                "null_skipped": dict(sorted(f.null_skipped.items())),
+                **({"section": dict(f.section)} if f.section is not None else {}),
             }
             for f in results
         ],
@@ -802,6 +896,7 @@ def _fact_json(rec: FactRecord) -> dict[str, Any]:
         "document": rec.fact.document_source,
         "entity_cells": list(rec.entity_cells),
         "period_from": rec.period_from,
+        "period_cells": list(rec.period_cells),
     }
 
 
