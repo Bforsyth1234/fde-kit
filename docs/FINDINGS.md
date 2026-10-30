@@ -12,6 +12,7 @@ the kit; this is what happened when it ran.
 - [Two things I didn't expect](#two-things-i-didnt-expect)
 - [Retrieval numbers](#retrieval-numbers)
 - [Durable runs: what a crash does at each point](#durable-runs-what-a-crash-does-at-each-point)
+- [Wrangling messy tables](#wrangling-messy-tables)
 - [Costs and limits](#costs-and-limits)
 
 ## Live eval results
@@ -297,6 +298,44 @@ before the side effect and compensating on duplicate, not just caching results a
 **What's still open.** The journal covers crash-after-complete. A crash *during* a non-idempotent tool, before the
 journal write, still re-runs the tool on retry. Closing that needs the tool to record intent
 before acting and reconcile on retry, which is the sandbox project, not this one.
+
+## Wrangling messy tables
+
+PR 5 loads hand-written mapping specs over a small fixture world: 5 plants named three ways, three
+sources (an ERP CSV, a planner workbook with merged headers and subtotals, and a `;`-delimited
+legacy report with European decimals and parentheses negatives). The expected facts were written
+from the generator's ground truth, not by parsing the files back. All 190 facts load, each one
+re-reads to its cell, and the one planted disagreement is the only conflict group.
+
+Four bugs the fixtures and tests caught before anything shipped:
+
+- **A re-export would have doubled every total.** `ingest` re-adds all facts when a document gets a
+  new version, and the old version's facts stayed live. For a filing that's right: a restatement
+  should conflict. For next month's export of the same sheet, `query_table` would have summed both.
+  Hence `on_new_version="replace"`.
+- **Replacing facts left phantom conflicts.** Deleting the old version's facts left the facts they
+  had disagreed with still flagged, sometimes in a group of one. Deleting now re-checks those
+  groups and dissolves any whose remaining members agree.
+- **`10-07` and `100-7` normalised to the same plant.** Dropping separators before stripping leading
+  zeros merges digit runs. Zeros now go first. A false merge silently sums two plants' numbers,
+  which is worse than any reject.
+- **`DET-07` parsed as the number −7.** The number parser stripped "any three capital letters" as a
+  currency code. Only ISO 4217 codes count now.
+
+One fixture detail: openpyxl can't write cached formula values, and "formula without a cached
+value is a reject, never a 0" is the case worth testing. So `formulas.xlsx` is the one committed
+binary, converted by LibreOffice and then edited to drop one cached value; its sha256 is pinned.
+
+Limits, all deliberate for now:
+
+- **One cell, one fact.** Line-level extracts that need summing (40 invoice lines → one
+  plant-month) aren't supported. Summing needs provenance to a *set* of cells.
+- **Composite entities, not dimensions.** Plant × part is the entity `Detroit Stamping 07/P-1234`.
+  "All parts at Plant 7" is a `LIKE` on the canonical name, which works but is only a convention.
+- **`add_facts` is two statements per fact,** so it's fine at thousands of facts and unmeasured
+  beyond that.
+- **Every sheet is embedded as a document** (about 700 chunks for a 10k-row sheet).
+- **Crosswalks own their entities' aliases;** loading one replaces aliases another adapter set.
 
 ## Costs and limits
 

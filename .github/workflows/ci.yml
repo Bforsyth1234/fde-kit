@@ -59,6 +59,41 @@ jobs:
           FDE_RAG_ADMIN_URL: postgresql://fde:fde@localhost:5432/fde
           FDE_RAG_EMBEDDER: hash
           FDE_OTEL_ENABLED: "false"
+      - name: wrangle (approve a copy of the fixture project, apply each spec twice into wrangle-ci)
+        # The committed specs are unapproved, so approve a copy. The second apply of each spec
+        # must be a no-op (idempotent): `fde wrangle apply` exits 1 if any gate refuses.
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          cp -r tests/fixtures/wrangle/project "$work/project"
+          fde rag migrate
+          fde rag create-tenant wrangle-ci --name "Wrangle CI"
+          specs="erp_shipments:erp_shipments.csv planner_forecast:planner_forecast.xlsx legacy_report:legacy_report.csv"
+          for pair in $specs; do
+            fde wrangle approve "$work/project/specs/${pair%%:*}.yaml" --by ci
+          done
+          count_facts() {
+            psql "$FDE_RAG_ADMIN_URL" -tAc \
+              "SELECT count(*) FROM rag_facts WHERE tenant_id = 'wrangle-ci'"
+          }
+          for pass in 1 2; do
+            for pair in $specs; do
+              echo "::group::apply ${pair%%:*} (pass $pass)"
+              fde wrangle apply "$work/project/specs/${pair%%:*}.yaml" \
+                "tests/fixtures/wrangle/${pair#*:}" --tenant wrangle-ci --out "$work/out/${pair%%:*}"
+              echo "::endgroup::"
+            done
+            counts[$pass]="$(count_facts)"
+            echo "facts in wrangle-ci after pass $pass: ${counts[$pass]}"
+          done
+          # 59 ERP + 35 planner + 96 legacy (tests/fixtures/wrangle/README.md); the re-run adds none.
+          test "${counts[1]}" = 190
+          test "${counts[2]}" = "${counts[1]}"
+        env:
+          FDE_RAG_ADMIN_URL: postgresql://fde:fde@localhost:5432/fde
+          FDE_RAG_EMBEDDER: hash
+          FDE_OTEL_ENABLED: "false"
+          COLUMNS: "160"
 
   eval:
     # The real gate. Runs only when the repo has an API key secret, so forks and PRs from
