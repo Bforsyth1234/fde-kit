@@ -132,11 +132,11 @@ crosswalks:
   plants: {path: ../crosswalks/plants.csv, kind: plant}
 
 source:
-  sheet: Plan                         # XLSX: required; CSV: omit
+  sheet: Plan                         # XLSX: required (an XLSX file without it: SpecMismatch); CSV: omit
   header_rows: [4, 5]                 # 1-based; several are joined "Upper / Lower"
   data_starts: 6                      # default: the row after the last header row
   header_fingerprint: 9c1e2b7a55f0    # optional; apply fails on a mismatch unless --force
-  document_key: "planner-forecast#{sheet}"   # default "{path}#{sheet}"; see §7.2
+  document_key: "{spec}#{sheet}"     # default "{spec}/{file}#{sheet}"; see §7.4
   encoding: utf-8                     # CSV only; default utf-8-sig
   delimiter: ","                      # CSV only; default: sniffed
   skip_rows:
@@ -196,15 +196,18 @@ no expressions.
 | Op | Params | In → out | Semantics |
 | --- | --- | --- | --- |
 | `text` | `strip` (true), `case` (none/upper/lower), `collapse` (true) | str → str | whitespace and case only |
-| `regex` | `pattern` (one group) | str → str | `re.fullmatch` unless the pattern has `^`/`$`; no match is a reject |
+| `regex` | `pattern` (one group) | str → str | `re.fullmatch` unless the pattern starts with `^` or ends with an unescaped `$` (then `re.search`); `([^,]+)` and `\$(\d+)` are fullmatched; no match is a reject |
 | `map` | `values: {from: to}`, `default` (absent = reject) | str → str | exact match after `text` defaults |
 | `number` | `thousands` (`,` `.` `'` ` ` or none), `decimal` (`.`/`,`), `parens_negative` (false), `trailing_minus` (false), `currency` (strip `$€£¥` and ISO codes, true), `percent` (false: `12%` → reject; true → 0.12) | str → Decimal | strict: after the declared stripping, the rest must be a valid number; `1,234.5` with `thousands: "."` is a reject |
-| `date` | `format` (strptime) **or** `excel_serial: true` | str → date | XLSX date cells arrive as ISO strings (§7.1) and parse with `%Y-%m-%d` |
+| `date` | `format` (strptime) **or** `excel_serial: true` | str → date | XLSX date cells arrive as ISO strings (§7.1); as a first op they skip `format` (native cells, §7.4) |
 | `period` | `format` **or** `pattern` like `Q{q} FY{yy}`; `grain` day/month/quarter/year/instant; `fy_start_month` (1) | str → (start, end) | month → first and last day; FY26 with `fy_start_month: 10` = 2025-10-01..2026-09-30; `instant` → start = end = the date |
 | `constant` | `value` | any → str | for a fixed period or label |
 
-Numbers stay `Decimal` through `scale`, then become `int` if integral, else `float` (what
-`FactRow` accepts, and `values_agree` reads floats through `repr`). Rounding is never applied.
+Numbers stay `Decimal` through `scale`, then become `int` if integral, else stay `Decimal`.
+`FactRow.value` accepts a Decimal and `add_facts` binds it as is, so it is stored exactly (a
+float would go through Postgres's float8 → numeric cast, which keeps 15 significant digits and
+stores `1100.0000000000002` as 1100). Rounding is never applied. JSON outputs write a Decimal
+as a number when a float reads back as the same value, else as a string.
 
 ## 7. Read, profile, apply (FROZEN behaviour)
 
@@ -279,16 +282,23 @@ For each part with `resolve.crosswalk`:
    when best ≥ `threshold` (default 92) **and** best − second ≥ 5. The match is used and
    written to `crosswalk.proposed.csv` for review.
 4. otherwise `closed` → reject `unknown entity`; `open` → the cleaned value is its own
-   canonical, and it's listed in the report as new.
+   canonical, and it's listed in the report as new. The store resolves names
+   case-insensitively, so within one load an open value whose casefold equals an open value
+   seen earlier, or a crosswalk canonical, takes that first spelling and is counted as
+   `normalised` (`Widget-a`, then `WIDGET-A` → both `Widget-a`).
 
 Parts with no crosswalk are `open`. Composite canonical = `template` filled with the resolved
-canonical of each part. False merges cost more than misses, which is why fuzzy is off by
+canonical of each part; composites are compared casefolded the same way. False merges cost more than misses, which is why fuzzy is off by
 default and the margin rule exists.
 
 ### 7.4 Apply — `wrangle/apply.py`
 
 `run(spec_path, files) -> ApplyResult` is pure (no database). It is the dry run, and the adapter
 calls it too.
+
+Before any file is read, each file's `document_key` is rendered (§7.4, documents). Two files
+with the same rendered key in one load → `SpecMismatch`: one would supersede the other within
+the load.
 
 For each file → `Grid` (the sheet named by the spec):
 
@@ -300,9 +310,18 @@ For each file → `Grid` (the sheet named by the spec):
 4. For each measure cell (each unpivoted cell, or the measure column): an empty cell with
    `empty: skip` is counted; otherwise run `ops`, then `scale` → `RawFact`. Failure →
    **cell-level reject**.
-5. **Within one load**, the same `(entity, field, period)` twice: equal values are
-   `duplicates_dropped` (first kept). Different values both load, and `add_facts` puts them in a
-   conflict group. The report names both cells.
+5. **Within one document** (file + sheet), the same `(entity, field, period)` twice: equal
+   values are `duplicates_dropped` (first kept). Different values both load, and `add_facts`
+   puts them in a conflict group. The report names both cells. Across documents nothing is
+   dropped: `add_facts` decides agreement and conflict at ingest, as between loads.
+
+**Native cells.** When a pipeline's (entity part, period, measure) **first** op is `number` and
+the cell's kind is `number`, the value is `Decimal(raw)` and only the remaining ops run, so a
+`thousands: "."` spec reads a native 1234.5 as 1234.5. A first `date` op on a `date` cell takes
+the cell's date (`date.fromisoformat` of the date part); a first `period` op on a `date` cell
+expands it with `period_of(date, grain, fy_start_month)` from the op's params. Text cells, and
+so every CSV cell, go through the ops as before. `apply.cell_pipeline` is the one function, and
+the provenance read-back uses it too.
 
 **Provenance (FROZEN):**
 
@@ -315,14 +334,19 @@ when `query_table` lists facts. The entity and period cells for that fact are in
 the ref.
 
 **Document per sheet:** `RawDocument(source=document_key rendered, title="<file name> — <sheet>",
-text=…)`. The text is the sheet as CSV with a leading `row` column holding the Excel row
-number, title rows included. That way `fetch_document` shows a person row 42 as row 42.
+text=…)`. The text's first line is `# wrangle spec=<spec> bundle=<bundle_sha256>`; the rest is
+the sheet as CSV with a leading `row` column holding the Excel row number, title rows included.
+That way `fetch_document` shows a person row 42 as row 42, and a corrected (re-approved) spec
+over the same bytes is a new document version, so `replace` (§3) retires the wrong facts.
 `metadata` holds `file_sha256`, `spec`, `bundle_sha256` and `header_rows`. `document_key`
-controls versioning. With the default `{path}#{sheet}`, `Forecast_Nov.xlsx` is a different
-document from `Forecast_Oct.xlsx`. With a fixed key like `planner-forecast#Plan`, each new
-export supersedes the last, and (with `replace`, §3) retires its facts. Choose per source:
-snapshot data wants a fixed key; history you want to keep as separate vintages wants distinct
-keys and distinct fields.
+controls versioning. Its placeholders are `{spec}` (the spec name), `{file}` (the file's base
+name), `{path}` (the path as passed) and `{sheet}` (CSV: the file stem). With the default
+`{spec}/{file}#{sheet}`, `Forecast_Nov.xlsx` is a different document from `Forecast_Oct.xlsx`,
+two specs over one file never share a document, and the key doesn't depend on how the path was
+typed. With a fixed key like `{spec}#{sheet}` (`planner_forecast#Plan`), each new export
+supersedes the last, and (with `replace`, §3) retires its facts. Choose per source: snapshot
+data wants a fixed key; history you want to keep as separate vintages wants distinct keys and
+distinct fields.
 
 **Report (FROZEN JSON):**
 
@@ -335,7 +359,8 @@ keys and distinct fields.
  "rejects": {"total": 14, "rate": 0.003,
              "by_reason": {"unknown entity": 12, "number: unparseable": 2}},
  "entities": {"exact": 388, "normalised": 22, "fuzzy": 0, "new": 0},
- "conflicts_within_load": [{"key": ["DET-07/P-1234", "demand_forecast_units", "2026-03"],
+ "conflicts_within_load": [{"document": "planner_forecast#Plan",
+                            "key": ["DET-07/P-1234", "demand_forecast_units", "2026-03"],
                             "cells": ["Plan!G42", "Plan!G97"]}]}
 ```
 
@@ -386,7 +411,9 @@ Apply refuses, writing nothing, and exits 1 when:
 - the spec has no `approval`, or `approval.bundle_sha256` ≠ the current bundle hash, unless
   `--draft` (draft loads are tagged `wrangle-draft:` in the job kind)
 - reject rate > `--max-reject-rate` (default 0.02)
-- any file raises `SpecMismatch` (unless `--force` for the fingerprint check only)
+- any file raises `SpecMismatch` (unless `--force` for the fingerprint check only), including two
+  files whose `document_key` renders the same and an XLSX file under a spec with no
+  `source.sheet`
 
 The rejects file and the report are written either way, so a refused load always says why.
 

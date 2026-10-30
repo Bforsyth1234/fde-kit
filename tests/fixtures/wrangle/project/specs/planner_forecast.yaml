@@ -8,7 +8,7 @@ source:
   sheet: Plan
   header_rows: [4, 5]
   data_starts: 6
-  document_key: "planner-forecast#{sheet}"
+  document_key: "{spec}#{sheet}"
   skip_rows:
     - {column: Site, matches: "(?i)^(sub)?total"}
 
@@ -45,4 +45,4 @@ notes: |
   and Part No have no upper label. The "Total" column is outside the unpivot range. A
   "Subtotal" row follows each site and a "Total" row ends the sheet. Toledo's site is typed in
   capitals (matches its alias after normalisation). Part numbers are upper-cased and stripped.
-  Fixed document_key: each new planner export supersedes the last.
+  Fixed document_key (no file name in it): each new planner export supersedes the last.

@@ -91,6 +91,17 @@ def test_no_crosswalk_is_open() -> None:
     assert (res.canonical, res.strategy) == ("P-1234", "new")
 
 
+def test_open_values_take_the_first_spelling_of_a_shared_name() -> None:
+    names = {"detroit stamping 07": "Detroit Stamping 07"}
+    r = Resolver(None, names=names)
+    got = [(x.canonical, x.strategy) for x in map(r.resolve, ["Widget-a", "WIDGET-A", "widget-a"])]
+    assert got == [("Widget-a", "new"), ("Widget-a", "normalised"), ("Widget-a", "normalised")]
+    assert r.resolve("DETROIT STAMPING 07").canonical == "Detroit Stamping 07"
+    assert r.counts == {"exact": 0, "normalised": 3, "fuzzy": 0, "new": 1}
+    # Without a shared map (the default), each spelling is its own value.
+    assert Resolver(None).resolve("WIDGET-A").canonical == "WIDGET-A"
+
+
 def test_empty_value_never_resolves() -> None:
     for r in (Resolver(None), Resolver(PLANTS, "open"), Resolver(PLANTS, "closed")):
         res = r.resolve("  ")

@@ -165,7 +165,9 @@ def test_defaults_without_optional_blocks():
     )
     m = MappingSpec.model_validate(spec)
     assert m.source.header_rows == [1] and m.source.first_data_row == 2
-    assert m.source.document_key == "{path}#{sheet}"
+    # Spec and base name: two specs over one file never share a document, and the key
+    # doesn't depend on how the path was typed.
+    assert m.source.document_key == "{spec}/{file}#{sheet}"
     assert m.entity.template == "{0}"
     assert m.entity.parts[0].resolve.policy == "open"
     assert m.measures[0].empty == "skip"
@@ -205,6 +207,12 @@ def test_unpivot_matching_and_alias_round_trip():
 
 
 # --- validation errors ----------------------------------------------------------------------
+
+
+def test_document_key_placeholders():
+    for key in ("{spec}/{file}#{sheet}", "{path}#{sheet}", "{spec}#{sheet}", "fixed"):
+        m = MappingSpec.model_validate(spec_with(source__document_key=key))
+        assert m.source.document_key == key
 
 
 @pytest.mark.parametrize(

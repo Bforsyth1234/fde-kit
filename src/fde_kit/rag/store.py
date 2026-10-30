@@ -157,8 +157,9 @@ class FactRow:
     entity: str
     """Canonical name or alias; resolved to entity_id (error if unknown)."""
     field: str
-    value: float | int | str
-    """A number goes to value_num, a str to value_text."""
+    value: float | int | Decimal | str
+    """A number goes to value_num, a str to value_text. A Decimal is bound as is, so it is
+    stored exactly (a float goes through Postgres's float8 -> numeric cast, 15 digits)."""
     unit: str = ""
     period_start: date | None = None
     period_end: date | None = None
@@ -608,14 +609,16 @@ class TenantSession:
             entity_id = self.resolve_entity(r.entity)
             if entity_id is None:
                 raise ValueError(f"unknown entity {r.entity!r} for tenant {self.tenant_id}")
-            if isinstance(r.value, bool) or not isinstance(r.value, int | float | str):
+            if isinstance(r.value, bool) or not isinstance(r.value, int | float | Decimal | str):
                 raise ValueError(f"fact value must be a number or a string, got {r.value!r}")
+            if isinstance(r.value, Decimal) and not r.value.is_finite():
+                raise ValueError(f"fact value must be finite, got {r.value!r}")
             if r.precision is not None:
                 if isinstance(r.value, str):
                     raise ValueError(f"precision applies to numbers only, got {r.value!r}")
                 if isinstance(r.precision, bool) or not r.precision > 0:
                     raise ValueError(f"precision must be positive, got {r.precision!r}")
-            num = r.value if isinstance(r.value, int | float) else None
+            num = r.value if isinstance(r.value, int | float | Decimal) else None
             txt = r.value if isinstance(r.value, str) else None
             candidates = self.conn.execute(
                 self.sql("""

@@ -820,7 +820,7 @@ fde wrangle apply   specs/planner_forecast.yaml planner.xlsx --tenant acme
 ```
 
 ```
-──────────── planner_forecast  bundle c7092e506b64  (not approved) ─────────────
+──────────── planner_forecast  bundle b848aef9e343  (not approved) ─────────────
 facts 35  rejects 0 (rate 0.0000)  duplicates dropped 0
 entities by strategy: exact 4  normalised 1  fuzzy 0  new 3
 conflicts within load: 0
@@ -842,9 +842,12 @@ What a load guarantees:
   wrong spec, not a dirty file. One load is one transaction.
 - **Conflicts kept.** Two sources that disagree on Toledo's October shipments land in one conflict
   group; two that agree at the declared precision (48,613 vs "48,6" in thousands) do not.
-- **Re-exports replace.** With a fixed `document_key`, next month's export supersedes this month's,
-  and its facts replace the old version's instead of being added on top
-  (`ingest(..., on_new_version="replace")`).
+- **Re-exports replace.** With a fixed `document_key` (like `{spec}#{sheet}`), next month's
+  export supersedes this month's, and its facts replace the old version's instead of being added
+  on top (`ingest(..., on_new_version="replace")`). Each document's text names the spec's bundle
+  hash, so re-applying a corrected spec to the same file replaces its facts too. The default key,
+  `{spec}/{file}#{sheet}`, keeps files with different names, and different specs over one
+  file, as separate documents.
 - **No false merges by default.** Plant names resolve exact → normalised (`DET-07` = `det7`) →
   optional fuzzy with a margin rule, against a reviewed crosswalk. Unknown names in a closed
   crosswalk are rejects.

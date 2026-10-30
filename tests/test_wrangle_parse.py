@@ -218,8 +218,11 @@ def test_to_fact_value():
     assert isinstance(to_fact_value(D("1234.000")), int)
     assert to_fact_value(D("1E+3")) == 1000 and isinstance(to_fact_value(D("1E+3")), int)
     assert to_fact_value(D("-0")) == 0
-    assert to_fact_value(D("0.1")) == 0.1 and isinstance(to_fact_value(D("0.1")), float)
-    assert repr(to_fact_value(D("1234.56"))) == "1234.56"
+    assert to_fact_value(D("0.1")) == D("0.1") and isinstance(to_fact_value(D("0.1")), D)
+    assert to_fact_value(D("1234.56")) == D("1234.56")
+    # Exact, digits a float would carry but Postgres's float8 -> numeric cast would drop.
+    assert to_fact_value(D("1100.0000000000002")) == D("1100.0000000000002")
+    assert to_fact_value(D("0.30000000000000004")) == D("0.30000000000000004")
     assert to_fact_value(parse_number("1,234.4") * 1000) == 1234400
     with pytest.raises(ValueError):
         to_fact_value(D("NaN"))
@@ -538,6 +541,10 @@ def test_text(raw, params, want):
         ("Site DET-07 (Detroit)", r"^Site (\S+)", "DET-07"),
         ("x Units: 42", r"Units: (\d+)$", "42"),
         ("abc", r"(?i)(ABC)", "abc"),
+        # `^` / `$` that aren't anchors: still fullmatch.
+        ("Detroit", r"([^,]+)", "Detroit"),
+        ("$42", r"\$(\d+)", "42"),
+        ("cost $", r"(.+) \$", "cost"),
     ],
 )
 def test_regex_ok(raw, pattern, want):
@@ -552,6 +559,9 @@ def test_regex_ok(raw, pattern, want):
         ("P-1234 xx", r"P-(\d+)", "regex: no match"),
         ("Q", r"^Q(\d)?$", "regex: group did not match"),
         ("nothing", r"^Site (\S+)", "regex: no match"),
+        # Not anchored, so fullmatch: trailing text is a reject, not silently cut off.
+        ("Detroit, MI", r"([^,]+)", "regex: no match"),
+        ("$42 total", r"\$(\d+)", "regex: no match"),
     ],
 )
 def test_regex_reject(raw, pattern, reason):

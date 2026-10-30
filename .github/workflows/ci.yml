@@ -59,16 +59,24 @@ jobs:
           FDE_RAG_ADMIN_URL: postgresql://fde:fde@localhost:5432/fde
           FDE_RAG_EMBEDDER: hash
           FDE_OTEL_ENABLED: "false"
-      - name: wrangle (approve a copy of the fixture project, apply each spec twice into wrangle-ci)
-        # The committed specs are unapproved, so approve a copy. The second apply of each spec
-        # must be a no-op (idempotent): `fde wrangle apply` exits 1 if any gate refuses.
+      - name: wrangle (dry-run each fixture spec, then approve a copy and apply each twice into wrangle-ci)
+        # The dry runs need no database and use the committed (unapproved) specs; each exits
+        # 1 on a SpecMismatch or a spec error. The committed specs are unapproved, so approve a
+        # copy. The second apply of each spec must be a no-op (idempotent): `fde wrangle apply`
+        # exits 1 if any gate refuses.
         run: |
           set -euo pipefail
           work="$(mktemp -d)"
+          specs="erp_shipments:erp_shipments.csv planner_forecast:planner_forecast.xlsx legacy_report:legacy_report.csv"
+          for pair in $specs; do
+            echo "::group::dry-run ${pair%%:*}"
+            fde wrangle dry-run "tests/fixtures/wrangle/project/specs/${pair%%:*}.yaml" \
+              "tests/fixtures/wrangle/${pair#*:}" --out "$work/dry/${pair%%:*}"
+            echo "::endgroup::"
+          done
           cp -r tests/fixtures/wrangle/project "$work/project"
           fde rag migrate
           fde rag create-tenant wrangle-ci --name "Wrangle CI"
-          specs="erp_shipments:erp_shipments.csv planner_forecast:planner_forecast.xlsx legacy_report:legacy_report.csv"
           for pair in $specs; do
             fde wrangle approve "$work/project/specs/${pair%%:*}.yaml" --by ci
           done

@@ -69,7 +69,8 @@ docstring.
   fixed by `strip`). Part No is an `open` part.
 - One empty cell, Monterrey P-3307 Feb-27 (F18). That's `empty_skipped: 1`, with no fact and no
   reject.
-- The fixed `document_key: "planner-forecast#{sheet}"` means a re-export supersedes the last.
+- The fixed `document_key: "{spec}#{sheet}"` (`planner_forecast#Plan`, no file name in it)
+  means a re-export supersedes the last.
 
 **`legacy_report.csv`** is a European export. Spec: `project/specs/legacy_report.yaml`.
 - UTF-8 with a BOM, a `;` delimiter, `.` thousands and `,` decimal throughout

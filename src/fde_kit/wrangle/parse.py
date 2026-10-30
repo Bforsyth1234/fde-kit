@@ -75,12 +75,19 @@ def compile_regex(pattern: str) -> re.Pattern[str]:
 
 
 def _anchored(pattern: str) -> bool:
-    return "^" in pattern or "$" in pattern
+    """Starts with `^`, or ends with a `$` that isn't escaped. A `^` or `$` anywhere else
+    (`([^,]+)`, `\\$(\\d+)`) is not an anchor."""
+    if pattern.startswith("^"):
+        return True
+    if not pattern.endswith("$"):
+        return False
+    backslashes = len(pattern[:-1]) - len(pattern[:-1].rstrip("\\"))
+    return backslashes % 2 == 0
 
 
 def apply_regex(raw: str, pattern: str | re.Pattern[str]) -> str:
-    """The group's text. `re.fullmatch`, unless the pattern has `^` or `$`, in which case it's
-    `re.search` and the pattern's own anchors decide."""
+    """The group's text. `re.fullmatch`, unless the pattern starts with `^` or ends with an
+    unescaped `$`, in which case it's `re.search` and the pattern's own anchors decide."""
     rx = compile_regex(pattern) if isinstance(pattern, str) else pattern
     m = rx.search(raw) if _anchored(rx.pattern) else rx.fullmatch(raw)
     if m is None:
@@ -251,13 +258,15 @@ def _check_number_params(thousands: str | None, decimal: str) -> None:
         raise ValueError(f"number: thousands and decimal are both {decimal!r}")
 
 
-def to_fact_value(d: Decimal) -> int | float:
-    """`int` when integral, else `float` (what FactRow takes). Never rounds."""
+def to_fact_value(d: Decimal) -> int | Decimal:
+    """`int` when integral, else the Decimal itself, so `1100.0000000000002` is stored exactly
+    (a float would go through Postgres's float8 -> numeric cast, which keeps 15 digits). Never
+    rounds."""
     if not d.is_finite():
         raise ValueError(f"not a finite number: {d}")
     if d == d.to_integral_value():
         return int(d)
-    return float(d)
+    return d
 
 
 # ---------------------------------------------------------------------------------- date

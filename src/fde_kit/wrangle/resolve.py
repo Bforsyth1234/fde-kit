@@ -9,9 +9,13 @@ For a part with a crosswalk, in order:
    only when the best canonical scores >= `threshold` **and** beats the runner-up canonical by
    at least `FUZZY_MARGIN`. Accepted matches are kept for `crosswalk.proposed.csv`;
 4. otherwise `closed` -> `unknown entity`; `open` -> the cleaned value is its own canonical
-   (strategy `new`).
+   (strategy `new`). With a shared `names` map (apply passes one per load, seeded with the
+   crosswalk canonicals), an open value whose casefold is already in it takes that spelling
+   instead (strategy `normalised`), because the store resolves names case-insensitively and
+   would otherwise attach both spellings' facts to one entity anyway.
 
-A part with no crosswalk is open: every non-empty value is `new`. An empty value never resolves.
+A part with no crosswalk is open: every non-empty value is `new` (or `normalised`, as above).
+An empty value never resolves.
 False merges cost more than misses, which is why fuzzy is off by default and the margin exists.
 """
 
@@ -111,6 +115,8 @@ class Resolver:
     threshold: float = 92
     scorer: Callable[[str, str], float] = _token_set_ratio
     """Similarity in 0..100 of two norm_keys; injectable for tests."""
+    names: dict[str, str] | None = None
+    """casefold -> first spelling, shared across a load's parts; see the module docstring."""
     counts: dict[str, int] = field(default_factory=lambda: dict.fromkeys(STRATEGIES, 0))
     fuzzy_matches: list[FuzzyMatch] = field(default_factory=list)
     _cache: dict[str, Resolution] = field(default_factory=dict, repr=False)
@@ -126,7 +132,9 @@ class Resolver:
                 self._norm.setdefault(nk, set()).add(canonical)
 
     @classmethod
-    def for_part(cls, resolve, crosswalks: dict[str, Crosswalk]) -> Resolver:
+    def for_part(
+        cls, resolve, crosswalks: dict[str, Crosswalk], *, names: dict[str, str] | None = None
+    ) -> Resolver:
         """From a spec `Resolve` block and the loaded crosswalks."""
         cw = crosswalks[resolve.crosswalk] if resolve.crosswalk else None
         return cls(
@@ -134,6 +142,7 @@ class Resolver:
             policy=resolve.policy or ("closed" if cw else "open"),
             fuzzy=resolve.fuzzy,
             threshold=resolve.threshold,
+            names=names,
         )
 
     def resolve(self, value: str) -> Resolution:
@@ -161,7 +170,7 @@ class Resolver:
             return Resolution(value, None, None, UNKNOWN)
         cw = self.crosswalk
         if cw is None:
-            return Resolution(value, value, "new")
+            return self._open(value)
         exact = cw.mapping.get(value)
         if exact is not None:
             return Resolution(value, exact, "exact")
@@ -185,8 +194,15 @@ class Resolver:
                 if fuzzy_accepts(best, second, self.threshold):
                     return Resolution(value, best_c, "fuzzy", score=best, second=second)
         if self.policy == "open":
-            return Resolution(value, value, "new")
+            return self._open(value)
         return Resolution(value, None, None, UNKNOWN)
+
+    def _open(self, value: str) -> Resolution:
+        if self.names is not None:
+            first = self.names.setdefault(value.casefold(), value)
+            if first != value:
+                return Resolution(value, first, "normalised")
+        return Resolution(value, value, "new")
 
 
 def check_crosswalk(crosswalk: Crosswalk) -> list[str]:

@@ -36,7 +36,7 @@ from fde_kit.rag import (
 )
 from fde_kit.rag.tool import reported_line_item
 from fde_kit.wrangle.adapter import apply_to_tenant, job_kind_for
-from fde_kit.wrangle.apply import ApplyResult, gate, run
+from fde_kit.wrangle.apply import ApplyResult, SpecMismatch, gate, run
 from fde_kit.wrangle.spec import LoadedSpec, approve, load_project_spec
 
 PG_URL = os.environ.get("FDE_TEST_PG_URL")
@@ -137,11 +137,13 @@ def _cells(result: ApplyResult) -> list[str]:
 
 def _fetched_cell(content: str, cell: str) -> tuple[str, str]:
     """From fetch_document output: the `row` column and the cell's raw text on the line for
-    `cell`'s Excel row. The first line of the output is the `[#1] ...` header."""
+    `cell`'s Excel row. The first line of the output is the `[#1] ...` header, the second the
+    document's `# wrangle spec=... bundle=...` line."""
     m = re.fullmatch(r"(?:.+!)?([A-Z]+)([0-9]+)", cell)
     assert m, cell
     col, row = m.group(1), m.group(2)
-    body = content.split("\n", 1)[1]
+    _, ident, body = content.split("\n", 2)
+    assert ident.startswith("# wrangle spec="), ident
     rows = list(csv.reader(io.StringIO(body)))
     header = rows[0]
     assert header[0] == "row"
@@ -361,7 +363,7 @@ def test_reexport_supersedes_and_replaces_its_facts(make_tenant, store, tmp_path
 
     second, r2 = _apply(store, tid, loaded, [export])
     assert r2 is not None, gate(second)
-    assert second.documents[0].source == first.documents[0].source == "planner-forecast#Plan"
+    assert second.documents[0].source == first.documents[0].source == "planner_forecast#Plan"
     assert (r2.documents, r2.documents_changed) == (1, 1)
     assert r2.facts_replaced == len(first.facts)
     assert r2.facts == len(second.facts) == len(first.facts)
@@ -481,7 +483,7 @@ def test_second_tenant_sees_none_of_the_first(tenant_a, make_tenant, store, tmp_
     with store.session(tid) as s:
         sources = [r[0] for r in s.query("SELECT source FROM rag_documents").rows]
         versions = [r[0] for r in s.query("SELECT version FROM rag_documents").rows]
-    assert sources == ["planner-forecast#Plan"] and versions == [1]
+    assert sources == ["planner_forecast#Plan"] and versions == [1]
     assert len(b_facts) == len(result.facts)
     assert {reported_line_item(f.source_ref).split("!")[0] for f in b_facts} == {"Plan"}
 
@@ -507,3 +509,96 @@ def test_second_tenant_sees_none_of_the_first(tenant_a, make_tenant, store, tmp_
     assert not out.is_error and len(out.content.splitlines()) - 1 == len(
         tenant_a["erp_shipments"][0].facts
     )
+
+
+# ------------------------------------------------------------------ review fixes
+
+
+def test_corrected_spec_over_the_same_file_replaces_its_facts(make_tenant, store, tmp_path):
+    """A wrong spec (scale 1 for a thousands column) applied, then corrected, re-approved and
+    applied to the same bytes: the document text names the bundle, so it's a new version and
+    the wrong facts are retired."""
+    tid = make_tenant("wrangle-pg-respec")
+    project = _project(tmp_path)
+    spec = _spec_path(project, "legacy_report")
+    good = spec.read_text(encoding="utf-8")
+    spec.write_text(good.replace("    scale: 1000\n    precision: 1000\n", "    scale: 1\n"))
+    wrong = _approved(project, "legacy_report")
+    _, r1 = _apply(store, tid, wrong, [FILES["legacy_report"]])
+    assert r1 is not None and r1.facts == 96
+
+    spec.write_text(good, encoding="utf-8")
+    fixed = _approved(project, "legacy_report")
+    assert fixed.bundle_sha256 != wrong.bundle_sha256
+    _, r2 = _apply(store, tid, fixed, [FILES["legacy_report"]])
+    assert r2 is not None
+    assert (r2.documents_changed, r2.facts, r2.facts_replaced) == (1, 96, 96)
+    with store.session(tid) as s:
+        toledo = [
+            f
+            for f in s.facts(entity="Toledo Assembly 12", field="shipped_units")
+            if f.period_start == OCT_2025
+        ]
+    assert [int(f.value) for f in toledo] == [39900]
+    assert f"@wrangle:legacy_report/{fixed.bundle_sha12}/" in toledo[0].source_ref
+    assert _counts(store, tid)["rag_facts"] == 96
+
+
+def test_two_specs_over_one_file_both_load(make_tenant, store, tmp_path):
+    tid = make_tenant("wrangle-pg-twospecs")
+    project = _project(tmp_path)
+    erp = _spec_path(project, "erp_shipments")
+    _spec_path(project, "erp_returns").write_text(
+        erp.read_text(encoding="utf-8")
+        .replace("spec: erp_shipments", "spec: erp_returns")
+        .replace("field: shipped_units", "field: returned_units"),
+        encoding="utf-8",
+    )
+    for name in ("erp_shipments", "erp_returns"):
+        _, report = _apply(store, tid, _approved(project, name), [FILES["erp_shipments"]])
+        assert report is not None and report.facts == 59 and report.facts_replaced == 0, name
+    with store.session(tid) as s:
+        by_field = dict(s.query("SELECT field, count(*) FROM rag_facts GROUP BY field").rows)
+        sources = sorted(r[0] for r in s.query("SELECT source FROM rag_documents").rows)
+    assert by_field == {"shipped_units": 59, "returned_units": 59}
+    assert sources == [
+        "erp_returns/erp_shipments.csv#erp_shipments",
+        "erp_shipments/erp_shipments.csv#erp_shipments",
+    ]
+
+
+def test_two_exports_under_one_key_in_one_load_write_nothing(make_tenant, store, tmp_path):
+    tid = make_tenant("wrangle-pg-samekey")
+    loaded = _approved(_project(tmp_path), "planner_forecast")
+    nov = tmp_path / "Forecast_Nov.xlsx"
+    wb = openpyxl.load_workbook(FILES["planner_forecast"])
+    wb["Plan"]["D14"] = 999.0
+    wb.save(nov)
+    with pytest.raises(SpecMismatch, match="supersede each other"):
+        _apply(store, tid, loaded, [FILES["planner_forecast"], nov])
+    assert set(_counts(store, tid).values()) == {0}
+
+
+def test_float_noise_values_round_trip_exactly(make_tenant, store, tmp_path):
+    """1100.0000000000002 and 0.30000000000000004 are stored exactly (Decimal, not a float
+    through float8 -> numeric), and a second file with the same values agrees with them."""
+    tid = make_tenant("wrangle-pg-exact")
+    loaded = _approved(_project(tmp_path), "erp_shipments")
+    body = "PLANT_CD,SHIP_DT,QTY_SHIPPED\n1007,20251031,1100.0000000000002\n"
+    body += "1012,20251031,0.30000000000000004\n"
+    a, b = tmp_path / "erp_a.csv", tmp_path / "erp_b.csv"
+    a.write_text(body, encoding="utf-8")
+    b.write_text(body, encoding="utf-8")
+    for path in (a, b):
+        _, report = _apply(store, tid, loaded, [path])
+        assert report is not None and report.facts == 2 and report.conflict_groups == 0
+    with store.session(tid) as s:
+        rows = s.query(
+            "SELECT value_num::text, conflict_group_id IS NULL FROM rag_facts ORDER BY 1"
+        ).rows
+    assert rows == [
+        ("0.30000000000000004", True),
+        ("0.30000000000000004", True),
+        ("1100.0000000000002", True),
+        ("1100.0000000000002", True),
+    ]

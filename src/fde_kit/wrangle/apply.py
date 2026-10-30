@@ -13,11 +13,31 @@ For each file the spec's sheet is read into a `Grid`, then:
    load. A row with every cell empty is passed over silently.
 4. Each measure cell: empty + `empty: skip` is counted; otherwise ops then `scale` -> a fact, or
    a **cell-level** reject.
-5. The same (entity, field, period) twice in one load: an equal value is dropped (the first
-   cell is kept); a different value loads too, and the report names every cell involved.
+5. The same (entity, field, period) twice in one document (file + sheet): an equal value is
+   dropped (the first cell is kept); a different value loads too, and the report names every
+   cell involved. Across documents nothing is dropped: `add_facts` decides agreement and
+   conflict at ingest, as it does between loads.
+
+Before any file is read, every file's `document_key` is rendered; two files with the same key
+in one load are a `SpecMismatch` (one would supersede the other within the load).
+
+**Native XLSX cells** (`cell_pipeline`): when a pipeline's first op is `number` and the cell is
+a number, the cell's value is taken as is (`Decimal(raw)`) and only the later ops run, so a
+`thousands: "."` spec doesn't misread the native 1234.5 as text. Likewise a first `date` op on
+a date cell takes the cell's date, and a first `period` op on a date cell expands that date
+with the op's `grain` and `fy_start_month`. Text cells (every CSV cell) go through the ops.
+
+**Open entities and case.** The store resolves entity names case-insensitively, so within one
+load an `open` value whose casefold matches an open value seen earlier, or a crosswalk
+canonical, takes that first spelling (`Widget-a` then `WIDGET-A` -> both `Widget-a`); the
+report counts it under `entities.normalised`. Composite names are compared casefolded too.
 
 Every fact's `source_ref` is `<Sheet>!<A1>@wrangle:<spec>/<bundle_sha12>/<file_sha12>`, and
-every sheet becomes one `RawDocument` whose text is the sheet as CSV with Excel row numbers.
+every sheet becomes one `RawDocument` whose text is a `# wrangle spec=<name> bundle=<sha256>`
+line, then the sheet as CSV with Excel row numbers. The first line makes a corrected spec over
+the same bytes a new document version, so `on_new_version="replace"` retires the old facts.
+Values are `int` or, when not integral, `Decimal` (exact); `write_outputs` writes a Decimal as
+a JSON number when a float reads back as the same value, else as a string.
 """
 
 from __future__ import annotations
@@ -30,7 +50,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +58,7 @@ from ..rag.adapters.base import RawDocument, RawEntity, RawFact
 from ..rag.store import FactRow
 from .labels import header_fingerprint, header_labels
 from .parse import ParseError, apply_text, compile_ops, period_of, to_fact_value
-from .read import Cell, Grid, col_letter, parse_ref, read_grid
+from .read import XLSX_SUFFIXES, Cell, Grid, col_letter, parse_ref, read_grid
 from .resolve import STRATEGIES, FuzzyMatch, Resolver
 from .spec import LoadedSpec, Measure, SkipBlank, SpecError, load_project_spec
 
@@ -47,6 +67,8 @@ __all__ = [
     "FactRecord",
     "FileResult",
     "SpecMismatch",
+    "cell_pipeline",
+    "document_key",
     "gate",
     "parse_source_ref",
     "reject_rate",
@@ -160,14 +182,54 @@ def reject_rate(facts: int, rejects: int) -> float:
 
 # --- compiling the spec ---------------------------------------------------------------------
 
-Pipeline = Callable[[str], object]
+Pipeline = Callable[[Cell], object]
+
+
+def _cell_date(cell: Cell, op: str) -> date:
+    try:  # `2025-10-31`, or `2025-10-31T13:00:00` for a date cell with a time of day
+        return date.fromisoformat(cell.raw[:10])
+    except ValueError as e:
+        raise ParseError(f"{op}: unparseable", op) from e
+
+
+def cell_pipeline(ops: list[dict[str, Any]]) -> Pipeline:
+    """`compile_ops` for a cell rather than its raw string: the native-cell rule in the module
+    docstring. ValueError for a bad pipeline, as `compile_ops`."""
+    whole = compile_ops(ops)
+    # Leading `text` ops only trim and case-fold; on a native number or date cell they are
+    # no-ops, so they don't stop the native rule (`[text, number]` is a common spec).
+    k = 0
+    while k < len(ops) - 1 and ops[k]["op"] == "text":
+        k += 1
+    first = ops[k]
+    rest = compile_ops(ops[k + 1 :]) if len(ops) > k + 1 else None
+    name = first["op"]
+
+    def run(cell: Cell) -> object:
+        value: object
+        if name == "number" and cell.kind == "number":
+            try:
+                value = Decimal(cell.raw)
+            except InvalidOperation as e:
+                raise ParseError("number: unparseable", "number") from e
+        elif name == "date" and cell.kind == "date":
+            value = _cell_date(cell, "date")
+        elif name == "period" and cell.kind == "date":
+            value = period_of(
+                _cell_date(cell, "period"), first["grain"], first.get("fy_start_month", 1)
+            )
+        else:
+            return whole(cell.raw)
+        return rest(value) if rest is not None else value  # type: ignore[arg-type]
+
+    return run
 
 
 def _compile(ops: list[dict[str, Any]], where: str) -> Pipeline | None:
     if not ops:
         return None
     try:
-        return compile_ops(ops)
+        return cell_pipeline(ops)
     except ValueError as e:
         raise SpecError(f"{where}: {e}") from e
 
@@ -183,8 +245,8 @@ def _period_pipeline(ops: list[dict[str, Any]], where: str, grain: str | None) -
     fn = _compile(ops, where)
     assert fn is not None
 
-    def run(raw: str) -> tuple[date, date]:
-        v = fn(raw)
+    def run(cell: Cell) -> tuple[date, date]:
+        v = fn(cell)
         if isinstance(v, tuple):
             return v
         assert isinstance(v, date)
@@ -203,12 +265,14 @@ class _Compiled:
     skips: list[tuple[str, Any]]
 
 
-def _compile_spec(loaded: LoadedSpec) -> _Compiled:
+def _compile_spec(loaded: LoadedSpec, names: dict[str, str]) -> _Compiled:
+    """`names` (casefold -> first spelling) is shared by every part's resolver, for the
+    case rule on open values."""
     spec = loaded.spec
     parts = [
         (
             _compile(p.ops, f"entity.parts[{i}]"),
-            Resolver.for_part(p.resolve, loaded.crosswalks),
+            Resolver.for_part(p.resolve, loaded.crosswalks, names=names),
         )
         for i, p in enumerate(spec.entity.parts)
     ]
@@ -264,8 +328,9 @@ class _Columns:
         return cols[0]
 
 
-def _render_document(grid: Grid) -> str:
+def _render_document(grid: Grid, spec: str, bundle_sha256: str) -> str:
     buf = io.StringIO()
+    buf.write(f"# wrangle spec={spec} bundle={bundle_sha256}\n")
     w = csv.writer(buf, lineterminator="\n")
     width = len(grid.rows[0]) if grid.rows else 0
     w.writerow(["row", *(col_letter(c) for c in range(1, width + 1))])
@@ -291,17 +356,44 @@ def _precision(m: Measure) -> int | float | None:
     return p
 
 
+def _is_xlsx(path: Path | str) -> bool:
+    return Path(path).suffix.lower() in XLSX_SUFFIXES
+
+
+def document_key(loaded: LoadedSpec, path: Path | str) -> str:
+    """The spec's `document_key` rendered for one file. Known before the file is read: the
+    sheet is `source.sheet` for XLSX (`SpecMismatch` when the spec has none) and the file stem
+    for CSV."""
+    src = loaded.spec.source
+    if _is_xlsx(path):
+        if src.sheet is None:
+            raise SpecMismatch(str(path), "XLSX needs source.sheet in the spec")
+        sheet = src.sheet
+    else:
+        sheet = Path(path).stem
+    return src.document_key.format(
+        spec=loaded.spec.spec, file=Path(path).name, path=str(path), sheet=sheet
+    )
+
+
 class _Run:
     def __init__(self, loaded: LoadedSpec, force: bool):
         self.loaded = loaded
         self.spec = loaded.spec
         self.force = force
-        self.c = _compile_spec(loaded)
+        canonicals = sorted(c for cw in loaded.crosswalks.values() for c in cw.canonicals)
+        # casefold -> the first spelling this load used (crosswalk canonicals first).
+        self.names: dict[str, str] = {}
+        for c in canonicals:
+            self.names.setdefault(c.casefold(), c)
+        self.crosswalk_canonicals = {c.casefold() for c in canonicals}
+        self.c = _compile_spec(loaded, self.names)
         self.rejects: list[dict[str, Any]] = []
         self.duplicates = 0
-        # (entity, field, start, end) -> [(value, "Sheet!A1")]; values within a key all differ.
+        # Per document: (entity, field, start, end) -> [(value, "Sheet!A1")]; values within a
+        # key all differ. Reset for each file; `conflicts` collects across them.
         self.seen: dict[tuple[str, str, date, date], list[tuple[Any, str]]] = {}
-        self.crosswalk_canonicals = {c for cw in loaded.crosswalks.values() for c in cw.canonicals}
+        self.conflicts: list[dict[str, Any]] = []
 
     def _reject(self, fr: FileResult, *, where: dict[str, Any], **kw: Any) -> None:
         rec: dict[str, Any] = {"file": fr.path, "sheet": fr.sheet, **where}
@@ -331,10 +423,11 @@ class _Run:
     def file(self, path: Path | str) -> FileResult:
         spec, src = self.spec, self.spec.source
         shown = str(path)
+        source = document_key(self.loaded, path)
         try:
             grid = read_grid(
                 path,
-                src.sheet if Path(path).suffix.lower() in (".xlsx", ".xlsm") else None,
+                src.sheet if _is_xlsx(path) else None,
                 encoding=src.encoding,
                 delimiter=src.delimiter,
             )
@@ -381,11 +474,10 @@ class _Run:
             for m, fn in self.c.measures
         ]
 
-        source = spec.source.document_key.format(path=shown, sheet=grid.sheet)
         document = RawDocument(
             source=source,
             title=f"{Path(path).name} — {grid.sheet}",
-            text=_render_document(grid),
+            text=_render_document(grid, spec.spec, self.loaded.bundle_sha256),
             metadata={
                 "file_sha256": grid.file_sha256,
                 "spec": spec.spec,
@@ -411,12 +503,13 @@ class _Run:
         label_periods: dict[int, tuple[date, date] | ParseError] = {}
         for col in unpivot_cols:
             assert self.c.unpivot is not None
-            try:
-                label_periods[col] = self.c.unpivot(labels[col - 1])
+            try:  # a label is text, whatever the header cells were
+                label_periods[col] = self.c.unpivot(Cell(0, col, labels[col - 1], "text"))
             except ParseError as e:
                 label_periods[col] = e
 
         entities: dict[str, RawEntity] = {}
+        self.seen = {}
         for r in range(src.first_data_row, len(grid.rows) + 1):
             row = grid.rows[r - 1]
             if all(c.kind == "empty" for c in row):
@@ -435,7 +528,7 @@ class _Run:
                     failed = True
                     break
                 try:
-                    cleaned = str(fn(cell.raw)) if fn else cell.raw
+                    cleaned = str(fn(cell)) if fn else cell.raw
                 except ParseError as e:
                     self._row_reject(fr, r, cell, "entity", e.op or "", e.reason)
                     failed = True
@@ -449,6 +542,7 @@ class _Run:
             if failed:
                 continue
             entity = spec.entity.render(canonicals)
+            entity = self.names.setdefault(entity.casefold(), entity)
             entity_cells = tuple(f"{col_letter(c)}{r}" for c in part_cols)
 
             # Period for the row (column or fixed cell); unpivot is per cell, below.
@@ -503,9 +597,21 @@ class _Run:
                     fr.facts.append(
                         FactRecord(RawFact(source, row_), shown, cell_name, entity_cells, pfrom)
                     )
-                    if entity not in self.crosswalk_canonicals and entity not in entities:
+                    if (
+                        entity.casefold() not in self.crosswalk_canonicals
+                        and entity not in entities
+                    ):
                         entities[entity] = RawEntity(spec.entity.kind, entity)
         fr.entities = list(entities.values())
+        self.conflicts.extend(
+            {
+                "document": source,
+                "key": [k[0], k[1], _period_label(k[2], k[3])],
+                "cells": [c for _, c in vs],
+            }
+            for k, vs in self.seen.items()
+            if len(vs) > 1
+        )
         return fr
 
     def _skipped(self, grid: Grid, r: int, skip_cols, fr: FileResult) -> bool:
@@ -526,18 +632,18 @@ class _Run:
         if cell.kind in _READ_FAILURES:
             return None, ParseError(_READ_FAILURES[cell.kind], "read")
         try:
-            return fn(cell.raw), None  # type: ignore[return-value]
+            return fn(cell), None  # type: ignore[return-value]
         except ParseError as e:
             return None, e
 
     def _measure_value(
         self, fr: FileResult, cell: Cell, m: Measure, fn: Pipeline | None
-    ) -> int | float | str | None:
+    ) -> int | Decimal | str | None:
         if cell.kind in _READ_FAILURES:
             self._cell_reject(fr, cell, cell.raw, "measure", "read", _READ_FAILURES[cell.kind])
             return None
         try:
-            out = fn(cell.raw) if fn else cell.raw
+            out = fn(cell) if fn else cell.raw
         except ParseError as e:
             self._cell_reject(fr, cell, cell.raw, "measure", e.op or "", e.reason)
             return None
@@ -558,13 +664,6 @@ class _Run:
         prior.append((value, cell_name))
         return True
 
-    def conflicts(self) -> list[dict[str, Any]]:
-        return [
-            {"key": [k[0], k[1], _period_label(k[2], k[3])], "cells": [c for _, c in vs]}
-            for k, vs in self.seen.items()
-            if len(vs) > 1
-        ]
-
 
 def run(
     spec: LoadedSpec | str | Path, files: Iterable[str | Path], *, force: bool = False
@@ -574,6 +673,18 @@ def run(
     Raises `SpecMismatch` when a file doesn't fit the spec (header fingerprint, unless `force`;
     a missing column or sheet) and `SpecError` for a spec whose ops can't run."""
     loaded = spec if isinstance(spec, LoadedSpec) else load_project_spec(spec)
+    files = list(files)
+    keys: dict[str, str] = {}
+    for f in files:
+        key = document_key(loaded, f)
+        if key in keys:
+            raise SpecMismatch(
+                str(f),
+                f"document_key {loaded.spec.source.document_key!r} renders {key!r} for this "
+                f"file and for {keys[key]}: in one load they would supersede each other "
+                "(load them separately, or use a document_key that tells them apart)",
+            )
+        keys[key] = str(f)
     state = _Run(loaded, force)
     results = [state.file(f) for f in files]
 
@@ -591,7 +702,7 @@ def run(
 
     n_facts = sum(len(f.facts) for f in results)
     n_rejects = len(state.rejects)
-    conflicts = state.conflicts()
+    conflicts = state.conflicts
     report = {
         "spec": loaded.spec.spec,
         "bundle_sha256": loaded.bundle_sha256,
@@ -664,6 +775,19 @@ def gate(
     return reasons
 
 
+def _json_default(o: object) -> object:
+    """A Decimal value: a JSON number when the float reads back as the same value, else a
+    string, so no digit is lost either way."""
+    if isinstance(o, Decimal):
+        f = float(o)
+        return f if Decimal(repr(f)) == o else str(o)
+    raise TypeError(f"{type(o).__name__} is not JSON serialisable")
+
+
+def _dumps(obj: object, **kw: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, default=_json_default, **kw)
+
+
 def _fact_json(rec: FactRecord) -> dict[str, Any]:
     row = rec.fact.row
     return {
@@ -691,16 +815,14 @@ def write_outputs(result: ApplyResult, out_dir: str | Path) -> dict[str, Path]:
         "preview": out / "facts.preview.jsonl",
         "proposed": out / "crosswalk.proposed.csv",
     }
-    paths["report"].write_text(
-        json.dumps(result.report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
+    paths["report"].write_text(_dumps(result.report, indent=2) + "\n", encoding="utf-8")
     paths["rejects"].write_text(
-        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in result.rejects),
+        "".join(_dumps(r) + "\n" for r in result.rejects),
         encoding="utf-8",
     )
     records = [r for f in result.files for r in f.facts][:PREVIEW_FACTS]
     paths["preview"].write_text(
-        "".join(json.dumps(_fact_json(r), ensure_ascii=False) + "\n" for r in records),
+        "".join(_dumps(_fact_json(r)) + "\n" for r in records),
         encoding="utf-8",
     )
     buf = io.StringIO()

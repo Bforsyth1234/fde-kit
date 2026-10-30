@@ -7,7 +7,7 @@ crosswalks:
 source:
   header_rows: [1]
   delimiter: ","
-  # document_key: default "{path}#{sheet}"
+  # document_key: default "{spec}/{file}#{sheet}"
 
 entity:
   kind: plant

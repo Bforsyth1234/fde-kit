@@ -179,6 +179,24 @@ def test_dry_run_spec_mismatch_is_exit_1(out):
     assert "spec mismatch" in out()
 
 
+def test_dry_run_exact_decimal_values_and_same_key_files(out, tmp_path):
+    """Non-integral values are Decimals: the summary and the JSON outputs handle them. Two
+    files with one rendered document_key are a spec mismatch (exit 1)."""
+    data = tmp_path / "erp_exact.csv"
+    data.write_text(
+        "PLANT_CD,SHIP_DT,QTY_SHIPPED\n1007,20251031,1100.0000000000002\n", encoding="utf-8"
+    )
+    dest = tmp_path / "out"
+    spec = str(SPECS / "erp_shipments.yaml")
+    assert cli.main(["wrangle", "dry-run", spec, str(data), "--out", str(dest)]) == 0
+    assert "facts 1  rejects 0" in out()
+    preview = json.loads((dest / "facts.preview.jsonl").read_text())
+    assert preview["value"] == 1100.0000000000002
+
+    assert cli.main(["wrangle", "dry-run", spec, str(data), str(data)]) == 1
+    assert "spec mismatch" in out() and "supersede each other" in out()
+
+
 def test_dry_run_missing_file_is_exit_2(out):
     argv = ["wrangle", "dry-run", str(SPECS / "erp_shipments.yaml"), "nope.csv"]
     assert cli.main(argv) == 2

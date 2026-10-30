@@ -98,7 +98,7 @@ TEXT_OPS = frozenset({"text", "map", "regex", "constant"})
 
 SPEC_NAME = re.compile(r"^[a-z0-9_]+$")
 CELL_REF = re.compile(r"^[A-Z]{1,3}[1-9][0-9]*$")
-DOCUMENT_KEY_FIELDS = frozenset({"path", "sheet"})
+DOCUMENT_KEY_FIELDS = frozenset({"spec", "file", "path", "sheet"})
 
 
 class SpecError(ValueError):
@@ -182,7 +182,9 @@ class Source(_Model):
     data_starts: int | None = Field(default=None, ge=1)
     """Default: the row after the last header row. See `first_data_row`."""
     header_fingerprint: str | None = None
-    document_key: str = "{path}#{sheet}"
+    document_key: str = "{spec}/{file}#{sheet}"
+    """`{spec}` the spec name, `{file}` the file's base name, `{path}` the path as passed,
+    `{sheet}` the sheet (CSV: the file stem)."""
     encoding: str = "utf-8-sig"
     delimiter: str | None = None
     """CSV only; None means sniffed."""
@@ -214,7 +216,8 @@ class Source(_Model):
         unknown = names - DOCUMENT_KEY_FIELDS
         if unknown:
             raise ValueError(
-                f"document_key may use only {{path}} and {{sheet}}, not {sorted(unknown)}"
+                "document_key may use only {spec}, {file}, {path} and {sheet}, "
+                f"not {sorted(unknown)}"
             )
         return v
 

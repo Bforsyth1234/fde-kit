@@ -15,6 +15,7 @@ import json
 import math
 import shutil
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -24,13 +25,14 @@ from fde_kit.wrangle.adapter import WrangleAdapter, apply_to_tenant, job_kind_fo
 from fde_kit.wrangle.apply import (
     ApplyResult,
     SpecMismatch,
+    cell_pipeline,
     gate,
     parse_source_ref,
     run,
     write_outputs,
 )
 from fde_kit.wrangle.labels import header_fingerprint, header_labels
-from fde_kit.wrangle.parse import compile_ops, to_fact_value
+from fde_kit.wrangle.parse import to_fact_value
 from fde_kit.wrangle.read import parse_ref, read_grid
 from fde_kit.wrangle.spec import LoadedSpec, approve, load_project_spec
 from tests.test_adapters import FakeSession
@@ -278,7 +280,8 @@ def test_provenance_read_back(name: str, results: dict[str, ApplyResult]) -> Non
     loaded = load_project_spec(_spec(name))
     path = FIXTURES / SOURCES[name]
     measures = {m.field: m for m in loaded.spec.measures}
-    pipelines = {m.field: compile_ops(m.ops) for m in loaded.spec.measures if m.ops}
+    # The same cell-aware pipeline apply uses (native XLSX numbers and dates).
+    pipelines = {m.field: cell_pipeline(m.ops) for m in loaded.spec.measures if m.ops}
     grids: dict[str, object] = {}
     assert result.facts
     for f in result.facts:
@@ -299,9 +302,9 @@ def test_provenance_read_back(name: str, results: dict[str, ApplyResult]) -> Non
         cell = grid.cell(*parse_ref(ref["cell"]))
         m = measures[f.row.field]
         if m.is_text:
-            expected = str(pipelines[m.field](cell.raw)) if m.ops else cell.raw
+            expected = str(pipelines[m.field](cell)) if m.ops else cell.raw
         else:
-            expected = to_fact_value(pipelines[m.field](cell.raw) * m.scale_decimal)
+            expected = to_fact_value(pipelines[m.field](cell) * m.scale_decimal)
         assert f.row.value == expected, (f.row.source_ref, cell.raw)
         assert type(f.row.value) is type(expected)
 
@@ -324,9 +327,11 @@ def test_parse_source_ref_rejects_other_refs() -> None:
 def test_document_per_sheet(results: dict[str, ApplyResult]) -> None:
     planner = results["planner_forecast"]
     (doc,) = planner.documents
-    assert doc.source == "planner-forecast#Plan"
+    assert doc.source == "planner_forecast#Plan"
     assert doc.title == "planner_forecast.xlsx — Plan"
-    rows = list(csv.reader(io.StringIO(doc.text)))
+    first, body = doc.text.split("\n", 1)
+    assert first == f"# wrangle spec=planner_forecast bundle={planner.loaded.bundle_sha256}"
+    rows = list(csv.reader(io.StringIO(body)))
     assert rows[0] == ["row", "A", "B", "C", "D", "E", "F", "G"]
     assert rows[1][:2] == ["1", "Acme Components - S&OP Demand Plan"]  # title rows kept
     assert rows[2][:2] == ["2", "Units (000s)"]
@@ -343,10 +348,10 @@ def test_document_per_sheet(results: dict[str, ApplyResult]) -> None:
 
     erp = results["erp_shipments"]
     (edoc,) = erp.documents
-    path = FIXTURES / "erp_shipments.csv"
-    assert edoc.source == f"{path}#erp_shipments"  # default key: the path as passed
+    # Default key "{spec}/{file}#{sheet}": the base name, however the path was typed.
+    assert edoc.source == "erp_shipments/erp_shipments.csv#erp_shipments"
     assert edoc.title == "erp_shipments.csv — erp_shipments"
-    erows = list(csv.reader(io.StringIO(edoc.text)))
+    erows = list(csv.reader(io.StringIO(edoc.text.split("\n", 1)[1])))
     assert erows[0] == ["row", "A", "B", "C"]
     assert erows[1] == ["1", "PLANT_CD", "SHIP_DT", "QTY_SHIPPED"]
     assert erows[28][0] == "28" and erows[28][3] == "38O37"
@@ -454,6 +459,7 @@ def test_within_load_conflict_reported(project: Path) -> None:
     assert result.report["facts"] == 60 and result.report["duplicates_dropped"] == 1
     assert result.report["conflicts_within_load"] == [
         {
+            "document": "erp_shipments/erp_shipments.csv#erp_shipments",
             "key": ["Detroit Stamping 07", "shipped_units", "2025-10"],
             "cells": ["erp_shipments!C2", "erp_shipments!C63"],
         }
@@ -492,15 +498,41 @@ def test_row_level_period_reject_and_empty_reject(project: Path) -> None:
     assert rejected.report["files"][0]["empty_skipped"] == 0
 
 
-def test_two_files_in_one_load_share_duplicate_detection(project: Path) -> None:
+def test_two_files_in_one_load_dedupe_per_document(project: Path) -> None:
+    """Duplicates are dropped (and conflicts reported) within a document only. Across
+    documents every fact loads, and `add_facts` decides agreement or conflict at ingest, as
+    it would between two loads: dropping the copy's facts would leave its document with
+    none, and with a fixed key a later file's facts would be retired with nothing in their
+    place."""
     a = FIXTURES / "erp_shipments.csv"
     b = _erp_variant(project, "", name="erp_copy.csv")
     result = run(project / "specs" / "erp_shipments.yaml", [a, b])
-    # The copy is a different sheet (file stem) with identical values: every fact a duplicate.
-    assert result.report["facts"] == 59
-    assert result.report["duplicates_dropped"] == 1 + 60
-    assert len(result.files) == 2 and result.files[1].facts == []
+    assert [len(f.facts) for f in result.files] == [59, 59]
+    assert result.report["facts"] == 118
+    assert result.report["duplicates_dropped"] == 1 + 1  # Saltillo Feb 2026, in each file
+    assert result.report["conflicts_within_load"] == []
     assert len(result.rejects) == 2
+
+
+def test_two_files_with_one_document_key_are_refused(project: Path) -> None:
+    """Two planner exports under its fixed key, in one load: the second would supersede the
+    first within the load (and retire its facts), so the load is refused before any read."""
+    import openpyxl
+
+    spec = project / "specs" / "planner_forecast.yaml"
+    oct_ = project.parent / "planner_forecast.xlsx"
+    wb = openpyxl.load_workbook(oct_)
+    wb["Plan"]["D14"] = 999.0
+    nov = project.parent / "Forecast_Nov.xlsx"
+    wb.save(nov)
+    with pytest.raises(SpecMismatch, match="supersede each other") as e:
+        run(spec, [oct_, nov])
+    assert "planner_forecast#Plan" in str(e.value) and str(oct_) in str(e.value)
+
+    # The same file twice under the default key, too, however the path is typed.
+    erp = project.parent / "erp_shipments.csv"
+    with pytest.raises(SpecMismatch, match="supersede each other"):
+        run(project / "specs" / "erp_shipments.yaml", [erp, f"{erp.parent}/./{erp.name}"])
 
 
 # --- gates ----------------------------------------------------------------------------------
@@ -590,7 +622,7 @@ def test_adapter_from_spec_and_files_one_batch_per_file(project: Path) -> None:
     batches = list(adapter.batches())
     assert len(batches) == 2
     assert [len(b.documents) for b in batches] == [1, 1]
-    assert [len(b.facts) for b in batches] == [59, 0]
+    assert [len(b.facts) for b in batches] == [59, 59]
 
 
 def test_apply_to_tenant_approved(project: Path) -> None:
@@ -611,11 +643,13 @@ def test_apply_to_tenant_approved(project: Path) -> None:
     assert len([k for k in up if k[0] == "plant"]) == 5
     assert len([k for k in up if k[0] == "plant_part"]) == 9
 
-    title, text, meta = s.documents["planner-forecast#Plan"]
-    assert title == "planner_forecast.xlsx — Plan" and text.startswith("row,A,B,")
+    title, text, meta = s.documents["planner_forecast#Plan"]
+    assert title == "planner_forecast.xlsx — Plan"
+    head = f"# wrangle spec=planner_forecast bundle={loaded.bundle_sha256}\n"
+    assert text.startswith(head + "row,A,B,")
     assert meta["spec"] == "planner_forecast" and meta["bundle_sha256"] == loaded.bundle_sha256
     assert len(s.facts_added) == 35
-    assert {r.doc_id for r in s.facts_added} == {"doc:planner-forecast#Plan"}
+    assert {r.doc_id for r in s.facts_added} == {"doc:planner_forecast#Plan"}
     assert ("set_dictionary", 1) in s.calls
 
     # Unchanged re-run: nothing written, no job.
@@ -643,9 +677,9 @@ def test_reexport_with_one_changed_cell_replaces_facts(project: Path) -> None:
     result, second = apply_to_tenant(s, loaded, [second_xlsx])
     assert second is not None
     assert (second.documents_changed, second.facts, second.facts_replaced) == (1, 35, 35)
-    assert ("delete_facts_for_document", "doc:planner-forecast#Plan") in s.calls
+    assert ("delete_facts_for_document", "doc:planner_forecast#Plan") in s.calls
     assert len(s.facts_added) == 35
-    assert {r.doc_id for r in s.facts_added} == {"doc:planner-forecast#Plan@v2"}
+    assert {r.doc_id for r in s.facts_added} == {"doc:planner_forecast#Plan@v2"}
     after = {r.source_ref.split("@")[0]: r.value for r in s.facts_added}
     diff = {k for k in before if before[k] != after[k]}
     assert diff == {"Plan!D6"} and after["Plan!D6"] == 14500
@@ -700,3 +734,248 @@ def test_ingest_replace_directly_with_adapter(results: dict[str, ApplyResult]) -
     # Facts arrive with their FactRow intact apart from doc_id.
     raw = results["erp_shipments"].facts[0].row
     assert dataclasses.replace(s.facts_added[0], doc_id=None) == raw
+
+
+# --- review fixes: spec changes reload, native cells, exact values, case, XLSX sheet --------
+
+
+def test_document_text_changes_with_the_bundle(project: Path) -> None:
+    """The same bytes under a corrected spec render a different document, so the ingest makes
+    a new version and `replace` retires the facts of the wrong one."""
+    spec = project / "specs" / "legacy_report.yaml"
+    csv_path = project.parent / "legacy_report.csv"
+    _edit(spec, "    scale: 1000\n    precision: 1000\n", "    scale: 1\n")
+    wrong = run(spec, [csv_path])
+    _edit(spec, "    scale: 1\n", "    scale: 1000\n    precision: 1000\n")
+    fixed = run(spec, [csv_path])
+    assert wrong.loaded.bundle_sha256 != fixed.loaded.bundle_sha256
+    assert wrong.documents[0].source == fixed.documents[0].source
+    assert wrong.documents[0].text != fixed.documents[0].text
+
+    s = RecordingSession()
+    _, first = apply_to_tenant(s, wrong.loaded, [csv_path], draft=True)
+    assert first is not None and first.facts == 96
+    _, second = apply_to_tenant(s, fixed.loaded, [csv_path], draft=True)
+    assert second is not None
+    assert (second.documents_changed, second.facts, second.facts_replaced) == (1, 96, 96)
+    toledo = {
+        r.value
+        for r in s.facts_added
+        if r.source_ref.startswith("legacy_report!C34@") and r.field == "shipped_units"
+    }
+    assert toledo == {39900}
+
+
+def test_two_specs_over_one_file_are_two_documents(project: Path) -> None:
+    other = project / "specs" / "erp_returns.yaml"
+    text = (project / "specs" / "erp_shipments.yaml").read_text(encoding="utf-8")
+    other.write_text(
+        text.replace("spec: erp_shipments", "spec: erp_returns").replace(
+            "field: shipped_units", "field: returned_units"
+        ),
+        encoding="utf-8",
+    )
+    csv_path = project.parent / "erp_shipments.csv"
+    a = run(project / "specs" / "erp_shipments.yaml", [csv_path])
+    b = run(other, [csv_path])
+    assert a.documents[0].source == "erp_shipments/erp_shipments.csv#erp_shipments"
+    assert b.documents[0].source == "erp_returns/erp_shipments.csv#erp_shipments"
+
+    s = RecordingSession()
+    apply_to_tenant(s, a.loaded, [csv_path], draft=True)
+    _, rep = apply_to_tenant(s, b.loaded, [csv_path], draft=True)
+    assert rep is not None and rep.facts == 59 and rep.facts_replaced == 0
+
+
+def _mini_project(tmp_path: Path, spec_yaml: str) -> Path:
+    proj = tmp_path / "mini"
+    (proj / "specs").mkdir(parents=True)
+    shutil.copy(PROJECT / "dictionary.yaml", proj / "dictionary.yaml")
+    spec = proj / "specs" / "mini.yaml"
+    spec.write_text(spec_yaml, encoding="utf-8")
+    return spec
+
+
+def test_native_xlsx_cells_skip_the_text_grammar(tmp_path: Path) -> None:
+    """A European-style spec (`thousands: "."`) over an XLSX whose amounts are native numbers:
+    the native 1234.5 is 1234.5, not a reject (or 1234 for 1.234). Text cells still use the
+    declared grammar. Native date cells feed `date` and `period` without a strptime format."""
+    from datetime import datetime
+
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "S"
+    ws.append(["Item", "Month", "Quarter", "Amount"])
+    ws.append(["A", datetime(2026, 1, 15), datetime(2025, 11, 3), 1.234])
+    ws.append(["B", datetime(2026, 2, 28, 13, 30), datetime(2026, 2, 1), 1234.5])
+    ws.append(["C", "15/03/2026", datetime(2026, 3, 9), "1.234,5"])
+    ws.append(["D", datetime(2026, 4, 1), datetime(2026, 4, 1), 12.5])
+    xlsx = tmp_path / "eu.xlsx"
+    wb.save(xlsx)
+    spec = _mini_project(
+        tmp_path,
+        """spec: mini
+dictionary: ../dictionary.yaml
+source: {sheet: S, header_rows: [1]}
+entity:
+  kind: item
+  parts: [{column: Item, ops: [{op: text}], resolve: {policy: open}}]
+period:
+  column: {name: Month, ops: [{op: date, format: "%d/%m/%Y"}], grain: month}
+measures:
+  - {field: line_total_usd, column: Amount, ops: [{op: number, thousands: ".", decimal: ","}]}
+""",
+    )
+    result = run(spec, [xlsx])
+    assert result.rejects == []
+    got = {f.row.entity: (f.row.value, f.row.period_start) for f in result.facts}
+    assert got == {
+        "A": (Decimal("1.234"), date(2026, 1, 1)),
+        "B": (Decimal("1234.5"), date(2026, 2, 1)),
+        "C": (Decimal("1234.5"), date(2026, 3, 1)),  # text cell: the declared grammar
+        "D": (Decimal("12.5"), date(2026, 4, 1)),
+    }
+
+    # A first `period` op on a date cell: the op's grain and fiscal year apply to the date.
+    _edit(
+        spec,
+        '  column: {name: Month, ops: [{op: date, format: "%d/%m/%Y"}], grain: month}',
+        '  column: {name: Quarter, ops: [{op: period, pattern: "Q{q} FY{yy}", grain: quarter,'
+        " fy_start_month: 10}]}",
+    )
+    quarters = {
+        f.row.entity: (f.row.period_start, f.row.period_end) for f in run(spec, [xlsx]).facts
+    }
+    assert quarters == {
+        "A": (date(2025, 10, 1), date(2025, 12, 31)),
+        "B": (date(2026, 1, 1), date(2026, 3, 31)),
+        "C": (date(2026, 1, 1), date(2026, 3, 31)),
+        "D": (date(2026, 4, 1), date(2026, 6, 30)),
+    }
+
+    # The read-back rule is the same function.
+    grid = read_grid(xlsx, "S")
+    fn = cell_pipeline([{"op": "number", "thousands": ".", "decimal": ","}])
+    assert fn(grid.cell(3, 4)) == Decimal("1234.5")
+    assert fn(grid.cell(4, 4)) == Decimal("1234.5")
+
+
+def test_values_are_exact_and_outputs_serialise(tmp_path: Path, project: Path) -> None:
+    path = project.parent / "variant" / "erp_exact.csv"
+    path.parent.mkdir()
+    path.write_text(
+        "PLANT_CD,SHIP_DT,QTY_SHIPPED\n1007,20251031,1100.0000000000002\n"
+        "1012,20251031,0.30000000000000004\n1021,20251031,1.00000000000000000001\n",
+        encoding="utf-8",
+    )
+    result = run(project / "specs" / "erp_shipments.yaml", [path])
+    values = [f.row.value for f in result.facts]
+    assert values == [
+        Decimal("1100.0000000000002"),
+        Decimal("0.30000000000000004"),
+        Decimal("1.00000000000000000001"),
+    ]
+    paths = write_outputs(result, tmp_path / "out")
+    preview = [d["value"] for d in _jsonl(paths["preview"])]
+    # A float that reads back exactly stays a number; one that can't is a string.
+    assert preview == [1100.0000000000002, 0.30000000000000004, "1.00000000000000000001"]
+    assert Decimal(repr(preview[0])) == values[0]
+
+
+def test_open_values_differing_only_in_case_are_one_entity(tmp_path: Path) -> None:
+    csv_path = tmp_path / "items.csv"
+    csv_path.write_text(
+        "Item,Month,Total\nWidget-a,2026-01,100\nWIDGET-A,2026-01,7\n"
+        "widget-A,2026-02,5\ndetroit stamping 07,2026-01,1\n",
+        encoding="utf-8",
+    )
+    spec = _mini_project(
+        tmp_path,
+        """spec: mini
+dictionary: ../dictionary.yaml
+crosswalks:
+  plants: {path: ../crosswalks/plants.csv, kind: plant}
+source: {header_rows: [1]}
+entity:
+  kind: item
+  parts: [{column: Item, ops: [{op: text}], resolve: {policy: open}}]
+period: {column: {name: Month, ops: [{op: date, format: "%Y-%m"}], grain: month}}
+measures: [{field: line_total_usd, column: Total, ops: [{op: number}]}]
+""",
+    )
+    (spec.parent.parent / "crosswalks").mkdir()
+    shutil.copy(PROJECT / "crosswalks" / "plants.csv", spec.parent.parent / "crosswalks")
+    result = run(spec, [csv_path])
+    assert [(f.row.entity, f.row.value) for f in result.facts] == [
+        ("Widget-a", 100),
+        ("Widget-a", 7),
+        ("Widget-a", 5),
+        ("Detroit Stamping 07", 1),  # a crosswalk canonical's spelling
+    ]
+    assert result.report["entities"] == {"exact": 0, "normalised": 3, "fuzzy": 0, "new": 1}
+    assert [(e.kind, e.canonical_name) for e in result.files[0].entities] == [("item", "Widget-a")]
+    # Now one key with two values, so the within-load conflict is reported.
+    assert result.report["conflicts_within_load"] == [
+        {
+            "document": "mini/items.csv#items",
+            "key": ["Widget-a", "line_total_usd", "2026-01"],
+            "cells": ["items!C2", "items!C3"],
+        }
+    ]
+
+
+def test_composite_names_merge_casefolded(tmp_path: Path) -> None:
+    """An open part spelled two ways at one site: one composite entity, first spelling."""
+    csv_path = tmp_path / "parts.csv"
+    csv_path.write_text(
+        "Site,Part,Month,Total\nDET-07,p-1,2026-01,10\nDetroit Plt 07,P-1,2026-02,20\n"
+        "TOL-12,P-1,2026-01,30\n",
+        encoding="utf-8",
+    )
+    spec = _mini_project(
+        tmp_path,
+        """spec: mini
+dictionary: ../dictionary.yaml
+crosswalks:
+  plants: {path: ../crosswalks/plants.csv, kind: plant}
+source: {header_rows: [1]}
+entity:
+  kind: plant_part
+  parts:
+    - {column: Site, resolve: {crosswalk: plants}}
+    - {column: Part, resolve: {policy: open}}
+  template: "{0}/{1}"
+period: {column: {name: Month, ops: [{op: date, format: "%Y-%m"}], grain: month}}
+measures: [{field: line_total_usd, column: Total, ops: [{op: number}]}]
+""",
+    )
+    (spec.parent.parent / "crosswalks").mkdir()
+    shutil.copy(PROJECT / "crosswalks" / "plants.csv", spec.parent.parent / "crosswalks")
+    result = run(spec, [csv_path])
+    assert [f.row.entity for f in result.facts] == [
+        "Detroit Stamping 07/p-1",
+        "Detroit Stamping 07/p-1",
+        "Toledo Assembly 12/p-1",
+    ]
+    assert [e.canonical_name for e in result.files[0].entities] == [
+        "Detroit Stamping 07/p-1",
+        "Toledo Assembly 12/p-1",
+    ]
+
+
+def test_xlsx_without_source_sheet_is_spec_mismatch(project: Path) -> None:
+    spec = project / "specs" / "planner_forecast.yaml"
+    _edit(spec, "  sheet: Plan\n", "")
+    with pytest.raises(SpecMismatch, match="XLSX needs source.sheet"):
+        run(spec, [project.parent / "planner_forecast.xlsx"])
+
+
+def test_native_rule_applies_after_leading_text_ops() -> None:
+    from fde_kit.wrangle.apply import cell_pipeline
+    from fde_kit.wrangle.read import Cell
+
+    fn = cell_pipeline([{"op": "text"}, {"op": "number", "thousands": ".", "decimal": ","}])
+    assert fn(Cell(row=2, col=3, raw="1234.5", kind="number")) == Decimal("1234.5")
+    assert fn(Cell(row=2, col=3, raw=" 1.234,5 ", kind="text")) == Decimal("1234.5")
