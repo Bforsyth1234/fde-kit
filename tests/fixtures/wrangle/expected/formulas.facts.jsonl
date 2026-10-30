@@ -1,0 +1,2 @@
+{"entity": "Bolts", "field": "line_total_usd", "value": 240, "unit": "USD", "period_start": "2026-03-01", "period_end": "2026-03-31", "precision": null, "source_ref": "Calc!D3"}
+{"entity": "Washers", "field": "line_total_usd", "value": 1000, "unit": "USD", "period_start": "2026-03-01", "period_end": "2026-03-31", "precision": null, "source_ref": "Calc!D5"}

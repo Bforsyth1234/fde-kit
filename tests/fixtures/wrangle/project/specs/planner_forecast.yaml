@@ -1,0 +1,48 @@
+spec: planner_forecast
+version: 1
+dictionary: ../dictionary.yaml
+crosswalks:
+  plants: {path: ../crosswalks/plants.csv, kind: plant}
+
+source:
+  sheet: Plan
+  header_rows: [4, 5]
+  data_starts: 6
+  document_key: "planner-forecast#{sheet}"
+  skip_rows:
+    - {column: Site, matches: "(?i)^(sub)?total"}
+
+entity:
+  kind: plant_part
+  parts:
+    - column: Site
+      ops: [{op: text, strip: true}]
+      resolve: {crosswalk: plants, policy: closed, fuzzy: false}
+    - column: Part No
+      ops: [{op: text, strip: true, case: upper}]
+      resolve: {policy: open}
+  template: "{0}/{1}"
+
+period:
+  unpivot:
+    columns: {from: "Forecast / Nov-26", to: "Forecast / Feb-27"}
+    ops:
+      - {op: regex, pattern: "Forecast / (.+)"}
+      - {op: period, format: "%b-%y", grain: month}
+
+measures:
+  - field: demand_forecast_units
+    column: null
+    ops: [{op: number, thousands: ",", decimal: "."}]
+    scale: 1000
+    precision: 1000
+    unit: units
+    empty: skip
+
+notes: |
+  Title row 2 says "Units (000s)", hence scale 1000. Header is two rows: "Forecast" is merged
+  over the month columns, so their labels are "Forecast / Nov-26" .. "Forecast / Feb-27"; Site
+  and Part No have no upper label. The "Total" column is outside the unpivot range. A
+  "Subtotal" row follows each site and a "Total" row ends the sheet. Toledo's site is typed in
+  capitals (matches its alias after normalisation). Part numbers are upper-cased and stripped.
+  Fixed document_key: each new planner export supersedes the last.

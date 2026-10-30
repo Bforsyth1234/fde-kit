@@ -56,7 +56,9 @@ class IngestOutcome:
 class TenantSession:
     def delete_facts_for_document(self, doc_id: str) -> int:
         """Delete this tenant's facts whose doc_id is `doc_id`. Returns the count. The document
-        row itself stays, as provenance."""
+        row itself stays, as provenance. Conflict groups the deleted facts were in are
+        re-checked: one left with a single member, or whose remaining members all agree, is
+        dissolved (conflict_group_id back to NULL)."""
 ```
 
 `ingest_versioned` fills `previous_doc_id` from the `current` row it already reads.
@@ -154,9 +156,9 @@ entity:
 
 period:                               # exactly one of: column, cell, unpivot
   unpivot:
-    columns: {from: "Jan-26", to: "Dec-26"}   # header labels, inclusive, sheet order
+    columns: {from: "Forecast / Jan-26", to: "Forecast / Dec-26"}   # joined labels (§7.2), inclusive, sheet order
     # or: matching: "^[A-Z][a-z]{2}-\\d{2}$"
-    ops: [{op: period, format: "%b-%y", grain: month}]
+    ops: [{op: regex, pattern: "Forecast / (.+)"}, {op: period, format: "%b-%y", grain: month}]
   # column: {name: Ship Date, ops: [{op: date, format: "%d/%m/%Y"}], grain: month}
   # cell:   {ref: B2, ops: [{op: regex, pattern: "Period: (.+)"}, {op: period, format: "%b %Y", grain: month}]}
 
@@ -357,6 +359,25 @@ Each batch has: the crosswalk entities (kind from the crosswalk, aliases from th
 composite and `open` entities it produced, the sheet's document, the facts, and the dictionary
 entries the spec uses. `apply` calls `ingest(session, adapter, on_new_version="replace")` inside
 one `store.session(tenant)`, so the load is one transaction.
+
+### 7.6 Resolved during Wave 1 (FROZEN)
+
+- **Labels.** A column's label is its header cells top to bottom, empty ones dropped, joined with
+  `" / "`, with merged upper cells filled across. With `header_rows: [4, 5]` and an empty row-4 cell
+  over `Site`, the label is `Site`. Spec `column`, `unpivot.columns.from/to` and `blank` all
+  name joined labels, and an unpivoted cell's period ops receive its joined label.
+- **`period.column`.** Its ops end in `date`; `grain` (default `day`) then expands the date to the
+  period containing it (`parse.period_of`). Ending in `period` is also allowed, and then `grain` must
+  be absent.
+- **Whitespace.** `number`, `date` and `period` ignore surrounding whitespace; no `text` op needed.
+- **Defaults.** `number` defaults to `thousands: ","`, `decimal: "."`. A measure with no ops is a
+  text measure; numeric measures name `number`. `crosswalks` may be omitted.
+- **Reject fields.** `file` is the path as passed on the command line; `raw` is `Cell.raw` (a CSV
+  cell after unquoting; `#DIV/0!` for an error cell; `""` for `formula_no_value`); `op` is the
+  failing op's name, `"resolve"` for an entity that didn't resolve and `"read"` for an error or
+  `formula_no_value` cell. Reasons for read failures are `"error cell"` and `"formula without
+  cached value"`; others are `ParseError.reason` or `unknown entity` / `ambiguous entity`.
+- **Duplicates.** "First kept" means the first row's cell is the fact's `source_ref`.
 
 ## 8. Gates (FROZEN)
 

@@ -121,6 +121,8 @@ class IngestOutcome:
     changed: bool
     """False = identical hash, nothing written."""
     content_hash: str
+    previous_doc_id: str | None = None
+    """The version this one superseded; None for a first version or an unchanged re-ingest."""
 
 
 @dataclass
@@ -475,7 +477,8 @@ class TenantSession:
         - same source, new hash: a new row at version max+1 with the body, the previous current
           row's `superseded_by` pointed at it, the previous version's chunks deleted (search
           only ever sees current chunks) and this tenant's cache cleared. The old row stays as
-          provenance, so an old citation's doc_id + content_hash still resolves.
+          provenance, so an old citation's doc_id + content_hash still resolves. Its doc_id is
+          the outcome's `previous_doc_id`.
         """
         digest = content_hash(text)
         current = self.conn.execute(
@@ -532,7 +535,9 @@ class TenantSession:
             )
         # Anything cached for this tenant may now be stale.
         self.conn.execute(self.sql("DELETE FROM @cache"))
-        outcome = IngestOutcome(doc_id, version, True, digest)
+        outcome = IngestOutcome(
+            doc_id, version, True, digest, current[0] if current is not None else None
+        )
         self.last_ingest = outcome
         return outcome
 
@@ -669,6 +674,48 @@ class TenantSession:
             assert row is not None
             out.append(row[0])
         return out
+
+    def delete_facts_for_document(self, doc_id: str) -> int:
+        """Delete this tenant's facts whose doc_id is `doc_id`. Returns the count. The document
+        row itself stays, as provenance.
+
+        `ingest(..., on_new_version="replace")` calls it with a superseded version's doc_id, so
+        a re-export replaces its own facts instead of conflicting with them.
+
+        Conflict groups the deleted facts belonged to are re-checked. A group that is left with
+        one member, or whose remaining members now all agree (by `values_agree`), is dissolved:
+        its facts' conflict_group_id goes back to NULL. Otherwise a fact that only disagreed with
+        the superseded version would still be reported as conflicting."""
+        rows = self.conn.execute(
+            self.sql(
+                "DELETE FROM @facts WHERE doc_id = %s::uuid "
+                "RETURNING conflict_group_id::text"
+            ),
+            (doc_id,),
+        ).fetchall()
+        groups = sorted({r[0] for r in rows if r[0]})
+        for group in groups:
+            members = self.conn.execute(
+                self.sql(
+                    "SELECT value_num, value_text, precision FROM @facts "
+                    "WHERE conflict_group_id = %s::uuid"
+                ),
+                (group,),
+            ).fetchall()
+            values = [(n if n is not None else t, p) for n, t, p in members]
+            if all(
+                values_agree(a, pa, b, pb)
+                for i, (a, pa) in enumerate(values)
+                for b, pb in values[i + 1 :]
+            ):
+                self.conn.execute(
+                    self.sql(
+                        "UPDATE @facts SET conflict_group_id = NULL "
+                        "WHERE conflict_group_id = %s::uuid"
+                    ),
+                    (group,),
+                )
+        return len(rows)
 
     def facts(self, entity: str | None = None, field: str | None = None) -> list[Fact]:
         """This tenant's facts, optionally for one entity (canonical name or alias) and/or one
