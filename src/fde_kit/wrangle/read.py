@@ -25,11 +25,14 @@ import csv
 import datetime as dt
 import hashlib
 import io
+import posixpath
 import re
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import IO, Literal
 
 CellKind = Literal["empty", "text", "number", "date", "bool", "error", "formula_no_value"]
 
@@ -188,33 +191,138 @@ def _xlsx_cell(row: int, col: int, value: object, is_formula: bool) -> Cell:
     return Cell(row, col, text, "empty" if not text.strip() else "text")
 
 
-def _read_xlsx(p: Path, sheet: str | None, sha: str) -> Grid:
-    """Stream one sheet's XML once.
+_MAIN_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_PKG_RELS_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+_DOC_RELS_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_OFFICE_DOCUMENT_REL = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
+)
 
-    The workbook is opened `read_only=True, data_only=True`, which parses the shared strings and
-    styles but no sheet; then only the requested sheet is parsed, by openpyxl's own sheet parser,
-    so cell values are exactly what `load_workbook(data_only=True)` gives. The same pass notes the
-    cells that hold a formula but no cached value (`<f>` with no or an empty `<v>`) and the
-    sheet's `<mergeCells>`, which read-only worksheets don't expose. Memory is the grid itself,
-    not openpyxl's worksheet model, and nothing is read twice.
+
+def _rels_path(part: str) -> str:
+    """ "xl/workbook.xml" -> "xl/_rels/workbook.xml.rels"."""
+    folder, name = posixpath.split(part)
+    return posixpath.join(folder, "_rels", name + ".rels")
+
+
+def _rel_targets(zf: zipfile.ZipFile, part: str) -> dict[str, tuple[str, str]]:
+    """Relationship id -> (type, zip member path) for one part's `.rels`; {} if it has none."""
+    try:
+        data = zf.read(_rels_path(part))
+    except KeyError:
+        return {}
+    out = {}
+    base = posixpath.dirname(part)
+    for rel in ET.fromstring(data).iter(f"{_PKG_RELS_NS}Relationship"):
+        if rel.get("TargetMode") == "External":
+            continue
+        target = rel.get("Target", "")
+        # A target starting with "/" is relative to the package root, otherwise to the part.
+        joined = target.lstrip("/") if target.startswith("/") else posixpath.join(base, target)
+        out[rel.get("Id", "")] = (rel.get("Type", ""), posixpath.normpath(joined))
+    return out
+
+
+def _sheet_xml_path(zf: zipfile.ZipFile, sheet: str) -> str:
+    """The zip member holding `sheet`'s XML: sheet name -> r:id in the workbook part ->
+    relationship target. File names (`sheet3.xml`) need not follow sheet order."""
+    workbook = next(
+        (t for typ, t in _rel_targets(zf, "").values() if typ == _OFFICE_DOCUMENT_REL),
+        "xl/workbook.xml",
+    )
+    rels = _rel_targets(zf, workbook)
+    for el in ET.fromstring(zf.read(workbook)).iter(f"{_MAIN_NS}sheet"):
+        if el.get("name") == sheet:
+            rid = el.get(f"{_DOC_RELS_NS}id")
+            if rid in rels:
+                return rels[rid][1]
+            break
+    raise ValueError(f"no worksheet part found for sheet {sheet!r}")
+
+
+def _row_number(r: str) -> int:
+    """A `<row r="..">`, read as openpyxl does ("3", or a whole float like "3.0")."""
+    try:
+        return int(r)
+    except ValueError:
+        val = float(r)
+        if not val.is_integer():
+            raise ValueError(f"{r} is not a valid row number") from None
+        return int(val)
+
+
+def _scan_sheet_xml(
+    src: IO[bytes],
+) -> tuple[set[tuple[int, int]], list[tuple[int, int, int, int]]]:
+    """One streaming pass over a sheet's XML for what read-only openpyxl doesn't expose: the
+    cells that hold a formula but no cached value (`<f>`, shared formulas' empty `<f t="shared"
+    si=".."/>` included, with no or an empty `<v>`), and the `<mergeCells>` ranges.
+
+    Cell coordinates follow openpyxl's parser exactly, including rows and cells written without
+    an `r` attribute (numbered on from the previous one), so both passes agree on every cell.
+    """
+    from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
+
+    no_value: set[tuple[int, int]] = set()
+    merged: list[tuple[int, int, int, int]] = []
+    c_tag, row_tag, f_tag, v_tag = (f"{_MAIN_NS}{t}" for t in ("c", "row", "f", "v"))
+    merge_tag, data_tag = f"{_MAIN_NS}mergeCell", f"{_MAIN_NS}sheetData"
+    sheet_data = None
+    row = 0
+    for event, el in ET.iterparse(src, events=("start", "end")):
+        if event == "start":
+            if el.tag == data_tag:
+                sheet_data = el
+            continue
+        tag = el.tag
+        if tag == row_tag:
+            # A row's cells are read when the row ends; then the row is dropped.
+            r = el.get("r")
+            row = row + 1 if r is None else _row_number(r)
+            col = 0  # the previous cell's column, as openpyxl counts it
+            last_ref = None  # ... or the previous cell's `r`, parsed only when needed
+            for c in el:
+                if c.tag != c_tag:
+                    continue
+                ref = c.get("r")
+                if ref:
+                    last_ref = ref
+                else:
+                    if last_ref is not None:
+                        col = coordinate_to_tuple(last_ref)[1]
+                        last_ref = None
+                    col += 1
+                if c.find(f_tag) is not None and not c.findtext(v_tag):
+                    no_value.add(coordinate_to_tuple(ref) if ref else (row, col))
+            el.clear()
+            if sheet_data is not None:
+                sheet_data.clear()
+        elif tag == merge_tag:
+            ref = el.get("ref")
+            if ref:
+                min_col, min_row, max_col, max_row = range_boundaries(ref)
+                merged.append((min_row, min_col, max_row, max_col))
+    return no_value, merged
+
+
+def _read_xlsx(p: Path, sheet: str | None, sha: str) -> Grid:
+    """Two streaming passes over the requested sheet only, both on public or standard APIs.
+
+    1. Values: `openpyxl.load_workbook(read_only=True, data_only=True)` and `iter_rows` on the
+       one sheet, so values are exactly what openpyxl's `data_only` load gives (dates from the
+       number formats, shared strings, errors as text). The declared `<dimension>` is ignored
+       (`reset_dimensions`): writers get it wrong, and it would truncate or pad the rows.
+    2. A stdlib `iterparse` of the same sheet XML (found through the workbook's relationships)
+       for formula cells without a cached value and the `<mergeCells>`, which read-only
+       worksheets don't expose. A formula with no cached value reads as `None` in pass 1, the
+       same as an empty cell; pass 2 is what tells them apart.
+
+    Memory is the grid itself, not openpyxl's worksheet model.
     """
     try:
         import openpyxl
-        from openpyxl.utils.cell import range_boundaries
-        from openpyxl.worksheet._reader import FORMULA_TAG, WorkSheetParser
     except ImportError as e:  # pragma: no cover - depends on the install
         raise ImportError("reading XLSX needs openpyxl: pip install 'fde-kit[wrangle]'") from e
-
-    class _Parser(WorkSheetParser):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.no_cached_value: set[tuple[int, int]] = set()
-
-        def parse_cell(self, element):
-            cell = super().parse_cell(element)
-            if cell["value"] is None and element.find(FORMULA_TAG) is not None:
-                self.no_cached_value.add((cell["row"], cell["column"]))
-            return cell
 
     wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
     try:
@@ -223,32 +331,26 @@ def _read_xlsx(p: Path, sheet: str | None, sha: str) -> Grid:
         if name not in names:
             raise ValueError(f"{p.name} has no sheet {name!r}; available sheets: {names}")
         ws = wb[name]
-        if not hasattr(ws, "_get_source"):  # a chartsheet
+        if ws not in wb.worksheets:  # a chartsheet
             raise ValueError(f"{p.name}: sheet {name!r} is not a worksheet")
-        sparse: dict[tuple[int, int], Cell] = {}
-        with ws._get_source() as src:
-            parser = _Parser(
-                src,
-                ws._shared_strings,
-                data_only=True,
-                epoch=wb.epoch,
-                date_formats=wb._date_formats,
-                timedelta_formats=wb._timedelta_formats,
-            )
-            for _, row in parser.parse():
-                for c in row:
-                    r_idx, c_idx = c["row"], c["column"]
-                    sparse[(r_idx, c_idx)] = _xlsx_cell(
-                        r_idx, c_idx, c["value"], (r_idx, c_idx) in parser.no_cached_value
-                    )
-            merge_refs = parser.merged_cells.mergeCell if parser.merged_cells else []
+        ws.reset_dimensions()
+        values: dict[tuple[int, int], object] = {}
+        for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            for c_idx, value in enumerate(row, start=1):
+                if value is not None:
+                    values[(r_idx, c_idx)] = value
     finally:
         wb.close()
 
-    merged = []
-    for mc in merge_refs:
-        min_col, min_row, max_col, max_row = range_boundaries(mc.ref)
-        merged.append((min_row, min_col, max_row, max_col))
+    with zipfile.ZipFile(p) as zf, zf.open(_sheet_xml_path(zf, name)) as src:
+        no_value, merged = _scan_sheet_xml(src)
+
+    sparse = {k: _xlsx_cell(k[0], k[1], v, False) for k, v in values.items()}
+    for r_idx, c_idx in no_value:
+        if (r_idx, c_idx) not in values:
+            sparse[(r_idx, c_idx)] = Cell(r_idx, c_idx, "", "formula_no_value")
+
+    for min_row, min_col, max_row, max_col in merged:
         # As openpyxl's full model does: only the top-left cell of a merged range keeps a value.
         if (max_row - min_row + 1) * (max_col - min_col + 1) <= len(sparse):
             for r_idx in range(min_row, max_row + 1):

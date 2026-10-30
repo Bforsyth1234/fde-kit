@@ -132,7 +132,8 @@ crosswalks:
   plants: {path: ../crosswalks/plants.csv, kind: plant}
 
 source:
-  sheet: Plan                         # XLSX: required (an XLSX file without it: SpecMismatch); CSV: omit
+  sheet: Plan                         # XLSX: this or `sheets` (an XLSX file with neither: SpecMismatch); CSV: omit
+  # sheets: {matching: "^\\d{4}$", exclude: ["2026"]}   # or a list: ["2024", "2025"]; see §7.4
   header_rows: [4, 5]                 # 1-based; several are joined "Upper / Lower"
   data_starts: 6                      # default: the row after the last header row
   header_fingerprint: 9c1e2b7a55f0    # optional; apply fails on a mismatch unless --force
@@ -153,7 +154,10 @@ entity:
       resolve: {crosswalk: plants, policy: closed, fuzzy: false}
     - column: Part No
       ops: [{op: text, strip: true, case: upper}]
-      resolve: {policy: open}
+      resolve:
+        policy: open
+        similar_warn: 90              # open parts: warn on near-duplicate names (§7.3); 0 = off
+        not_same: [["P-1234", "P-1243"]]   # reviewed pairs that are different: never warned
   template: "{0}/{1}"                 # default "{0}" for one part
 
 period:                               # exactly one of: column, cell, unpivot
@@ -188,11 +192,18 @@ Validation beyond types: unpivot excludes `measure.column` (and vice versa); eve
 field and crosswalk named exists; a regex compiles and has exactly one group when a later op
 needs its output; `template` placeholders match `parts`; there is at most one unpivot;
 `start_after`/`stop_before` regexes compile; `nulls` entries are non-blank, unpadded and
-distinct; a `period.column.name` list is non-empty with no column twice.
+distinct; a `period.column.name` list is non-empty with no column twice; at most one of
+`sheet` and `sheets`; a `sheets` list is non-empty with no sheet twice, a `sheets.matching`
+regex compiles and `sheets.exclude` names no sheet twice; `similar_warn` is 0..100; a
+`not_same` entry is two different strings and no pair is listed twice (in either order).
+Whether a file is XLSX or CSV is known only at apply, so "neither for CSV" and "one of them for
+XLSX" are `SpecMismatch`es there (§7.4).
 
-**Bundle hash and later settings.** `start_after`, `stop_before` and `nulls` enter the bundle
-hash only when set (a non-empty `nulls`), so a spec that doesn't use them hashes exactly as it
-did before they existed and its approval stays valid. Setting one is an edit like any other.
+**Bundle hash and later settings.** `start_after`, `stop_before`, `sheets`, `nulls`,
+`not_same` and `similar_warn` enter the bundle hash only when set (a non-empty `nulls` or
+`not_same`; a `similar_warn` other than the default 90), so a spec that doesn't use them hashes
+exactly as it did before they existed and its approval stays valid. Setting one is an edit like
+any other: reviewing a warning pair into `not_same` needs a re-approval.
 
 **Text values.** A measure whose last op is `text` or `map` produces a text fact (`value_text`).
 `precision` with a text measure is a validation error.
@@ -239,10 +250,13 @@ class Grid:
     merged: list[tuple[int, int, int, int]]
 ```
 
-- XLSX via `openpyxl.load_workbook(read_only=True, data_only=True)`, then one streaming pass of
-  openpyxl's sheet parser over the requested sheet only: cell values are what the full model
-  gives, and the same pass records formula cells with no cached value and the sheet's
-  `<mergeCells>` (a 25k-row sheet of a 19 MB workbook: 1 s and 125 MB, was 76 s and 2.8 GB).
+- XLSX via `openpyxl.load_workbook(read_only=True, data_only=True)` and `iter_rows` on the
+  requested sheet only, so cell values are what the full model gives; then a stdlib streaming
+  pass (`zipfile` + `ElementTree.iterparse`) over the same sheet's XML, found through
+  `xl/workbook.xml` and its relationships, records formula cells with no cached value and the
+  sheet's `<mergeCells>`, which read-only openpyxl doesn't expose. Public API only, no version
+  pin (a 25k-row sheet of a 19 MB workbook: 1.3 s and 128 MB, was 76 s and 2.8 GB with the full
+  model).
   A formula cell whose cached value is `None` is `formula_no_value`, and is a reject wherever a
   spec reads it, **never** a 0.
   `#N/A`, `#REF!` and the like are `error`.
@@ -317,16 +331,63 @@ Parts with no crosswalk are `open`. Composite canonical = `template` filled with
 canonical of each part; composites are compared casefolded the same way. False merges cost more than misses, which is why fuzzy is off by
 default and the margin rule exists.
 
+**Possible-duplicate warnings (never merges).** Open values are their own canonicals, so one
+thing spelled two ways becomes two entities. After a load's rows are resolved, for each entity
+part with policy `open`, the distinct new canonicals of that part (not crosswalk canonicals,
+and only names on a row that loaded at least one fact) are compared pairwise, per part and
+never as the composite string (`Springfield/A` vs `Springfield/B` is two different parts).
+A part is compared only within the values of the parts to its left, read as a hierarchy:
+counties within one state, never Johnson County KS against Johnston County NC. Each report
+entry then carries `within` (those left parts); `similar.csv` has a `within` column.
+
+- pairs with the same `norm_key` but different text are always reported, score 100, reason
+  `same apart from punctuation/spacing` (`Beer, wine, and liquor stores` /
+  `Beer, wine and liquor stores`);
+- pairs whose rapidfuzz `fuzz.ratio` on a casefolded, NFKC, whitespace-collapsed form
+  (`resolve.similar_key`) is ≥ `resolve.similar_warn` (default 90; 0 turns this half off) are
+  reported with reason `similar spelling`.
+
+`ratio` (normalised Indel similarity of the whole strings) is chosen over `token_set_ratio`,
+`partial_ratio` and `WRatio` because those score a name contained in another 100, and real
+tables list parents beside children (`Clothing stores` / `Men's clothing stores`), which would
+flood the report with pairs that are certainly different. The cost: short names one letter
+apart (`Lee County` / `Lea County`) fire. `resolve.not_same: [[a, b], ...]` (exact strings,
+either order) drops pairs a person reviewed and found different. The pairwise pass is
+`rapidfuzz.process.cdist` with `score_cutoff`, in 512-row chunks, when numpy is importable,
+else `process.extract_iter` per name with the same scorer and cutoff (same pairs; the wrangle
+extra doesn't pull in numpy). 1,882 distinct county names: 0.04 s with cdist, 0.13–0.17 s
+without.
+
+Warnings never change a fact, a count, the reject rate or the gate. They are in the report as
+`similar_entities` (§7.4), printed by `dry-run` / `apply` (top 20), and written to
+`similar.csv`.
+
 ### 7.4 Apply — `wrangle/apply.py`
 
 `run(spec_path, files) -> ApplyResult` is pure (no database). It is the dry run, and the adapter
 calls it too.
 
-Before any file is read, each file's `document_key` is rendered (§7.4, documents). Two files
+Before any file is read, each unit's `document_key` is rendered (§7.4, documents). Two units
 with the same rendered key in one load → `SpecMismatch`: one would supersede the other within
 the load.
 
-For each file → `Grid` (the sheet named by the spec):
+**Units.** A unit is a CSV file, an XLSX file's `source.sheet`, or one sheet of a
+`source.sheets` selection. `sheets: {matching: <regex>, exclude: [names]}` selects every
+worksheet whose name matches (`re.search`) and isn't excluded; `sheets: [names]` selects those
+sheets. Either way they run in **workbook order**, and opening the workbook to list them is the
+first step of the load (`apply.unit_sheets`). A selection that matches no sheet, a listed or
+excluded name the workbook doesn't have, an XLSX with neither `sheet` nor `sheets`, or a CSV
+with either → `SpecMismatch`. Each selected sheet is a unit exactly as a one-sheet file is: its
+own document (so `document_key` should use `{sheet}`, as the default does: without it every
+sheet renders one key, a `SpecMismatch`), its own entry in the report's `files`, its own
+rejects (which carry `sheet`), and its own duplicate and within-load conflict scope. Any
+check below that fails on one sheet (fingerprint, a missing column, a section bound, no
+unpivot label) refuses the **whole load**, and the message names the sheet:
+`mrtssales92-present.xlsx sheet '2026': skip_rows blank column 'TOTAL' is not a column; …`.
+`header_fingerprint` with several sheets is checked against each one (normally omit it: sheets
+of different years have different month labels).
+
+For each unit → `Grid` (the sheet named by the spec, or the selected sheet):
 
 1. Check `header_fingerprint` if set. Mismatch → `SpecMismatch` (whole file refused, not rejects).
 2. Build column labels from `header_rows`. A spec column name not found → `SpecMismatch`.
@@ -423,8 +484,16 @@ distinct fields.
  "entities": {"exact": 388, "normalised": 22, "fuzzy": 0, "new": 0},
  "conflicts_within_load": [{"document": "planner_forecast#Plan",
                             "key": ["DET-07/P-1234", "demand_forecast_units", "2026-03"],
-                            "cells": ["Plan!G42", "Plan!G97"]}]}
+                            "cells": ["Plan!G42", "Plan!G97"]}],
+ "similar_entities": [{"part": "Part No", "kind": "plant_part", "a": "P-1234", "b": "P1234",
+                       "score": 100.0, "reason": "same apart from punctuation/spacing",
+                       "cells": ["Plan!B9", "Plan!B31"]}]}
 ```
+
+`files` has one entry per unit (§7.4, units): with `source.sheets`, one per selected sheet, in
+workbook order. `similar_entities` (§7.3) is sorted by score descending, then `a`, then `b`;
+`a` < `b`, and `cells` are the first cell each name was read from (on a row that loaded a
+fact). It is empty when nothing fires and never affects the other keys.
 
 `reject rate = rejects.total / (facts + rejects.total)`. Rows skipped by rule and empty skips
 are not in the denominator.
@@ -471,6 +540,13 @@ one `store.session(tenant)`, so the load is one transaction.
   entries always carry `null_skipped` (`{}` when nothing matched) and carry `section` only when
   the spec sets a bound. The join separator for multi-column periods is `-`
   (`spec.PERIOD_JOIN`).
+- **Later additions (second pass).** `source.sheets` (§7.4, units) came from Census retail's 35
+  year sheets, now one spec (`real/project/specs/mrts_all_nsa.yaml`); `resolve.similar_warn` /
+  `not_same` and the report's `similar_entities` (§7.3) from the same file naming one line two
+  ways. `SpecMismatch` has a `sheet` attribute (None unless the spec uses `sheets`).
+  `write_outputs` also writes `similar.csv`
+  (`part,kind,a,b,score,reason,cell_a,cell_b`). An XLSX spec with `source.sheet` over a CSV file
+  is now a `SpecMismatch` (it was ignored).
 
 ## 8. Gates (FROZEN)
 
@@ -479,9 +555,13 @@ Apply refuses, writing nothing, and exits 1 when:
 - the spec has no `approval`, or `approval.bundle_sha256` ≠ the current bundle hash, unless
   `--draft` (draft loads are tagged `wrangle-draft:` in the job kind)
 - reject rate > `--max-reject-rate` (default 0.02)
-- any file raises `SpecMismatch` (unless `--force` for the fingerprint check only), including two
-  files whose `document_key` renders the same and an XLSX file under a spec with no
-  `source.sheet`
+- any file, or any one sheet of a `source.sheets` selection, raises `SpecMismatch` (unless
+  `--force` for the fingerprint check only), including two units whose `document_key` renders
+  the same, an XLSX file under a spec with neither `source.sheet` nor `source.sheets`, a CSV
+  under a spec with either, and a `sheets` selection that matches nothing or names a missing
+  sheet
+
+Possible-duplicate warnings (§7.3) never gate.
 
 The rejects file and the report are written either way, so a refused load always says why.
 
@@ -494,7 +574,7 @@ New top-level group in `cli.py`. `profile`, `check`, `dry-run` and `approve` nee
 ```
 fde wrangle profile FILE [--sheet S] [--json]
 fde wrangle check SPEC                  # validate the spec + crosswalks, print the bundle hash
-fde wrangle dry-run SPEC FILE... [--out DIR]   # report.json, rejects.jsonl, facts.preview.jsonl (first 50), crosswalk.proposed.csv
+fde wrangle dry-run SPEC FILE... [--out DIR]   # report.json, rejects.jsonl, facts.preview.jsonl (first 50), crosswalk.proposed.csv, similar.csv
 fde wrangle approve SPEC --by NAME      # stamps approval; refuses if `check` fails
 fde wrangle apply SPEC FILE... --tenant T [--max-reject-rate 0.02] [--draft] [--force] [--out DIR] [--url URL] [--embedder E]
 ```
@@ -502,6 +582,10 @@ fde wrangle apply SPEC FILE... --tenant T [--max-reject-rate 0.02] [--draft] [--
 `profile` prints a rich summary: header rows, columns with type and formats, skip candidates,
 unpivot candidates, scale hints, keys. `--json` prints the model. Exit codes follow the rest of
 the CLI: 0 ok, 1 refused or failed, 2 bad arguments.
+
+`dry-run` and `apply` print a row per unit (one per sheet with `source.sheets`), then
+`conflicts within load: N` and `possible duplicate entities: N`, each with its first 20 lines
+(the rest are in `report.json` / `similar.csv` with `--out`).
 
 ## 10. Fixtures (FROZEN layout) — `tests/fixtures/wrangle/`
 
@@ -526,11 +610,15 @@ that's the case worth testing. `make_fixtures.py` documents the `soffice --headl
 
 `real/` holds US government files (see its README; `SHA256SUMS` pins them) and
 `real/project/` a dictionary and one spec per load: `state_pop`, `eia_residential`,
-`eia_transport`, `county_pop`, `mrts_2024_nsa`, `mrts_2024_sa`, `generation_ct_ri`.
+`eia_transport`, `county_pop`, `mrts_2024_nsa`, `mrts_2024_sa`, `generation_ct_ri`, and
+`mrts_all_nsa` (`source.sheets`: the NOT ADJUSTED table of all 35 year sheets, 25,207 facts,
+each checked against its own sheet).
 `tests/test_wrangle_real.py` runs each and checks **every** fact against an independent read of
 the file (openpyxl or `csv`, not the wrangle reader or ops), the report's counts (0 rejects,
 0 conflicts, `null_skipped`, and the 12 justified `duplicates_dropped` in MRTS NSA where NAICS
-4522 and 45221 are both "Department stores"), and hand-checked anchors.
+4522 and 45221 are both "Department stores"), and hand-checked anchors. The specs' reviewed
+`not_same` pairs are tested too: as committed no spec warns, and with `not_same` removed the
+exact pairs fire.
 
 ## 11. Tests
 

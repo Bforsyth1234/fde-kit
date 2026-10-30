@@ -27,7 +27,18 @@ import pytest
 
 openpyxl = pytest.importorskip("openpyxl")
 
-from fde_kit.wrangle.apply import ApplyResult, gate, parse_source_ref, run  # noqa: E402
+from fde_kit.wrangle.apply import (  # noqa: E402
+    ApplyResult,
+    SpecMismatch,
+    gate,
+    parse_source_ref,
+    run,
+)
+from fde_kit.wrangle.resolve import (  # noqa: E402
+    SAME_BUT_PUNCTUATION,
+    SIMILAR_SPELLING,
+    similar_names,
+)
 
 REAL = Path(__file__).parent / "fixtures" / "wrangle" / "real"
 SPECS = REAL / "project" / "specs"
@@ -191,6 +202,41 @@ def _mrts(fld: str, adjusted: bool) -> Oracle:
     return o
 
 
+_MONTH_LABEL = re.compile(r"^([A-Z][a-z]{2})\.? (\d{4})(\(p\))?$")  # "Aug. 2026(p)"
+
+
+def _mrts_year(ws, sheet: str, fld: str, adjusted: bool) -> Oracle:
+    """One year sheet's NOT ADJUSTED (or ADJUSTED) table, read directly: the table bounds by
+    their column-B markers, the months by their row-5 labels (TOTAL, CY CUM and PY CUM are not
+    months), footnote marks dropped from the names, `(S)` / `(NA)` counted as placeholders."""
+    o = Oracle(fld, "USD", scale=1_000_000, sheet=sheet)
+    assert "millions of dollars" in ws["A2"].value, sheet
+    kinds = {r: ws.cell(r, 2).value for r in range(1, ws.max_row + 1)}
+    nsa = next(r for r, v in kinds.items() if v == "NOT ADJUSTED")
+    sa = next(r for r, v in kinds.items() if v == "ADJUSTED(2)")
+    months = {}
+    for c in range(3, ws.max_column + 1):
+        text = ws.cell(5, c).value
+        m = _MONTH_LABEL.match(text) if isinstance(text, str) else None
+        if m:
+            assert int(m[2]) == int(sheet), (sheet, text)
+            months[c] = (_month(int(m[2]), MONTHS[m[1]]), text)
+    rows = range(sa + 1, ws.max_row + 1) if adjusted else range(nsa + 1, sa)
+    for r in rows:
+        kind = kinds[r]
+        if not isinstance(kind, str) or not kind.strip() or ws.cell(r, 3).value is None:
+            continue  # below the adjusted table: blank rows and footnotes in column A
+        entity = re.sub(r"\(\d+\)$", "", kind)  # `GAFO(1)`
+        for c, (period, text) in months.items():
+            v = ws.cell(r, c).value
+            if isinstance(v, str):
+                assert v in ("(S)", "(NA)"), (sheet, f"{_letter(c)}{r}", v)
+                o.nulls[v] += 1
+                continue
+            o.add(entity, period, f"{_letter(c)}{r}", v, text)
+    return o
+
+
 def oracle_mrts_2024_nsa() -> Oracle:
     return _mrts("retail_sales_nsa", adjusted=False)
 
@@ -211,6 +257,13 @@ def oracle_generation_ct_ri() -> Oracle:
 
 
 ORACLES = {name: globals()[f"oracle_{name}"] for name in SOURCES}
+
+
+def oracle_mrts_all_nsa() -> dict[str, Oracle]:
+    """Every sheet of the workbook, in workbook order: each must be a year and is one unit."""
+    wb = openpyxl.load_workbook(REAL / SOURCES["mrts_2024_nsa"], data_only=True)
+    assert all(re.fullmatch(r"\d{4}", n) for n in wb.sheetnames), wb.sheetnames
+    return {n: _mrts_year(wb[n], n, "retail_sales_nsa", adjusted=False) for n in wb.sheetnames}
 
 
 # --- running the specs ----------------------------------------------------------------------
@@ -401,3 +454,185 @@ def test_without_sections_mrts_tables_conflict(project_copy: Path) -> None:
     result = run(spec, [REAL / SOURCES["mrts_2024_nsa"]])
     # The adjusted table's values load under the same keys: one conflict per line and month.
     assert len(result.report["conflicts_within_load"]) > 300
+
+
+# --- all 35 year sheets in one spec (source.sheets) -----------------------------------------
+
+
+@pytest.fixture(scope="module")
+def all_nsa() -> ApplyResult:
+    return run(SPECS / "mrts_all_nsa.yaml", [REAL / SOURCES["mrts_2024_nsa"]])
+
+
+@pytest.fixture(scope="module")
+def all_nsa_oracle() -> dict[str, Oracle]:
+    return oracle_mrts_all_nsa()
+
+
+def test_all_years_one_unit_per_sheet(all_nsa: ApplyResult, all_nsa_oracle) -> None:
+    rep = all_nsa.report
+    sheets = [f.sheet for f in all_nsa.files]
+    assert sheets == list(all_nsa_oracle) == [str(y) for y in range(2026, 1991, -1)]
+    assert [d.source for d in all_nsa.documents] == [
+        f"mrts_all_nsa/mrtssales92-present.xlsx#{s}" for s in sheets
+    ]
+    assert rep["rejects"] == {"total": 0, "rate": 0.0, "by_reason": {}}, all_nsa.rejects[:5]
+    assert rep["conflicts_within_load"] == []
+    assert gate(all_nsa, draft=True) == []
+    for f in rep["files"]:
+        o = all_nsa_oracle[f["sheet"]]
+        assert f["null_skipped"] == dict(sorted(o.nulls.items())), f["sheet"]
+        assert f["empty_skipped"] == 0
+        assert f["section"] == {"start_after_row": 6, "stop_before_row": 71}
+        assert f["rows_read"] == 64
+    assert rep["facts"] == sum(len({k for k in o.cells}) for o in all_nsa_oracle.values())
+    assert rep["facts"] == 25_207
+    # Department stores twice per sheet (NAICS 4522 and 45221): 12 a year, 8 in 2026 so far.
+    assert all_nsa.duplicates_dropped == sum(o.duplicates for o in all_nsa_oracle.values())
+    assert all_nsa.duplicates_dropped == 34 * 12 + 8
+
+
+def test_all_years_every_fact_matches_its_sheet(all_nsa: ApplyResult, all_nsa_oracle) -> None:
+    for fr in all_nsa.files:
+        o = all_nsa_oracle[fr.sheet]
+        got: dict[tuple[str, date, date], tuple[str, object]] = {}
+        for rec in fr.facts:
+            row = rec.fact.row
+            assert row.field == o.field and row.unit == o.unit and row.precision == o.scale
+            ref = parse_source_ref(row.source_ref)
+            assert ref["sheet"] == fr.sheet and f"{ref['sheet']}!{ref['cell']}" == rec.cell
+            assert ref["spec"] == "mrts_all_nsa" and ref["file"] == fr.file_sha256[:12]
+            assert rec.fact.document_source.endswith(f"#{fr.sheet}")
+            key = (row.entity, row.period_start, row.period_end)
+            assert key not in got, (fr.sheet, key)
+            got[key] = (ref["cell"], row.value)
+            assert rec.period_from == o.period_from[ref["cell"]], rec.cell
+        missing, extra = sorted(set(o.cells) - set(got)), sorted(set(got) - set(o.cells))
+        assert not missing and not extra, (fr.sheet, missing[:3], extra[:3])
+        for key, cells in o.cells.items():
+            first_ref, want = cells[0]
+            ref, value = got[key]
+            assert ref == first_ref and Decimal(value) == want, (fr.sheet, key, ref, value)
+            assert all(v == want for _, v in cells[1:]), (fr.sheet, key, cells)
+        assert fr.null_skipped == dict(o.nulls)
+
+
+def test_all_years_no_category_drift(all_nsa: ApplyResult) -> None:
+    """The 1990s sheets carry the same 63 kinds of business as 2026 (the workbook was
+    re-tabulated on one NAICS basis), so one entity column serves every year."""
+    by_sheet = {f.sheet: {r.fact.row.entity for r in f.facts} for f in all_nsa.files}
+    names = set().union(*by_sheet.values())
+    assert len(names) == 63
+    # What does drift is which lines have any value: a line whose every month that year is a
+    # placeholder loads no fact. `(NA)` lines are series that start in 2001; `(S)` lines are
+    # suppressed for whole recent years. Every other line loads in every sheet.
+    absent = {n: {int(s) for s in by_sheet if n not in by_sheet[s]} for n in names}
+    nineties = set(range(1992, 2001))
+    assert {n: years for n, years in absent.items() if years} == {
+        "Other clothing stores": nineties,
+        "Paint and wallpaper stores": nineties,
+        "Supermarkets and other grocery (except convenience) stores": nineties,
+        "All other home furnishings stores": nineties | set(range(2021, 2027)),
+        "Home furnishings stores": set(range(2021, 2027)),
+        "Full service restaurants": set(range(2021, 2027)),
+        "Jewelry stores": set(range(2022, 2027)),
+        "Men's clothing stores": set(range(2022, 2027)),
+        "Drinking places": set(range(2019, 2027)),
+        "Floor covering stores": set(range(2018, 2027)),
+    }
+
+
+def test_all_years_anchors(all_nsa: ApplyResult, results: dict[str, ApplyResult]) -> None:
+    facts = _facts(all_nsa)
+    total = "Retail and food services sales, total"
+    assert facts[(total, date(1992, 1, 1))] == 142_051_000_000
+    assert facts[(total, date(1992, 12, 1))] == 203_616_000_000
+    assert facts[(total, date(2024, 1, 1))] == 603_091_000_000
+    assert facts[(total, date(2026, 8, 1))] == 750_707_000_000  # "Aug. 2026(p)"
+    assert (total, date(2026, 9, 1)) not in facts  # not released yet
+    assert {d for e, d in facts if e == total} == {
+        date(y, m, 1) for y in range(1992, 2027) for m in range(1, 13) if (y, m) <= (2026, 8)
+    }
+    # The 2024 sheet loads exactly what the one-sheet spec loads from it.
+    one = {(f.row.entity, f.row.period_start): f.row.value for f in results["mrts_2024_nsa"].facts}
+    assert {k: v for k, v in facts.items() if k[1].year == 2024} == one
+
+
+def test_one_sheet_mismatch_refuses_all_years(project_copy: Path) -> None:
+    """A rule written against a complete year names TOTAL, which every sheet has but the
+    current year's (CY CUM / PY CUM instead): the whole load is refused, naming that sheet."""
+    spec = project_copy / "specs" / "mrts_all_nsa.yaml"
+    rows = "  header_rows: [4, 5]\n"
+    _edit(spec, rows, rows + "  skip_rows: [{blank: [TOTAL]}]\n")
+    with pytest.raises(SpecMismatch, match=r"sheet '2026': skip_rows blank column 'TOTAL'"):
+        run(spec, [REAL / SOURCES["mrts_2024_nsa"]])
+    _edit(spec, '{matching: "^\\\\d{4}$"}', '{matching: "^\\\\d{4}$", exclude: ["2026"]}')
+    result = run(spec, [REAL / SOURCES["mrts_2024_nsa"]])
+    assert [f.sheet for f in result.files][0] == "2025" and len(result.files) == 34
+
+
+# --- possible-duplicate entity warnings -----------------------------------------------------
+
+# What fires on each real spec with its `not_same` list removed. Every pair was checked
+# against the source and is two different things, so each spec lists them in `not_same`.
+SIMILAR = {
+    "eia_residential": [
+        ("East North Central", "West North Central", 94.4),
+        ("East South Central", "West South Central", 94.4),
+        ("Pacific Contiguous", "Pacific Noncontiguous", 92.3),
+    ],
+    # Only the North Central divisions have a transportation price; the others are all `--`
+    # and load no fact, so they aren't compared.
+    "eia_transport": [("East North Central", "West North Central", 94.4)],
+    "county_pop": [
+        ("Northeastern Connecticut Planning Region", "Southeastern Connecticut Planning Region",
+         95.0),
+        ("Northeastern Connecticut Planning Region", "Western Connecticut Planning Region", 90.7),
+        ("Southeastern Connecticut Planning Region", "Western Connecticut Planning Region", 90.7),
+    ],
+    # All (S) in 2024, so only the all-years spec, where earlier years have values, sees it.
+    "mrts_all_nsa": [("Men's clothing stores", "Women's clothing stores", 95.5)],
+}  # fmt: skip
+
+
+def _strip_not_same(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    stripped = re.sub(r"\n +not_same:.*(\n +- \[.*)+", "", text)
+    assert stripped != text
+    path.write_text(stripped, encoding="utf-8")
+
+
+@pytest.mark.parametrize("name", [*SOURCES, "mrts_all_nsa"])
+def test_real_specs_have_no_unreviewed_similar_names(name: str, results, all_nsa) -> None:
+    result = all_nsa if name == "mrts_all_nsa" else results[name]
+    assert result.report["similar_entities"] == []
+
+
+@pytest.mark.parametrize("name", list(SIMILAR))
+def test_similar_names_fire_on_real_specs(name: str, project_copy: Path) -> None:
+    spec = project_copy / "specs" / f"{name}.yaml"
+    _strip_not_same(spec)
+    source = REAL / (SOURCES.get(name) or SOURCES["mrts_2024_nsa"])
+    result = run(spec, [source])
+    sim = result.report["similar_entities"]
+    assert [(d["a"], d["b"], d["score"]) for d in sim] == SIMILAR[name]
+    assert {d["reason"] for d in sim} == {SIMILAR_SPELLING}
+    part = {"county_pop": "CTYNAME", "mrts_all_nsa": "Kind of Business"}
+    assert {d["part"] for d in sim} == {part.get(name, "Census Division and State")}
+    assert gate(result, draft=True) == []  # warnings never gate
+
+
+def test_nsa_and_sa_spell_three_lines_differently(results: dict[str, ApplyResult]) -> None:
+    """The same lines in the two tables of one sheet, named two ways: two specs, so no load
+    sees both, but the check finds all three over the union and nothing else."""
+    tables = ("mrts_2024_nsa", "mrts_2024_sa")
+    names = {e.canonical_name for n in tables for e in results[n].entities}
+    got = [(p.a, p.b, p.score, p.reason) for p in similar_names(sorted(names), 90)]
+    assert got == [
+        ("Beer, wine and liquor stores", "Beer, wine, and liquor stores", 100.0,
+         SAME_BUT_PUNCTUATION),
+        ("Electronic shopping and mail order houses",
+         "Electronic shopping and mail-order houses", 100.0, SAME_BUT_PUNCTUATION),
+        ("Miscellaneous store retailers", "Miscellaneous stores retailers", 98.3,
+         SIMILAR_SPELLING),
+    ]  # fmt: skip

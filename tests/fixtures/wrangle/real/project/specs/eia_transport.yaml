@@ -10,7 +10,12 @@ entity:
   kind: region
   parts:
     - column: Census Division and State
-      resolve: {policy: open}
+      resolve:
+        policy: open
+        not_same:   # reviewed similar-name warnings: different Census divisions
+          - ["East North Central", "West North Central"]
+          - ["East South Central", "West South Central"]
+          - ["Pacific Contiguous", "Pacific Noncontiguous"]   # lower 48 vs Alaska + Hawaii
 period:
   unpivot:
     columns: {from: "Transportation / August 2026", to: "Transportation / August 2025"}

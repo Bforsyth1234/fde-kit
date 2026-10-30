@@ -316,3 +316,125 @@ def test_xlsx_reads_only_the_requested_sheet(tmp_path, monkeypatch):
     wb.save(path)
     read_grid(path)
     assert calls == [{"read_only": True, "data_only": True}]
+
+
+def _patch_xlsx(src, dst, replace):
+    """Copy an xlsx, with `replace[member] = new bytes or None (drop)` and renamed members."""
+    import zipfile
+
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w") as zout:
+        for item in zin.infolist():
+            data = replace.get(item.filename, zin.read(item.filename))
+            zout.writestr(item.filename, data)
+
+
+def test_shared_formulas_without_cached_values(tmp_path):
+    """Excel writes a filled-down formula once (`<f t="shared" ref=.. si="0">`) and the other
+    cells as an empty `<f t="shared" si="0"/>`. With no `<v>`, or an empty one, each such cell
+    is `formula_no_value`, never empty; one with a cached `<v>` reads as that value."""
+    wb = openpyxl.Workbook()
+    wb.active.title = "Calc"
+    src = tmp_path / "src.xlsx"
+    wb.save(src)
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    sheet = (
+        f'<worksheet xmlns="{ns}"><sheetData>'
+        '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="inlineStr"><is><t>x2</t></is></c>'
+        "</row>"
+        '<row r="2"><c r="A2"><v>1</v></c>'
+        '<c r="B2"><f t="shared" ref="B2:B5" si="0">A2*2</f></c></row>'
+        '<row r="3"><c r="A3"><v>2</v></c><c r="B3"><f t="shared" si="0"/></c></row>'
+        '<row r="4"><c r="A4"><v>3</v></c><c r="B4"><f t="shared" si="0"/><v></v></c></row>'
+        '<row r="5"><c r="A5"><v>4</v></c><c r="B5"><f t="shared" si="0"/><v>8</v></c></row>'
+        # no `r` on the row or its cells: numbered on as openpyxl does (row 6, A then B)
+        '<row><c><v>5</v></c><c><f t="shared" si="0"/></c></row>'
+        "</sheetData></worksheet>"
+    )
+    strings = f'<sst xmlns="{ns}" count="1" uniqueCount="1"><si><t>n</t></si></sst>'
+    dst = tmp_path / "shared.xlsx"
+    _patch_xlsx(src, dst, {"xl/worksheets/sheet1.xml": sheet.encode()})
+    # add a shared-strings part the workbook relationships point to
+    import zipfile
+
+    with zipfile.ZipFile(dst) as z:
+        rels = z.read("xl/_rels/workbook.xml.rels").decode()
+        types = z.read("[Content_Types].xml").decode()
+    rels = rels.replace(
+        "</Relationships>",
+        '<Relationship Id="rIdSS" Target="sharedStrings.xml" Type="http://schemas.openxmlformats'
+        '.org/officeDocument/2006/relationships/sharedStrings"/></Relationships>',
+    )
+    types = types.replace(
+        "</Types>",
+        '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats'
+        '-officedocument.spreadsheetml.sharedStrings+xml"/></Types>',
+    )
+    dst2 = tmp_path / "shared2.xlsx"
+    _patch_xlsx(
+        dst,
+        dst2,
+        {"xl/_rels/workbook.xml.rels": rels.encode(), "[Content_Types].xml": types.encode()},
+    )
+    with zipfile.ZipFile(dst2, "a") as z:
+        z.writestr("xl/sharedStrings.xml", strings)
+
+    g = read_grid(dst2, "Calc")
+    got = [[(c.raw, c.kind) for c in r] for r in g.rows]
+    fnv = ("", "formula_no_value")
+    assert got == [
+        [("n", "text"), ("x2", "text")],
+        [("1", "number"), fnv],
+        [("2", "number"), fnv],
+        [("3", "number"), fnv],
+        [("4", "number"), ("8", "number")],
+        [("5", "number"), fnv],
+    ]
+
+
+def test_sheet_xml_found_through_relationships_not_file_order(tmp_path):
+    """Sheet files needn't be named in sheet order (Excel keeps `sheet3.xml` for a sheet moved
+    to the front). The merged ranges and formula cells come from the sheet the name maps to."""
+    wb = openpyxl.Workbook()
+    first = wb.active
+    first.title = "First"
+    first["A1"] = "first"
+    first.merge_cells("A1:B1")
+    first["A2"] = "=1+1"
+    wb.create_sheet("Second")["A1"] = "second"
+    third = wb.create_sheet("Third")
+    third["A1"] = "third"
+    third["C3"] = 3
+    third.merge_cells("C3:D4")
+    src = tmp_path / "src.xlsx"
+    wb.save(src)
+    import zipfile
+
+    with zipfile.ZipFile(src) as z:
+        s1 = z.read("xl/worksheets/sheet1.xml")
+        s3 = z.read("xl/worksheets/sheet3.xml")
+        rels = z.read("xl/_rels/workbook.xml.rels").decode()
+    # Swap the two files and point the relationships at them with relative targets.
+    rels = rels.replace('Target="/xl/worksheets/sheet1.xml"', 'Target="worksheets/sheetX.xml"')
+    rels = rels.replace('Target="/xl/worksheets/sheet3.xml"', 'Target="worksheets/sheet1.xml"')
+    rels = rels.replace('Target="worksheets/sheetX.xml"', 'Target="./worksheets/sheet3.xml"')
+    dst = tmp_path / "swapped.xlsx"
+    _patch_xlsx(
+        src,
+        dst,
+        {
+            "xl/worksheets/sheet1.xml": s3,
+            "xl/worksheets/sheet3.xml": s1,
+            "xl/_rels/workbook.xml.rels": rels.encode(),
+        },
+    )
+    g = read_grid(dst, "First")
+    assert g.merged == [(1, 1, 1, 2)]
+    assert [[(c.raw, c.kind) for c in r] for r in g.rows] == [
+        [("first", "text")],
+        [("", "formula_no_value")],
+    ]
+    g = read_grid(dst, "Third")
+    assert g.merged == [(3, 3, 4, 4)]
+    assert g.cell(1, 1).raw == "third" and g.cell(3, 3).raw == "3"
+    assert {c.kind for r in g.rows for c in r} == {"text", "number", "empty"}
+    assert read_grid(dst, "Second").rows == [[Cell(1, 1, "second", "text")]]

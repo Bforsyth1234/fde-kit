@@ -82,6 +82,7 @@ __all__ = [
     "PeriodColumn",
     "Resolve",
     "SectionBound",
+    "SheetsMatching",
     "SkipBlank",
     "SkipMatch",
     "Source",
@@ -101,6 +102,7 @@ TEXT_OPS = frozenset({"text", "map", "regex", "constant"})
 SPEC_NAME = re.compile(r"^[a-z0-9_]+$")
 CELL_REF = re.compile(r"^[A-Z]{1,3}[1-9][0-9]*$")
 DOCUMENT_KEY_FIELDS = frozenset({"spec", "file", "path", "sheet"})
+SIMILAR_WARN_DEFAULT = 90
 
 
 class SpecError(ValueError):
@@ -190,9 +192,44 @@ class SectionBound(_Model):
         return v
 
 
+class SheetsMatching(_Model):
+    """Every sheet whose name matches `matching` (`re.search`), minus `exclude` (exact names)."""
+
+    matching: str
+    exclude: list[str] = Field(default_factory=list)
+
+    @field_validator("matching")
+    @classmethod
+    def _compiles(cls, v: str) -> str:
+        _compile(v, "source.sheets.matching")
+        return v
+
+    @field_validator("exclude")
+    @classmethod
+    def _distinct(cls, v: list[str]) -> list[str]:
+        if len(set(v)) != len(v):
+            raise ValueError("source.sheets.exclude lists a sheet twice")
+        return v
+
+
+def _sheet_names(v: list[str]) -> list[str]:
+    if not v:
+        raise ValueError("source.sheets list is empty")
+    if len(set(v)) != len(v):
+        raise ValueError("source.sheets lists a sheet twice")
+    return v
+
+
+Sheets = SheetsMatching | Annotated[list[str], AfterValidator(_sheet_names)]
+
+
 class Source(_Model):
     sheet: str | None = None
-    """XLSX: the sheet to read (required there). CSV: omit; the sheet is the file stem."""
+    """XLSX: the sheet to read (this or `sheets` is required there). CSV: omit; the sheet is
+    the file stem."""
+    sheets: Sheets | None = None
+    """XLSX, instead of `sheet`: several sheets, each loaded as its own document, in workbook
+    order. `{matching: <regex>, exclude: [names]}` or a list of names. CSV: omit."""
     header_rows: list[Annotated[int, Field(ge=1)]] = Field(default_factory=lambda: [1])
     """1-based. Several rows are joined "Upper / Lower"."""
     data_starts: int | None = Field(default=None, ge=1)
@@ -263,7 +300,41 @@ class Source(_Model):
     def _data_after_header(self) -> Source:
         if self.data_starts is not None and self.data_starts <= self.header_rows[-1]:
             raise ValueError("data_starts must be after the last header row")
+        if self.sheet is not None and self.sheets is not None:
+            raise ValueError("source needs at most one of `sheet` or `sheets`")
         return self
+
+    @property
+    def multi_sheet(self) -> bool:
+        return self.sheets is not None
+
+    def select_sheets(self, names: list[str]) -> list[str]:
+        """The `sheets` selection from a workbook's sheet names, in workbook order. ValueError
+        when it names a sheet the workbook doesn't have or selects none."""
+        sel = self.sheets
+        assert sel is not None
+        if isinstance(sel, list):
+            missing = [n for n in sel if n not in names]
+            if missing:
+                raise ValueError(
+                    f"source.sheets names {missing}, not in the workbook; sheets: {names}"
+                )
+            wanted = set(sel)
+            return [n for n in names if n in wanted]
+        missing = [n for n in sel.exclude if n not in names]
+        if missing:
+            raise ValueError(
+                f"source.sheets.exclude names {missing}, not in the workbook; sheets: {names}"
+            )
+        rx = re.compile(sel.matching)
+        out = [n for n in names if rx.search(n) and n not in sel.exclude]
+        if not out:
+            raise ValueError(
+                f"source.sheets: no sheet matches {sel.matching!r}"
+                + (f" outside exclude {sel.exclude}" if sel.exclude else "")
+                + f"; sheets: {names}"
+            )
+        return out
 
     @property
     def first_data_row(self) -> int:
@@ -279,6 +350,26 @@ class Resolve(_Model):
     """Default: closed with a crosswalk, open without one."""
     fuzzy: bool = False
     threshold: int = Field(default=92, ge=0, le=100)
+    similar_warn: int = Field(default=SIMILAR_WARN_DEFAULT, ge=0, le=100)
+    """Open parts: warn about two new canonicals of this part scoring >= this (rapidfuzz
+    `ratio` on a casefolded, whitespace-collapsed form). 0 turns the score warning off; pairs
+    equal under `norm_key` are always reported. Warnings never merge or reject anything."""
+    not_same: list[tuple[str, str]] = Field(default_factory=list)
+    """Pairs a person reviewed and found to be different entities: never warned about. Exact
+    strings, either order."""
+
+    @field_validator("not_same")
+    @classmethod
+    def _pairs(cls, v: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        seen: set[frozenset[str]] = set()
+        for a, b in v:
+            if a == b:
+                raise ValueError(f"not_same: {a!r} is paired with itself")
+            key = frozenset((a, b))
+            if key in seen:
+                raise ValueError(f"not_same: the pair {a!r}, {b!r} is listed twice")
+            seen.add(key)
+        return v
 
     @model_validator(mode="after")
     def _default_policy(self) -> Resolve:
@@ -523,8 +614,9 @@ class MappingSpec(_Model):
         """The spec as it enters the bundle hash: JSON-mode, aliases, no approval.
 
         Settings added after the first release (`source.start_after`, `source.stop_before`,
-        `measures[].nulls`) enter only when set, so a spec that doesn't use them hashes as it
-        did before they existed and its approval stays valid."""
+        `source.sheets`, `measures[].nulls`, `resolve.similar_warn`, `resolve.not_same`) enter
+        only when set (`similar_warn`: when not the default), so a spec that doesn't use them
+        hashes as it did before they existed and its approval stays valid."""
         out = self.model_dump(mode="json", by_alias=True, exclude={"approval"})
         for key in _LATER_SOURCE_KEYS:
             if out["source"].get(key) is None:
@@ -532,10 +624,16 @@ class MappingSpec(_Model):
         for m in out["measures"]:
             if not m.get("nulls"):
                 m.pop("nulls", None)
+        for part in out["entity"]["parts"]:
+            res = part["resolve"]
+            if res.get("similar_warn") == SIMILAR_WARN_DEFAULT:
+                res.pop("similar_warn", None)
+            if not res.get("not_same"):
+                res.pop("not_same", None)
         return out
 
 
-_LATER_SOURCE_KEYS = ("start_after", "stop_before")
+_LATER_SOURCE_KEYS = ("start_after", "stop_before", "sheets")
 
 
 # --- loading --------------------------------------------------------------------------------

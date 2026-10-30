@@ -12,7 +12,12 @@ entity:
     - column: STNAME
       resolve: {policy: open}
     - column: CTYNAME
-      resolve: {policy: open}
+      resolve:
+        policy: open
+        not_same:   # reviewed similar-name warnings: three different CT planning regions
+          - ["Northeastern Connecticut Planning Region", "Southeastern Connecticut Planning Region"]
+          - ["Northeastern Connecticut Planning Region", "Western Connecticut Planning Region"]
+          - ["Southeastern Connecticut Planning Region", "Western Connecticut Planning Region"]
   template: "{0}/{1}"
 period:
   unpivot:

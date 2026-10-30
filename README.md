@@ -824,6 +824,7 @@ fde wrangle apply   specs/planner_forecast.yaml planner.xlsx --tenant acme
 facts 35  rejects 0 (rate 0.0000)  duplicates dropped 0
 entities by strategy: exact 4  normalised 1  fuzzy 0  new 3
 conflicts within load: 0
+possible duplicate entities: 0
 apply now would refuse (max reject rate 0.02):
   - spec 'planner_forecast' is not approved (run `fde wrangle approve`, or load with --draft)
 ```

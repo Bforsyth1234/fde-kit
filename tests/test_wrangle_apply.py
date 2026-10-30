@@ -222,6 +222,7 @@ def test_report(name: str, results: dict[str, ApplyResult]) -> None:
         "rejects",
         "entities",
         "conflicts_within_load",
+        "similar_entities",
     ]
     assert rep["spec"] == name and rep["bundle_sha256"] == result.loaded.bundle_sha256
     assert rep["approved"] is False

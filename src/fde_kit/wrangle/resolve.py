@@ -17,13 +17,18 @@ For a part with a crosswalk, in order:
 A part with no crosswalk is open: every non-empty value is `new` (or `normalised`, as above).
 An empty value never resolves.
 False merges cost more than misses, which is why fuzzy is off by default and the margin exists.
+
+`similar_names` is the other side of that trade: it never merges, it lists pairs of new open
+names that may be one thing spelled two ways (equal `norm_key`, or `fuzz.ratio` >= a
+threshold), for a person to review into a crosswalk or into `resolve.not_same`. Apply runs it
+per open part after a load is resolved and reports `similar_entities`.
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -32,14 +37,19 @@ from .spec import Crosswalk
 __all__ = [
     "AMBIGUOUS",
     "FUZZY_MARGIN",
+    "SAME_BUT_PUNCTUATION",
+    "SIMILAR_SPELLING",
     "UNKNOWN",
     "FuzzyMatch",
     "Resolution",
     "Resolver",
+    "SimilarPair",
     "Strategy",
     "check_crosswalk",
     "fuzzy_accepts",
     "norm_key",
+    "similar_key",
+    "similar_names",
 ]
 
 Strategy = Literal["exact", "normalised", "fuzzy", "new"]
@@ -203,6 +213,127 @@ class Resolver:
             if first != value:
                 return Resolution(value, first, "normalised")
         return Resolution(value, value, "new")
+
+
+SAME_BUT_PUNCTUATION = "same apart from punctuation/spacing"
+SIMILAR_SPELLING = "similar spelling"
+_SPACES = re.compile(r"\s+")
+_CDIST_CHUNK = 512
+
+
+@dataclass(frozen=True)
+class SimilarPair:
+    """Two distinct names of one entity part that may be the same thing. A warning only."""
+
+    a: str
+    b: str
+    """`a` < `b` (plain string order)."""
+    score: float
+    reason: str
+
+
+def similar_key(s: str) -> str:
+    """What the similarity score compares: casefolded, NFKC, whitespace collapsed and stripped.
+    Case is folded because the store already treats names case-insensitively; punctuation is
+    kept, because `norm_key` pairs are reported separately and `Lee County`/`Lea County` must
+    still score as different by one letter, not be erased into one key."""
+    return _SPACES.sub(" ", unicodedata.normalize("NFKC", s.casefold())).strip()
+
+
+def _scored_pairs(
+    keys: list[str], cutoff: float, use_cdist: bool | None
+) -> list[tuple[int, int, float]]:
+    """(i, j, score) for i < j with `fuzz.ratio(keys[i], keys[j]) >= cutoff`.
+
+    `process.cdist` (C++, all cores, chunked by rows so memory is 512 x n, not n x n) when
+    numpy is importable; otherwise `process.extract_iter` per row with the same scorer and
+    cutoff. Both give the same pairs; cdist needs numpy, which the wrangle extra doesn't pull
+    in. `use_cdist` forces one path (tests)."""
+    from rapidfuzz import fuzz, process
+
+    if use_cdist is None:
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            use_cdist = False
+        else:
+            use_cdist = True
+    out: list[tuple[int, int, float]] = []
+    n = len(keys)
+    if use_cdist:
+        import numpy as np
+
+        for lo in range(0, n, _CDIST_CHUNK):
+            block = process.cdist(
+                keys[lo : lo + _CDIST_CHUNK],
+                keys,
+                scorer=fuzz.ratio,
+                score_cutoff=cutoff,
+                dtype=np.float32,
+                workers=-1,
+            )
+            rows, cols = np.nonzero(block >= cutoff)
+            for r, c in zip(rows.tolist(), cols.tolist(), strict=True):
+                i = lo + r
+                if c > i:
+                    out.append((i, c, float(fuzz.ratio(keys[i], keys[c]))))
+    else:
+        for i in range(n - 1):
+            for _, score, j in process.extract_iter(
+                keys[i], keys[i + 1 :], scorer=fuzz.ratio, score_cutoff=cutoff
+            ):
+                out.append((i, i + 1 + j, float(score)))
+    return out
+
+
+def similar_names(
+    names: list[str],
+    threshold: float,
+    *,
+    not_same: Iterable[tuple[str, str]] = (),
+    use_cdist: bool | None = None,
+) -> list[SimilarPair]:
+    """Pairs of distinct names that may be one entity spelled two ways. Never merges anything.
+
+    - Pairs with the same `norm_key` but different text are always reported, score 100,
+      reason `same apart from punctuation/spacing` (`Beer, wine, and liquor stores` /
+      `Beer, wine and liquor stores`).
+    - With `threshold` > 0, pairs whose `fuzz.ratio` on `similar_key` is >= `threshold`, reason
+      `similar spelling`.
+
+    **Why `fuzz.ratio`.** It is the normalised Indel similarity of the whole strings, so every
+    added, dropped or changed character costs in proportion to the length: a typo or a dropped
+    comma in a long name scores in the 90s, while a name that adds a word (`Clothing stores` /
+    `Men's clothing stores`) falls well below. `token_set_ratio` and `partial_ratio`, which
+    suit resolving a cell against a crosswalk, score a name that is a subset of another 100,
+    and real hierarchical tables (MRTS kinds of business: a category and its sub-categories)
+    would then flood the report with parent/child pairs that are certainly different. `WRatio`
+    mixes those in for the same reason. The cost is that short names differing by a letter
+    (`Lee County` / `Lea County`, 90) do fire: those are the pairs `not_same` exists for.
+
+    `not_same` pairs (exact strings, either order) are dropped. Sorted by score descending,
+    then `a`, then `b`."""
+    distinct = sorted(set(names))
+    suppressed = {frozenset(p) for p in not_same}
+    found: dict[tuple[str, str], SimilarPair] = {}
+
+    by_norm: dict[str, list[str]] = {}
+    for n in distinct:
+        by_norm.setdefault(norm_key(n), []).append(n)
+    for group in by_norm.values():
+        for i, a in enumerate(group):
+            for b in group[i + 1 :]:
+                found[(a, b)] = SimilarPair(a, b, 100.0, SAME_BUT_PUNCTUATION)
+
+    if threshold > 0 and len(distinct) > 1:
+        keys = [similar_key(n) for n in distinct]
+        for i, j, score in _scored_pairs(keys, float(threshold), use_cdist):
+            a, b = distinct[i], distinct[j]
+            if (a, b) not in found:
+                found[(a, b)] = SimilarPair(a, b, round(score, 1), SIMILAR_SPELLING)
+
+    pairs = [p for p in found.values() if frozenset((p.a, p.b)) not in suppressed]
+    return sorted(pairs, key=lambda p: (-p.score, p.a, p.b))
 
 
 def check_crosswalk(crosswalk: Crosswalk) -> list[str]:

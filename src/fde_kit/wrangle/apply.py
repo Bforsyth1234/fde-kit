@@ -3,7 +3,8 @@
 `run(spec, files)` is pure: no database. It is the dry run, and the adapter (`adapter.py`)
 loads what it returns, so a dry run and an apply can never disagree about a value.
 
-For each file the spec's sheet is read into a `Grid`, then:
+A load's units are its files, or with `source.sheets` each selected sheet of each XLSX file,
+in workbook order (`unit_sheets`). Each unit is read into a `Grid`, then:
 
 1. `header_fingerprint`, if the spec sets one, must match (`force=True` skips only this check).
 2. Column labels are built from `header_rows` (`labels.header_labels`); a column the spec names
@@ -21,8 +22,13 @@ For each file the spec's sheet is read into a `Grid`, then:
    cell involved. Across documents nothing is dropped: `add_facts` decides agreement and
    conflict at ingest, as it does between loads.
 
-Before any file is read, every file's `document_key` is rendered; two files with the same key
-in one load are a `SpecMismatch` (one would supersede the other within the load).
+Before any sheet is read, every unit's `document_key` is rendered; two units with the same key
+in one load are a `SpecMismatch` (one would supersede the other within the load). A
+`SpecMismatch` on any unit refuses the whole load; with `source.sheets` it names the sheet.
+
+After every unit, each open entity part's new names are compared pairwise for possible
+duplicates (`resolve.similar_names`): `similar_entities` in the report and `similar.csv`.
+Warnings only; they change no fact, count or gate.
 
 **Native XLSX cells** (`cell_pipeline`): when a pipeline's first op is `number` and the cell is
 a number, the cell's value is taken as is (`Decimal(raw)`) and only the later ops run, so a
@@ -62,7 +68,7 @@ from ..rag.store import FactRow
 from .labels import header_fingerprint, header_labels
 from .parse import ParseError, apply_text, compile_ops, period_of, to_fact_value
 from .read import XLSX_SUFFIXES, Cell, Grid, col_letter, parse_ref, read_grid
-from .resolve import STRATEGIES, FuzzyMatch, Resolver
+from .resolve import STRATEGIES, FuzzyMatch, Resolver, similar_names
 from .spec import PERIOD_JOIN, LoadedSpec, Measure, SkipBlank, SpecError, load_project_spec
 
 __all__ = [
@@ -76,6 +82,7 @@ __all__ = [
     "parse_source_ref",
     "reject_rate",
     "run",
+    "unit_sheets",
     "write_outputs",
 ]
 
@@ -89,11 +96,14 @@ _READ_FAILURES = {"error": "error cell", "formula_no_value": "formula without ca
 
 class SpecMismatch(ValueError):
     """The file doesn't fit the spec (fingerprint, a missing column or sheet): the whole file is
-    refused, rather than turned into rejects."""
+    refused, rather than turned into rejects. With `source.sheets` the message names the sheet
+    too, and one sheet's mismatch refuses the whole load."""
 
-    def __init__(self, path: str, message: str):
-        super().__init__(f"{path}: {message}")
+    def __init__(self, path: str, message: str, sheet: str | None = None):
+        where = path if sheet is None else f"{path} sheet {sheet!r}"
+        super().__init__(f"{where}: {message}")
         self.path = path
+        self.sheet = sheet
 
 
 def parse_source_ref(ref: str) -> dict[str, str]:
@@ -155,6 +165,8 @@ class ApplyResult:
     proposed: list[FuzzyMatch]
     duplicates_dropped: int = 0
     conflicts: list[dict[str, Any]] = field(default_factory=list)
+    similar_entities: list[dict[str, Any]] = field(default_factory=list)
+    """Possible duplicate entity names (warnings only; see `_similar_entities`)."""
 
     @property
     def approved(self) -> bool:
@@ -319,8 +331,9 @@ def _compile_spec(loaded: LoadedSpec, names: dict[str, str]) -> _Compiled:
 class _Columns:
     """Joined header labels -> 1-based column numbers."""
 
-    def __init__(self, path: str, labels: list[str]):
+    def __init__(self, path: str, labels: list[str], sheet: str | None = None):
         self.path = path
+        self.sheet = sheet
         self.labels = labels
         self._exact: dict[str, list[int]] = {}
         self._loose: dict[str, list[int]] = {}
@@ -332,10 +345,14 @@ class _Columns:
         cols = self._exact.get(name) or self._loose.get(apply_text(name), [])
         if not cols:
             shown = [lbl for lbl in self.labels if lbl]
-            raise SpecMismatch(self.path, f"{what} {name!r} is not a column; labels: {shown}")
+            raise SpecMismatch(
+                self.path, f"{what} {name!r} is not a column; labels: {shown}", self.sheet
+            )
         if len(cols) > 1:
             letters = [col_letter(c) for c in cols]
-            raise SpecMismatch(self.path, f"{what} {name!r} names several columns: {letters}")
+            raise SpecMismatch(
+                self.path, f"{what} {name!r} names several columns: {letters}", self.sheet
+            )
         return cols[0]
 
 
@@ -371,20 +388,75 @@ def _is_xlsx(path: Path | str) -> bool:
     return Path(path).suffix.lower() in XLSX_SUFFIXES
 
 
-def document_key(loaded: LoadedSpec, path: Path | str) -> str:
-    """The spec's `document_key` rendered for one file. Known before the file is read: the
-    sheet is `source.sheet` for XLSX (`SpecMismatch` when the spec has none) and the file stem
+def _workbook_sheets(path: Path | str) -> list[str]:
+    """The workbook's worksheet names in workbook order (chartsheets left out). Only the
+    workbook part is parsed, no sheet."""
+    import openpyxl
+
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    except Exception as e:  # zipfile.BadZipFile, KeyError, InvalidFileException, OSError
+        raise SpecMismatch(str(path), f"cannot open the workbook: {e}") from e
+    try:
+        return [ws.title for ws in wb.worksheets]
+    finally:
+        wb.close()
+
+
+def unit_sheets(loaded: LoadedSpec, path: Path | str) -> list[str | None]:
+    """The sheets the spec reads from one file, in workbook order: `[source.sheet]`, the
+    `source.sheets` selection (which opens the workbook to list its sheets), or `[None]` for a
+    CSV. `SpecMismatch` for an XLSX with neither, a CSV with either, or a selection that names
+    a missing sheet or matches none."""
+    src = loaded.spec.source
+    if not _is_xlsx(path):
+        if src.sheet is not None or src.sheets is not None:
+            which = "source.sheet" if src.sheet is not None else "source.sheets"
+            raise SpecMismatch(
+                str(path), f"is a CSV, whose only sheet is its file stem: omit {which}"
+            )
+        return [None]
+    if src.sheets is not None:
+        try:
+            return list(src.select_sheets(_workbook_sheets(path)))
+        except ValueError as e:
+            if isinstance(e, SpecMismatch):
+                raise
+            raise SpecMismatch(str(path), str(e)) from e
+    if src.sheet is None:
+        raise SpecMismatch(str(path), "XLSX needs source.sheet or source.sheets in the spec")
+    return [src.sheet]
+
+
+def document_key(loaded: LoadedSpec, path: Path | str, sheet: str | None = None) -> str:
+    """The spec's `document_key` rendered for one file (and, with `source.sheets`, one of its
+    sheets, which must then be given). Known before the sheet is read: the sheet is `sheet`,
+    else `source.sheet` for XLSX (`SpecMismatch` when the spec has neither) and the file stem
     for CSV."""
     src = loaded.spec.source
-    if _is_xlsx(path):
-        if src.sheet is None:
-            raise SpecMismatch(str(path), "XLSX needs source.sheet in the spec")
-        sheet = src.sheet
-    else:
-        sheet = Path(path).stem
+    if sheet is None:
+        if _is_xlsx(path):
+            if src.sheets is not None:
+                raise SpecMismatch(
+                    str(path), "the spec reads several sheets (source.sheets): name one"
+                )
+            if src.sheet is None:
+                raise SpecMismatch(
+                    str(path), "XLSX needs source.sheet or source.sheets in the spec"
+                )
+            sheet = src.sheet
+        else:
+            sheet = Path(path).stem
     return src.document_key.format(
         spec=loaded.spec.spec, file=Path(path).name, path=str(path), sheet=sheet
     )
+
+
+def _others(canonicals: list[str], i: int) -> tuple[str, ...]:
+    """The scope a part's names are compared within: the parts to its left, read as a
+    hierarchy (state, then county). Parts to the right don't scope it: in plant / part /
+    line, two spellings of one part number under the same plant are still worth a look."""
+    return tuple(canonicals[:i])
 
 
 class _Run:
@@ -405,6 +477,43 @@ class _Run:
         # key all differ. Reset for each file; `conflicts` collects across them.
         self.seen: dict[tuple[str, str, date, date], list[tuple[Any, str]]] = {}
         self.conflicts: list[dict[str, Any]] = []
+        # Per entity part: is it open, and each new (non-crosswalk) canonical with at least
+        # one fact -> the cell it was first read from, keyed by the parts to its left. In a
+        # composite entity only names under the same left parts are compared: `Johnson
+        # County` in Kansas is not a near-duplicate of `Johnston County` in North Carolina.
+        self.open_parts = [p.resolve.policy == "open" for p in self.spec.entity.parts]
+        self.part_names: list[dict[tuple[tuple[str, ...], str], str]] = [
+            {} for _ in self.spec.entity.parts
+        ]
+
+    def similar_entities(self) -> list[dict[str, Any]]:
+        """Possible duplicates among each open part's new canonicals, compared per part (never
+        the composite string): `resolve.similar_warn` and `not_same` (§7.3). Warnings only."""
+        out: list[dict[str, Any]] = []
+        kind = self.spec.entity.kind
+        for i, part in enumerate(self.spec.entity.parts):
+            if not self.open_parts[i]:
+                continue
+            groups: dict[tuple[str, ...], dict[str, str]] = {}
+            for (ctx, name), where in self.part_names[i].items():
+                groups.setdefault(ctx, {})[name] = where
+            for ctx, names in groups.items():
+                for p in similar_names(
+                    list(names), part.resolve.similar_warn, not_same=part.resolve.not_same
+                ):
+                    item = {
+                        "part": part.column,
+                        "kind": kind,
+                        "a": p.a,
+                        "b": p.b,
+                        "score": p.score,
+                        "reason": p.reason,
+                        "cells": [names[p.a], names[p.b]],
+                    }
+                    if ctx:
+                        item["within"] = list(ctx)
+                    out.append(item)
+        return sorted(out, key=lambda d: (-d["score"], d["a"], d["b"], d["part"]))
 
     def _reject(self, fr: FileResult, *, where: dict[str, Any], **kw: Any) -> None:
         rec: dict[str, Any] = {"file": fr.path, "sheet": fr.sheet, **where}
@@ -431,19 +540,25 @@ class _Run:
             reason=reason,
         )
 
-    def file(self, path: Path | str) -> FileResult:
+    def file(self, path: Path | str, sheet: str | None = None) -> FileResult:
+        """One unit: a CSV, an XLSX file's `source.sheet`, or (with `source.sheets`) one of the
+        selected sheets, passed as `sheet`."""
         spec, src = self.spec, self.spec.source
         shown = str(path)
-        source = document_key(self.loaded, path)
+        if sheet is None and _is_xlsx(path):
+            sheet = src.sheet
+        source = document_key(self.loaded, path, sheet)
+        # Mismatch messages name the sheet when the spec reads several.
+        msheet = sheet if src.sheets is not None else None
         try:
             grid = read_grid(
                 path,
-                src.sheet if _is_xlsx(path) else None,
+                sheet if _is_xlsx(path) else None,
                 encoding=src.encoding,
                 delimiter=src.delimiter,
             )
         except ValueError as e:
-            raise SpecMismatch(shown, str(e)) from e
+            raise SpecMismatch(shown, str(e), msheet) from e
 
         labels = header_labels(grid, list(src.header_rows))
         if src.header_fingerprint and not self.force:
@@ -453,8 +568,9 @@ class _Run:
                     shown,
                     f"header_fingerprint is {got}, the spec expects {src.header_fingerprint} "
                     "(the header changed; re-check the spec, or --force)",
+                    msheet,
                 )
-        cols = _Columns(shown, labels)
+        cols = _Columns(shown, labels, msheet)
         part_cols = [cols.find(p.column, "entity column") for p in spec.entity.parts]
         skip_cols: list[tuple[str, Any]] = []
         for kind, rule in self.c.skips:
@@ -469,20 +585,22 @@ class _Run:
         period_cols = (
             [cols.find(n, "period column") for n in per.column.names] if per.column else []
         )
-        first_row, last_row = self._section(grid, cols, shown)
+        first_row, last_row = self._section(grid, cols, shown, msheet)
         unpivot_cols: list[int] = []
         if per.unpivot is not None:
             if per.unpivot.columns is not None:
                 lo = cols.find(per.unpivot.columns.from_, "unpivot.columns.from")
                 hi = cols.find(per.unpivot.columns.to, "unpivot.columns.to")
                 if lo > hi:
-                    raise SpecMismatch(shown, "unpivot.columns.from is right of `to`")
+                    raise SpecMismatch(shown, "unpivot.columns.from is right of `to`", msheet)
                 unpivot_cols = list(range(lo, hi + 1))
             else:
                 rx = re.compile(per.unpivot.matching or "")
                 unpivot_cols = [i for i, lbl in enumerate(labels, 1) if rx.search(lbl)]
                 if not unpivot_cols:
-                    raise SpecMismatch(shown, f"no column label matches {per.unpivot.matching!r}")
+                    raise SpecMismatch(
+                        shown, f"no column label matches {per.unpivot.matching!r}", msheet
+                    )
         measure_cols = [
             (m, fn, cols.find(m.column, "measure column") if m.column is not None else None)
             for m, fn in self.c.measures
@@ -561,6 +679,14 @@ class _Run:
                 canonicals.append(res.canonical)
             if failed:
                 continue
+            # Each open part's new name and its cell, noted once the row loads a fact.
+            new_names = [
+                (i, (_others(canonicals, i), canonical), f"{grid.sheet}!{col_letter(col)}{r}")
+                for i, (canonical, col) in enumerate(zip(canonicals, part_cols, strict=True))
+                if self.open_parts[i]
+                and (_others(canonicals, i), canonical) not in self.part_names[i]
+                and canonical.casefold() not in self.crosswalk_canonicals
+            ]
             entity = spec.entity.render(canonicals)
             entity = self.names.setdefault(entity.casefold(), entity)
             entity_cells = tuple(f"{col_letter(c)}{r}" for c in part_cols)
@@ -636,6 +762,9 @@ class _Run:
                         and entity not in entities
                     ):
                         entities[entity] = RawEntity(spec.entity.kind, entity)
+                    for i, key, where in new_names:
+                        self.part_names[i].setdefault(key, where)
+                    new_names = []
         fr.entities = list(entities.values())
         self.conflicts.extend(
             {
@@ -648,7 +777,9 @@ class _Run:
         )
         return fr
 
-    def _section(self, grid: Grid, cols: _Columns, shown: str) -> tuple[int, int]:
+    def _section(
+        self, grid: Grid, cols: _Columns, shown: str, msheet: str | None
+    ) -> tuple[int, int]:
         """(first, last) data row, inclusive: `first_data_row` to the grid's end, narrowed by
         `start_after` and `stop_before`. A bound that matches no row is a `SpecMismatch`, since
         loading on regardless would read the wrong table (or both)."""
@@ -661,6 +792,7 @@ class _Run:
                     shown,
                     f"source.start_after: no row from {first} has {src.start_after.column!r} "
                     f"matching {src.start_after.matches!r}",
+                    msheet,
                 )
             first = hit + 1
         if src.stop_before is not None:
@@ -670,6 +802,7 @@ class _Run:
                     shown,
                     f"source.stop_before: no row from {first} has {src.stop_before.column!r} "
                     f"matching {src.stop_before.matches!r}",
+                    msheet,
                 )
             last = hit - 1
         return first, last
@@ -766,19 +899,28 @@ def run(
     a missing column or sheet) and `SpecError` for a spec whose ops can't run."""
     loaded = spec if isinstance(spec, LoadedSpec) else load_project_spec(spec)
     files = list(files)
+    units: list[tuple[str | Path, str | None]] = [
+        (f, sheet) for f in files for sheet in unit_sheets(loaded, f)
+    ]
     keys: dict[str, str] = {}
-    for f in files:
-        key = document_key(loaded, f)
+    for f, sheet in units:
+        key = document_key(loaded, f, sheet)
+        shown = (
+            str(f) if sheet is None or loaded.spec.source.sheets is None else f"{f} sheet {sheet!r}"
+        )
         if key in keys:
             raise SpecMismatch(
                 str(f),
                 f"document_key {loaded.spec.source.document_key!r} renders {key!r} for this "
-                f"file and for {keys[key]}: in one load they would supersede each other "
+                f"{'sheet' if loaded.spec.source.sheets is not None else 'file'} and for "
+                f"{keys[key]}: in one load they would supersede each other "
                 "(load them separately, or use a document_key that tells them apart)",
+                sheet if loaded.spec.source.sheets is not None else None,
             )
-        keys[key] = str(f)
+        keys[key] = shown
     state = _Run(loaded, force)
-    results = [state.file(f) for f in files]
+    results = [state.file(f, sheet) for f, sheet in units]
+    similar = state.similar_entities()
 
     crosswalk_entities = [
         RawEntity(cw.kind, canonical, cw.aliases_for(canonical))
@@ -821,6 +963,7 @@ def run(
         },
         "entities": counts,
         "conflicts_within_load": conflicts,
+        "similar_entities": similar,
     }
     return ApplyResult(
         loaded=loaded,
@@ -831,6 +974,7 @@ def run(
         proposed=proposed,
         duplicates_dropped=state.duplicates,
         conflicts=conflicts,
+        similar_entities=similar,
     )
 
 
@@ -901,7 +1045,8 @@ def _fact_json(rec: FactRecord) -> dict[str, Any]:
 
 
 def write_outputs(result: ApplyResult, out_dir: str | Path) -> dict[str, Path]:
-    """report.json, rejects.jsonl, facts.preview.jsonl (first 50) and crosswalk.proposed.csv."""
+    """report.json, rejects.jsonl, facts.preview.jsonl (first 50), crosswalk.proposed.csv and
+    similar.csv (possible duplicate entities)."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     paths = {
@@ -909,6 +1054,7 @@ def write_outputs(result: ApplyResult, out_dir: str | Path) -> dict[str, Path]:
         "rejects": out / "rejects.jsonl",
         "preview": out / "facts.preview.jsonl",
         "proposed": out / "crosswalk.proposed.csv",
+        "similar": out / "similar.csv",
     }
     paths["report"].write_text(_dumps(result.report, indent=2) + "\n", encoding="utf-8")
     paths["rejects"].write_text(
@@ -926,4 +1072,21 @@ def write_outputs(result: ApplyResult, out_dir: str | Path) -> dict[str, Path]:
     for p in result.proposed:
         w.writerow([p.crosswalk, p.alias, p.canonical, f"{p.score:g}", f"{p.second:g}"])
     paths["proposed"].write_text(buf.getvalue(), encoding="utf-8")
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["part", "kind", "within", "a", "b", "score", "reason", "cell_a", "cell_b"])
+    for d in result.similar_entities:
+        w.writerow(
+            [
+                d["part"],
+                d["kind"],
+                " / ".join(d.get("within", [])),
+                d["a"],
+                d["b"],
+                f"{d['score']:g}",
+                d["reason"],
+                *d["cells"],
+            ]
+        )
+    paths["similar"].write_text(buf.getvalue(), encoding="utf-8")
     return paths

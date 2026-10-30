@@ -197,6 +197,49 @@ def test_dry_run_exact_decimal_values_and_same_key_files(out, tmp_path):
     assert "spec mismatch" in out() and "supersede each other" in out()
 
 
+REAL = FIXTURES / "real"
+
+
+def test_dry_run_all_year_sheets(out):
+    """One spec over all 35 sheets of the MRTS workbook: a row per sheet, placeholders named by
+    sheet, and the reviewed similar-name pair suppressed."""
+    spec = str(REAL / "project" / "specs" / "mrts_all_nsa.yaml")
+    assert cli.main(["wrangle", "dry-run", spec, str(REAL / "mrtssales92-present.xlsx")]) == 0
+    text = out()
+    assert "facts 25207  rejects 0 (rate 0.0000)  duplicates dropped 416" in text
+    assert "placeholders skipped as empty (2026): '(S)' 56" in text
+    assert "placeholders skipped as empty (1992): '(NA)' 48" in text
+    assert "section 1992: start_after_row 6  stop_before_row 71" in text
+    assert "possible duplicate entities: 0" in text
+
+
+def test_dry_run_prints_and_writes_similar_entities(out, tmp_path):
+    project = tmp_path / "project"
+    shutil.copytree(REAL / "project", project)
+    spec = project / "specs" / "eia_residential.yaml"
+    text = spec.read_text(encoding="utf-8")
+    spec.write_text(text[: text.index("        not_same:")] + text[text.index("period:") :])
+    dest = tmp_path / "out"
+    argv = ["wrangle", "dry-run", str(spec), str(REAL / "table_5_06_a.xlsx"), "--out", str(dest)]
+    assert cli.main(argv) == 0
+    printed = out()
+    assert "possible duplicate entities: 3" in printed
+    assert (
+        "94.4 Census Division and State: 'East North Central' ~ 'West North Central' "
+        "(similar spelling; Table_5_06_A!A16, Table_5_06_A!A22)"
+    ) in printed
+    # The only refusal is the missing approval: warnings never gate.
+    assert "apply now would refuse" in printed and "is not approved" in printed
+    assert "possible duplicate" not in printed.split("apply now would refuse")[1]
+    rows = (dest / "similar.csv").read_text(encoding="utf-8").splitlines()
+    assert rows[0] == "part,kind,within,a,b,score,reason,cell_a,cell_b"
+    assert len(rows) == 4 and rows[3].startswith(
+        "Census Division and State,region,,Pacific Contiguous,Pacific Noncontiguous,92.3,"
+    )
+    report = json.loads((dest / "report.json").read_text())
+    assert len(report["similar_entities"]) == 3
+
+
 def test_dry_run_missing_file_is_exit_2(out):
     argv = ["wrangle", "dry-run", str(SPECS / "erp_shipments.yaml"), "nope.csv"]
     assert cli.main(argv) == 2

@@ -942,7 +942,8 @@ def _print_wrangle_result(result) -> None:
         nulls = f.get("null_skipped") or {}
         if nulls:
             shown = "  ".join(f"{escape(k)!r} {v}" for k, v in nulls.items())
-            console.print(f"placeholders skipped as empty: {shown}")
+            where = f" ({escape(f['sheet'])})" if len(rep["files"]) > 1 else ""
+            console.print(f"placeholders skipped as empty{where}: {shown}")
     rj = rep["rejects"]
     console.print(
         f"facts {rep['facts']}  rejects {rj['total']} (rate {rj['rate']:.4f})  "
@@ -964,6 +965,19 @@ def _print_wrangle_result(result) -> None:
     if len(conflicts) > WRANGLE_SHOWN_CONFLICTS:
         more = len(conflicts) - WRANGLE_SHOWN_CONFLICTS
         console.print(f"  ... and {more} more (all of them are in report.json with --out)")
+    similar = rep["similar_entities"]
+    console.print(f"possible duplicate entities: {len(similar)}")
+    for d in similar[:WRANGLE_SHOWN_CONFLICTS]:
+        console.print(
+            f"  [yellow]{d['score']:g}[/] {escape(d['part'])}: {escape(d['a'])!r} ~ "
+            f"{escape(d['b'])!r} ({escape(d['reason'])}; {escape(', '.join(d['cells']))})"
+        )
+    if len(similar) > WRANGLE_SHOWN_CONFLICTS:
+        more = len(similar) - WRANGLE_SHOWN_CONFLICTS
+        console.print(
+            f"  ... and {more} more (all of them are in similar.csv with --out; "
+            "add reviewed pairs to resolve.not_same)"
+        )
 
 
 def _print_gate(reasons: list[str], max_reject_rate: float, *, now: bool) -> None:

@@ -372,18 +372,47 @@ for exports in the thousands, and slow at 100k. The next step is batching the co
 
 **What real files still can't say:**
 
-- **The same thing named two ways inside one file:** "Beer, wine, and liquor stores" in one table,
-  "Beer, wine and liquor stores" in the next. Open entities only merge by case; a crosswalk fixes it.
+- **The same thing named two ways is flagged, not merged.** "Beer, wine, and liquor stores" in one
+  table, "Beer, wine and liquor stores" in the next: open entities still only merge by case, and
+  a crosswalk is still the fix. What's new is that a load now warns: every pair of new names in
+  one entity part that are equal apart from punctuation and spacing, or score ≥ 90 on
+  `fuzz.ratio`, goes to `similar_entities` and `similar.csv`, and pairs a person checked go in
+  `resolve.not_same`. On the real specs it fired 8 times, and all 8 were different things: East
+  vs West North Central (and South Central), Pacific Contiguous vs Noncontiguous, three
+  Connecticut planning regions, Men's vs Women's clothing stores. The three MRTS lines spelled
+  two ways (beer, mail-order, "store retailers") sit in the NSA and SA tables, which are
+  separate specs, so no single load sees both; over the union of the two the check finds
+  exactly those three and nothing else. On the full county file the first version raised 349
+  warnings, nearly all across states (Johnson/Johnston, De Witt County IL vs DeWitt County TX).
+  A warning list that long gets ignored, so a part of a composite entity is now compared only
+  within the parts to its left (counties within one state). That leaves 46, all in one state,
+  like Coke vs Cooke County TX and East vs West Baton Rouge Parish: still different places, but
+  the kind a careless merge gets wrong, and short enough to review.
 - **No hierarchy.** Regions beside states, divisions beside states, NAICS parents beside children all
   load as flat entities, so summing a column double-counts.
 - **No per-fact status.** `Aug. 2026(p)` (preliminary) and EIA's "not meaningful" vs "not
   applicable" are stripped or skipped, not recorded on the fact.
 - **"As of July 1" can't be an instant.** A year label gives the year, and no op builds
   `YYYY-07-01`.
-- **One sheet per spec.** Census retail has one sheet per year, 35 of them, so that's 35 specs, or
-  one spec per year generated from a template.
-- **The XLSX reader uses an openpyxl internal** (`openpyxl.worksheet._reader`), so the dependency is
-  pinned to `>=3.1,<3.2`.
+- **Many sheets, one layout.** `source.sheets` (a regex plus `exclude`, or a list) loads every
+  selected sheet as its own document in one all-or-nothing load, so Census retail's 35 year
+  sheets are one spec (25,207 facts, 0 rejects, 0 conflicts, every fact checked against its own
+  sheet, 2.9 s). That worked because the 1992-2026 sheets turned out to share one layout: the
+  same header rows, both tables at the same rows, the same 63 kinds of business. The drift was
+  in the cells, and one spec covers it: `(NA)` in 1992-2000 and `(S)` from 2017, lines that
+  are all placeholder for whole years and so load nothing (floor covering stores from 2018,
+  drinking places from 2019), and the current-year sheet with only 8 months, `Aug. 2026(p)`,
+  and CY CUM / PY CUM where full years have TOTAL. A spec still can't vary its layout per
+  sheet. A workbook whose old sheets have other header rows or other names needs a spec per
+  layout, with `exclude` (or a list) splitting the sheets between them, and a rule that one
+  sheet breaks (a column only full years have) refuses the whole load until that sheet is
+  excluded.
+- **The XLSX reader uses only openpyxl's public API plus a stdlib XML pass.** Values come from
+  `load_workbook(read_only=True, data_only=True)`; a second streaming pass over the sheet's XML
+  (`zipfile` + `iterparse`) finds merged ranges and formulas with no cached value, which read-only
+  openpyxl doesn't expose. That second pass costs about 0.3 s on the 19 MB EIA workbook (1.3 s
+  in all). python-calamine would be faster, but it doesn't expose formulas, so a formula with no
+  cached value would read as an empty cell instead of a reject.
 
 ## Costs and limits
 
