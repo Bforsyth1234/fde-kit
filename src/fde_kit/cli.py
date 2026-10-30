@@ -8,6 +8,7 @@ fde rag seed-demo                     # three demo tenants on a shared lease tem
 fde rag search --tenant summit "late fee?"
 fde rag ask --tenant summit "How much is the late fee?"
 fde rag posture                       # would this connection let RLS be bypassed?
+fde wrangle dry-run SPEC FILE...      # a mapping spec over messy CSV/XLSX, nothing written
 """
 
 from __future__ import annotations
@@ -729,6 +730,415 @@ def _add_adapter_parsers(rsub) -> None:
 # --- end adapters (PR 4)
 
 
+# --- wrangle (PR 5)
+WRANGLE_MISSING = "[red]{name} not installed[/]: pip install 'fde-kit[wrangle]'"
+DEFAULT_MAX_REJECT_RATE = 0.02
+"""§8's default: apply refuses when rejects / (facts + rejects) is over this."""
+
+
+def _wrangle_files(files: list[str]) -> list[Path] | None:
+    """The FILE arguments as paths, or None (after printing which) when one isn't a file."""
+    from rich.markup import escape
+
+    paths = [Path(f) for f in files]
+    missing = [p for p in paths if not p.is_file()]
+    for p in missing:
+        console.print(f"[red]not a file[/]: {escape(str(p))}")
+    return None if missing else paths
+
+
+def _wrangle_check(spec_path: str):
+    """Load the spec with its dictionary and crosswalks, compile its ops and check each
+    crosswalk for norm_key collisions. Returns (loaded or None, problems)."""
+    from .wrangle import check_crosswalk, load_project_spec, run
+
+    try:
+        loaded = load_project_spec(spec_path)
+        run(loaded, [])  # compiles every op pipeline without reading a file
+    except ValueError as exc:  # SpecError, pydantic.ValidationError
+        return None, [str(exc)]
+    problems = [p for cw in loaded.crosswalks.values() for p in check_crosswalk(cw)]
+    return loaded, problems
+
+
+def _approval_line(loaded) -> str:
+    from rich.markup import escape
+
+    approval = loaded.spec.approval
+    if approval is None:
+        return "[yellow]not approved[/]"
+
+    who = f"by {escape(approval.by)} at {escape(str(approval.at))}"
+    if loaded.approved:
+        return f"[green]approved[/] {who}"
+    return (
+        f"[red]stale approval[/] {who}: stamped at bundle {approval.bundle_sha256[:12]}, "
+        f"the bundle is now {loaded.bundle_sha12}"
+    )
+
+
+def cmd_wrangle_profile(args: argparse.Namespace) -> int:
+    from rich.markup import escape
+
+    try:
+        from .wrangle import profile_file
+    except ModuleNotFoundError as exc:
+        console.print(WRANGLE_MISSING.format(name=exc.name))
+        return 2
+    if _wrangle_files([args.file]) is None:
+        return 2
+    try:
+        prof = profile_file(args.file, args.sheet, encoding=args.encoding)
+    except ValueError as exc:  # unknown sheet or encoding, a sheet name given for a CSV, ...
+        console.print(f"[red]{escape(str(exc))}[/]")
+        return 1
+    if args.json:
+        sys.stdout.write(prof.model_dump_json(indent=2) + "\n")
+        return 0
+
+    console.rule(f"[bold]{escape(prof.file)} — {escape(prof.sheet)}")
+    found = "" if prof.header_found else "  [yellow](guessed: no row looked like a header)[/]"
+    console.print(
+        f"{prof.n_rows} rows x {prof.n_cols} cols  header rows {prof.header_rows}{found}  "
+        f"data rows {prof.data.start}-{prof.data.end} ({prof.data.rows} non-empty)"
+    )
+    console.print(f"header_fingerprint {prof.header_fingerprint}")
+    if prof.encoding is not None:
+        console.print(f"encoding {prof.encoding}")
+    for tr in prof.title_rows:
+        text = "  ".join(f"{c.ref}={c.value}" for c in tr.cells)
+        console.print(f"title row {tr.row}: {escape(text)}")
+
+    table = Table(title="columns")
+    for col in ("col", "label", "type", "nulls", "distinct", "format", "scale", "samples"):
+        table.add_column(col)
+    for c in prof.columns:
+        if c.number_format is not None:
+            nf = c.number_format
+            fmt = f"number {nf.thousands!r}/{nf.decimal!r}" + (" ?" if nf.ambiguous else "")
+            extras = [
+                k
+                for k in ("parens_negative", "trailing_minus", "currency", "percent")
+                if getattr(nf, k)
+            ]
+            fmt += "".join(f" +{k}" for k in extras)
+        elif c.date_formats:
+            fmt = c.date_formats[0] + (" (d/m ambiguous)" if c.day_month_ambiguous else "")
+        else:
+            fmt = "-"
+        scale = f"x{c.scale_hint.scale}" if c.scale_hint else "-"
+        samples = ", ".join(s.value for s in c.samples[:3])
+        table.add_row(
+            c.letter,
+            escape(c.label),
+            c.type,
+            f"{c.null_rate:.0%}",
+            str(c.distinct),
+            escape(fmt),
+            scale,
+            escape(samples),
+        )
+    console.print(table)
+
+    for s in prof.skip_candidates:
+        sums = f" (sums: {', '.join(s.sum_columns)})" if s.sum_columns else ""
+        console.print(
+            f"skip candidate row {s.row}: {'+'.join(s.reasons)} {escape(s.first_value)!r}"
+            f"{escape(sums)}"
+        )
+    for u in prof.unpivot_candidates:
+        console.print(
+            f"unpivot candidate {escape(u.from_)} .. {escape(u.to)} "
+            f"({len(u.columns)} cols {u.columns[0]}-{u.columns[-1]}, "
+            f"{escape(u.format or u.pattern or '')}, grain {u.grain})"
+        )
+    for h in prof.scale_hints:
+        console.print(f"scale hint x{h.scale} from {h.ref or h.source}: {escape(h.text)}")
+    for key in prof.keys:
+        console.print(f"key candidate: {escape(' + '.join(key))}")
+    for row in prof.notes_rows:
+        text = "  ".join(f"{c.ref}={c.value}" for c in row.cells)
+        console.print(f"notes row {row.row}: {escape(text)}")
+    for w in prof.warnings:
+        console.print(f"[yellow]warning[/] {escape(w)}")
+    return 0
+
+
+def cmd_wrangle_check(args: argparse.Namespace) -> int:
+    from rich.markup import escape
+
+    try:
+        loaded, problems = _wrangle_check(args.spec)
+    except ModuleNotFoundError as exc:
+        console.print(WRANGLE_MISSING.format(name=exc.name))
+        return 2
+    for p in problems:
+        console.print(f"[red]FAIL[/] {escape(p)}")
+    if loaded is None:
+        return 1
+    console.print(f"spec {loaded.spec.spec}  bundle_sha256 {loaded.bundle_sha256}")
+    for path, sha in sorted(loaded.files.items()):
+        console.print(f"  {escape(path)}  {sha[:12]}")
+    console.print(_approval_line(loaded))
+    if not problems:
+        console.print("[green]ok[/]: the spec, dictionary and crosswalks validate")
+    return 1 if problems else 0
+
+
+def cmd_wrangle_approve(args: argparse.Namespace) -> int:
+    from rich.markup import escape
+
+    try:
+        from .wrangle import approve
+
+        loaded, problems = _wrangle_check(args.spec)
+    except ModuleNotFoundError as exc:
+        console.print(WRANGLE_MISSING.format(name=exc.name))
+        return 2
+    if not args.by.strip():
+        console.print("[red]--by must not be empty[/]")
+        return 2
+    for p in problems:
+        console.print(f"[red]FAIL[/] {escape(p)}")
+    if problems:
+        console.print("[red]refused[/]: `fde wrangle check` fails, so the spec was not approved")
+        return 1
+    stamped = approve(args.spec, by=args.by)
+    console.print(
+        f"approved {stamped.spec.spec} at bundle {stamped.bundle_sha256} by {escape(args.by)}"
+    )
+    return 0
+
+
+WRANGLE_SHOWN_CONFLICTS = 20
+
+
+def _print_wrangle_result(result) -> None:
+    from rich.markup import escape
+
+    rep = result.report
+    approved = "approved" if result.approved else "not approved"
+    console.rule(f"[bold]{escape(rep['spec'])}  bundle {result.loaded.bundle_sha12}  ({approved})")
+    table = Table(title="files")
+    table.add_column("file", overflow="fold")  # the whole path, wrapped, never "…"
+    table.add_column("sheet")
+    for col in ("rows", "skipped", "empty", "facts"):
+        table.add_column(col, justify="right")
+    for f, fr in zip(rep["files"], result.files, strict=True):
+        table.add_row(
+            escape(f["path"]),
+            escape(f["sheet"]),
+            str(f["rows_read"]),
+            str(sum(f["rows_skipped"].values())),
+            str(f["empty_skipped"]),
+            str(len(fr.facts)),
+        )
+    console.print(table)
+    for f in rep["files"]:
+        sec = f.get("section") or {}
+        if sec:
+            bounds = "  ".join(f"{k} {v}" for k, v in sec.items())
+            console.print(f"section {escape(f['sheet'])}: {bounds}")
+        nulls = f.get("null_skipped") or {}
+        if nulls:
+            shown = "  ".join(f"{escape(k)!r} {v}" for k, v in nulls.items())
+            where = f" ({escape(f['sheet'])})" if len(rep["files"]) > 1 else ""
+            console.print(f"placeholders skipped as empty{where}: {shown}")
+    rj = rep["rejects"]
+    console.print(
+        f"facts {rep['facts']}  rejects {rj['total']} (rate {rj['rate']:.4f})  "
+        f"duplicates dropped {rep['duplicates_dropped']}"
+    )
+    for reason, n in rj["by_reason"].items():
+        console.print(f"  reject {n} x {escape(reason)}")
+    ents = "  ".join(f"{k} {v}" for k, v in rep["entities"].items())
+    console.print(f"entities by strategy: {ents}")
+    for p in result.proposed:
+        console.print(
+            f"  [yellow]fuzzy[/] {escape(p.alias)!r} -> {escape(p.canonical)!r} "
+            f"({p.score:g} vs {p.second:g}); see crosswalk.proposed.csv"
+        )
+    conflicts = rep["conflicts_within_load"]
+    console.print(f"conflicts within load: {len(conflicts)}")
+    for c in conflicts[:WRANGLE_SHOWN_CONFLICTS]:
+        console.print(f"  {escape(' / '.join(c['key']))}: {escape(', '.join(c['cells']))}")
+    if len(conflicts) > WRANGLE_SHOWN_CONFLICTS:
+        more = len(conflicts) - WRANGLE_SHOWN_CONFLICTS
+        console.print(f"  ... and {more} more (all of them are in report.json with --out)")
+    similar = rep["similar_entities"]
+    console.print(f"possible duplicate entities: {len(similar)}")
+    for d in similar[:WRANGLE_SHOWN_CONFLICTS]:
+        console.print(
+            f"  [yellow]{d['score']:g}[/] {escape(d['part'])}: {escape(d['a'])!r} ~ "
+            f"{escape(d['b'])!r} ({escape(d['reason'])}; {escape(', '.join(d['cells']))})"
+        )
+    if len(similar) > WRANGLE_SHOWN_CONFLICTS:
+        more = len(similar) - WRANGLE_SHOWN_CONFLICTS
+        console.print(
+            f"  ... and {more} more (all of them are in similar.csv with --out; "
+            "add reviewed pairs to resolve.not_same)"
+        )
+
+
+def _print_gate(reasons: list[str], max_reject_rate: float, *, now: bool) -> None:
+    from rich.markup import escape
+
+    if reasons:
+        verdict = "apply now would refuse" if now else "refused, nothing written"
+        console.print(f"[red]{verdict}[/] (max reject rate {max_reject_rate}):")
+        for r in reasons:
+            console.print(f"  - {escape(r)}")
+    else:
+        console.print(f"[green]apply now would load[/] (max reject rate {max_reject_rate})")
+
+
+def _print_outputs(paths: dict) -> None:
+    from rich.markup import escape
+
+    for name, path in paths.items():
+        console.print(f"wrote {name}: {escape(str(path))}", soft_wrap=True)
+
+
+def _wrangle_run(args: argparse.Namespace):
+    """`run(spec, files)` for dry-run/apply: (result, None), or (None, exit code) after printing
+    why. Bad FILE arguments are 2; a SpecMismatch or a spec that doesn't load is 1."""
+    from rich.markup import escape
+
+    from .wrangle import SpecMismatch, run
+
+    files = _wrangle_files(args.files)
+    if files is None:
+        return None, 2
+    try:
+        return run(args.spec, files, force=args.force), None
+    except SpecMismatch as exc:
+        console.print(f"[red]spec mismatch[/]: {escape(str(exc))}")
+    except ValueError as exc:  # SpecError, pydantic.ValidationError
+        console.print(f"[red]spec error[/]: {escape(str(exc))}")
+    return None, 1
+
+
+def cmd_wrangle_dry_run(args: argparse.Namespace) -> int:
+    try:
+        from .wrangle import gate, write_outputs
+
+        result, code = _wrangle_run(args)
+    except ModuleNotFoundError as exc:
+        console.print(WRANGLE_MISSING.format(name=exc.name))
+        return 2
+    if result is None:
+        return code
+    _print_wrangle_result(result)
+    _print_gate(gate(result), DEFAULT_MAX_REJECT_RATE, now=True)
+    if args.out:
+        _print_outputs(write_outputs(result, args.out))
+    return 0
+
+
+def cmd_wrangle_apply(args: argparse.Namespace) -> int:
+    """Gate first, store second: the approval and reject-rate checks run on the dry-run result
+    before any database connection opens, so a refused apply writes nothing (§8). The load
+    itself is `apply_to_tenant` inside one `store.session(tenant)` transaction."""
+    from rich.markup import escape
+
+    try:
+        from .wrangle import gate, write_outputs
+
+        result, code = _wrangle_run(args)
+    except ModuleNotFoundError as exc:
+        console.print(WRANGLE_MISSING.format(name=exc.name))
+        return 2
+    if result is None:
+        return code
+    rate = args.max_reject_rate
+    reasons = gate(result, draft=args.draft, max_reject_rate=rate)
+    _print_wrangle_result(result)
+    if reasons:
+        _print_gate(reasons, rate, now=False)
+        if args.out:
+            _print_outputs(write_outputs(result, args.out))
+        return 1
+
+    try:
+        from .wrangle.adapter import apply_to_tenant, job_kind_for
+
+        store_cm = _adapter_store(args)
+    except ModuleNotFoundError as exc:
+        console.print(f"[red]{exc.name} not installed[/]: pip install 'fde-kit[rag]'")
+        return 2
+    with store_cm as store, store.session(args.tenant) as s:
+        applied, report = apply_to_tenant(
+            s,
+            result.loaded,
+            [Path(f) for f in args.files],
+            draft=args.draft,
+            max_reject_rate=rate,
+            force=args.force,
+        )
+    if args.out:
+        _print_outputs(write_outputs(applied, args.out))
+    if report is None:  # pragma: no cover - the same gates already passed above
+        _print_gate(gate(applied, draft=args.draft, max_reject_rate=rate), rate, now=False)
+        return 1
+    table = Table(title=f"apply: {escape(args.tenant)}")
+    for col in ("entities", "docs", "changed", "facts", "replaced", "conflicts"):
+        table.add_column(col, justify="right")
+    table.add_column("job")
+    table.add_row(
+        str(report.entities),
+        str(report.documents),
+        str(report.documents_changed),
+        str(report.facts),
+        str(report.facts_replaced),
+        str(report.conflict_groups),
+        report.job_id[:8] or "-",
+    )
+    console.print(table)
+    console.print(f"job kind {escape(job_kind_for(applied.loaded))}")
+    return 0
+
+
+def _add_wrangle_parsers(sub) -> None:
+    wg = sub.add_parser("wrangle", help="messy CSV/XLSX tables -> cited facts, via a mapping spec")
+    wsub = wg.add_subparsers(dest="wrangle_cmd", required=True)
+    pr = wsub.add_parser("profile", help="what is in a sheet: header, types, totals, layout")
+    pr.add_argument("file")
+    pr.add_argument("--sheet", help="XLSX sheet (default: the first)")
+    pr.add_argument(
+        "--encoding",
+        help="CSV encoding (default: try utf-8-sig, then cp1252, then latin-1, and say which)",
+    )
+    pr.add_argument("--json", action="store_true", help="print the profile model as JSON")
+    pr.set_defaults(fn=cmd_wrangle_profile)
+    ck = wsub.add_parser("check", help="validate a spec and its crosswalks; print the bundle hash")
+    ck.add_argument("spec")
+    ck.set_defaults(fn=cmd_wrangle_check)
+    dr = wsub.add_parser("dry-run", help="apply a spec to files without writing to a database")
+    dr.add_argument("spec")
+    dr.add_argument("files", nargs="+", metavar="FILE")
+    dr.add_argument("--out", help="write report.json, rejects.jsonl, previews here")
+    dr.add_argument("--force", action="store_true", help="skip the header fingerprint check")
+    dr.set_defaults(fn=cmd_wrangle_dry_run)
+    ap = wsub.add_parser("approve", help="stamp the spec's approval at its current bundle hash")
+    ap.add_argument("spec")
+    ap.add_argument("--by", required=True)
+    ap.set_defaults(fn=cmd_wrangle_approve)
+    al = wsub.add_parser("apply", help="load a spec's facts into one tenant (gated, §8)")
+    al.add_argument("spec")
+    al.add_argument("files", nargs="+", metavar="FILE")
+    al.add_argument("--tenant", required=True)
+    al.add_argument("--max-reject-rate", type=float, default=DEFAULT_MAX_REJECT_RATE)
+    al.add_argument("--draft", action="store_true", help="load an unapproved spec, tagged draft")
+    al.add_argument("--force", action="store_true", help="skip the header fingerprint check")
+    al.add_argument("--out", help="write report.json, rejects.jsonl, previews here")
+    al.add_argument("--url")
+    al.add_argument("--embedder")
+    al.set_defaults(fn=cmd_wrangle_apply)
+
+
+# --- end wrangle (PR 5)
+
+
 def _print_sources(result) -> None:
     """Evidence the run saw, marking what the answer actually cited.
 
@@ -1203,6 +1613,10 @@ def main(argv: list[str] | None = None) -> int:
     rdr.add_argument("--json", action="store_true", help="machine-readable results")
     rdr.add_argument("--url", help="app database URL (default: $FDE_RAG_URL or from admin URL)")
     ru.set_defaults(fn=cmd_runs)
+
+    # --- wrangle (PR 5)
+    _add_wrangle_parsers(sub)
+    # --- end wrangle (PR 5)
 
     args = p.parse_args(argv)
     return args.fn(args)

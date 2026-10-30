@@ -1,0 +1,30 @@
+spec: eia_transport
+version: 1
+dictionary: ../dictionary.yaml
+source:
+  sheet: Table_5_06_A
+  header_rows: [3, 4]
+  skip_rows:
+    - {blank: ["Transportation / August 2026", "Transportation / August 2025"]}   # notes row 67
+entity:
+  kind: region
+  parts:
+    - column: Census Division and State
+      resolve:
+        policy: open
+        not_same:   # reviewed similar-name warnings: different Census divisions
+          - ["East North Central", "West North Central"]
+          - ["East South Central", "West South Central"]
+          - ["Pacific Contiguous", "Pacific Noncontiguous"]   # lower 48 vs Alaska + Hawaii
+period:
+  unpivot:
+    columns: {from: "Transportation / August 2026", to: "Transportation / August 2025"}
+    ops: [{op: regex, pattern: ".* / (.+)"}, {op: period, format: "%B %Y", grain: month}]
+measures:
+  - field: transportation_price
+    ops: [{op: number}]
+    nulls: ["--", "NM"]
+notes: |
+  `--` is "not applicable" (no transportation sales in that state); `NM` is EIA's "not
+  meaningful" suppression (Connecticut, August 2026). Neither is a price, so both are nulls
+  and are counted, not loaded.

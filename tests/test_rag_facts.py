@@ -764,3 +764,108 @@ def test_migrate_adds_precision_columns_to_a_pr3_schema(admin_url: str, store):
         ).fetchone() == (0,)
     with psycopg.connect(app_url_from_admin(admin_url)) as conn:
         assert check_posture(conn) == []
+
+
+# --- re-exports replace their own facts (PR 5)
+
+
+def test_ingest_versioned_reports_the_superseded_doc_id(store: TenantStore):
+    src = "harbor/reexport-previous.csv"
+    with store.session("harbor") as s:
+        first = s.ingest_versioned(src, "month,amount\n2026-01,100\n")
+        assert first.changed and first.previous_doc_id is None
+        same = s.ingest_versioned(src, "month,amount\n2026-01,100\n")
+        assert not same.changed and same.previous_doc_id is None
+        second = s.ingest_versioned(src, "month,amount\n2026-01,110\n")
+        assert second.changed and second.version == 2
+        assert second.previous_doc_id == first.doc_id
+        assert s.last_ingest is not None and s.last_ingest.previous_doc_id == first.doc_id
+        third = s.ingest_versioned(src, "month,amount\n2026-01,120\n")
+        assert third.previous_doc_id == second.doc_id  # the current row, not the first
+
+
+def test_delete_facts_for_document_is_scoped_to_the_doc_and_the_tenant(
+    store: TenantStore, company: str
+):
+    jan = {"period_start": date(2026, 1, 1), "period_end": date(2026, 1, 31)}
+    summit_name = TENANTS["summit"]["name"]
+    with store.session("harbor") as s:
+        old = s.ingest_versioned("harbor/reexport-delete.csv", "a,1\n").doc_id
+        other = s.ingest_versioned("harbor/reexport-other.csv", "b,2\n").doc_id
+        doomed = s.add_facts(
+            [
+                FactRow(company, "spend", 1, "USD", doc_id=old, **jan),
+                FactRow(company, "headcount", 2, doc_id=old, **jan),
+            ]
+        )
+        kept = s.add_facts(
+            [
+                FactRow(company, "spend", 1, "USD", doc_id=other, **jan),
+                FactRow(company, "spend", 1, "USD", **jan),  # no document at all
+            ]
+        )
+    with store.session("summit") as s:
+        summit_doc = s.ingest_versioned("summit/reexport-delete.csv", "a,1\n").doc_id
+        (summit_fact,) = s.add_facts([FactRow("summit", "spend", 1, "USD", doc_id=summit_doc)])
+
+    try:
+        # Another tenant's doc_id is invisible here: nothing deleted, in either tenant.
+        with store.session("harbor") as s:
+            assert s.delete_facts_for_document(summit_doc) == 0
+        with store.session("summit") as s:
+            assert s.facts_by_id([summit_fact]).keys() == {summit_fact}
+            assert s.delete_facts_for_document(old) == 0
+
+        with store.session("harbor") as s:
+            assert s.delete_facts_for_document(old) == 2
+            remaining = {f.fact_id for f in s.facts(entity=company)}
+            assert remaining == set(kept) and not remaining & set(doomed)
+            # The document row stays, as provenance.
+            assert s.conn.execute(
+                "SELECT count(*) FROM rag_documents WHERE doc_id = %s", (old,)
+            ).fetchone() == (1,)
+            assert s.delete_facts_for_document(old) == 0  # idempotent
+        with store.session("summit") as s:
+            assert s.facts_by_id([summit_fact]).keys() == {summit_fact}
+            assert s.facts(entity=summit_name)  # summit's facts are untouched
+    finally:
+        with store.session("summit") as s:
+            s.conn.execute("DELETE FROM rag_facts WHERE fact_id = %s::uuid", (summit_fact,))
+
+
+def test_delete_facts_for_document_dissolves_conflicts_it_leaves_behind(
+    store: TenantStore, company: str
+):
+    """A fact that only disagreed with the superseded version must not stay flagged."""
+    feb = {"period_start": date(2026, 2, 1), "period_end": date(2026, 2, 28)}
+    with store.session("harbor") as s:
+        v1 = s.ingest_versioned("harbor/regroup-a.csv", "a,1\n").doc_id
+        other = s.ingest_versioned("harbor/regroup-b.csv", "b,1\n").doc_id
+        third = s.ingest_versioned("harbor/regroup-c.csv", "c,1\n").doc_id
+        # Pair 1: v1 says 100, other says 120. Deleting v1 leaves a group of one.
+        s.add_facts([FactRow(company, "returns", 100, doc_id=v1, **feb)])
+        (lonely,) = s.add_facts([FactRow(company, "returns", 120, doc_id=other, **feb)])
+        # Pair 2: v1 says 5; other and third both say 7. Deleting v1 leaves two that agree.
+        s.add_facts([FactRow(company, "scrap", 5, doc_id=v1, **feb)])
+        agree = s.add_facts(
+            [
+                FactRow(company, "scrap", 7, doc_id=other, **feb),
+                FactRow(company, "scrap", 7, doc_id=third, **feb),
+            ]
+        )
+        # Pair 3: v1 says 1; other 2 and third 3. Deleting v1 leaves a real conflict.
+        s.add_facts([FactRow(company, "rework", 1, doc_id=v1, **feb)])
+        still = s.add_facts(
+            [
+                FactRow(company, "rework", 2, doc_id=other, **feb),
+                FactRow(company, "rework", 3, doc_id=third, **feb),
+            ]
+        )
+        assert all(f.conflict_group_id for f in s.facts_by_id([lonely, *agree, *still]).values())
+
+        assert s.delete_facts_for_document(v1) == 3
+        after = s.facts_by_id([lonely, *agree, *still])
+        assert after[lonely].conflict_group_id is None
+        assert all(after[f].conflict_group_id is None for f in agree)
+        groups = {after[f].conflict_group_id for f in still}
+        assert len(groups) == 1 and None not in groups

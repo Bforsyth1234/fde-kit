@@ -244,10 +244,16 @@ class _F:
 
 
 class FakeSession:
+    """Versions by hash like `TenantSession`: a first version is `doc:<source>`, a new hash is
+    `doc:<source>@v<n>` with the superseded doc_id as `previous_doc_id`."""
+
     def __init__(self) -> None:
         self.calls: list[tuple] = []
         self.hashes: dict[str, str] = {}
+        self.doc_ids: dict[str, str] = {}
+        self.versions: dict[str, int] = {}
         self.facts_added: list[FactRow] = []
+        self.jobs: list[tuple[str, str, str]] = []
 
     def upsert_entity(self, kind, canonical_name, aliases=()):
         self.calls.append(("upsert_entity", kind, canonical_name, tuple(aliases)))
@@ -255,19 +261,30 @@ class FakeSession:
 
     def ingest_versioned(self, source, text, *, title="", metadata=None, max_chars=900):
         digest = hashlib.sha256(text.encode()).hexdigest()
-        changed = self.hashes.get(source) != digest
-        self.hashes[source] = digest
         self.calls.append(("ingest_versioned", source, max_chars))
-        return IngestOutcome(f"doc:{source}", 1, changed, digest)
+        previous = self.doc_ids.get(source)
+        if self.hashes.get(source) == digest:
+            return IngestOutcome(previous or "", self.versions[source], False, digest)
+        version = self.versions.get(source, 0) + 1
+        doc_id = f"doc:{source}" if version == 1 else f"doc:{source}@v{version}"
+        self.hashes[source], self.doc_ids[source], self.versions[source] = digest, doc_id, version
+        return IngestOutcome(doc_id, version, True, digest, previous)
 
     def start_extraction_job(self, kind, *, model="", prompt_sha256=""):
         self.calls.append(("start_extraction_job", kind))
+        self.jobs.append((kind, model, prompt_sha256))
         return "job-1"
 
     def add_facts(self, rows, *, extraction_job_id=None):
         self.calls.append(("add_facts", len(rows), extraction_job_id))
         self.facts_added.extend(rows)
         return [f"f{i}" for i in range(len(rows))]
+
+    def delete_facts_for_document(self, doc_id):
+        self.calls.append(("delete_facts_for_document", doc_id))
+        n = sum(1 for r in self.facts_added if r.doc_id == doc_id)
+        self.facts_added = [r for r in self.facts_added if r.doc_id != doc_id]
+        return n
 
     def set_dictionary(self, entries):
         self.calls.append(("set_dictionary", len(list(entries))))
@@ -314,6 +331,90 @@ def test_ingest_is_idempotent_and_fills_doc_id() -> None:
     assert len(s.facts_added) == 1
     assert sum(1 for c in s.calls if c[0] == "add_facts") == 1
     assert sum(1 for c in s.calls if c[0] == "start_extraction_job") == 1
+
+
+def _export(text: str, values: tuple[int, ...]) -> AdapterBatch:
+    """One sheet-like document re-exported with new content, citing `values` as facts."""
+    rows = [
+        FactRow(entity="Acme", field=f"m{i}", value=v, unit="USD", source_ref=f"Plan!B{i}")
+        for i, v in enumerate(values, start=2)
+    ]
+    return AdapterBatch(
+        entities=[RawEntity("company", "Acme")],
+        documents=[RawDocument("plan.xlsx#Plan", "Plan", text)],
+        facts=[RawFact("plan.xlsx#Plan", r) for r in rows],
+    )
+
+
+def test_fake_session_previous_doc_id() -> None:
+    s = FakeSession()
+    first = s.ingest_versioned("a", "one")
+    assert (first.doc_id, first.version, first.changed, first.previous_doc_id) == (
+        "doc:a",
+        1,
+        True,
+        None,
+    )
+    same = s.ingest_versioned("a", "one")
+    assert (same.doc_id, same.changed, same.previous_doc_id) == ("doc:a", False, None)
+    second = s.ingest_versioned("a", "two")
+    assert (second.doc_id, second.version, second.previous_doc_id) == ("doc:a@v2", 2, "doc:a")
+
+
+def test_ingest_keep_leaves_superseded_facts() -> None:
+    s = FakeSession()
+    ingest(s, _ListAdapter([_export("v1", (1, 2, 3))]))
+    report = ingest(s, _ListAdapter([_export("v2", (1, 2, 4))]))
+    assert (report.documents_changed, report.facts, report.facts_replaced) == (1, 3, 0)
+    assert not any(c[0] == "delete_facts_for_document" for c in s.calls)
+    assert [r.doc_id for r in s.facts_added] == ["doc:plan.xlsx#Plan"] * 3 + [
+        "doc:plan.xlsx#Plan@v2"
+    ] * 3
+
+
+def test_ingest_replace_deletes_superseded_facts_before_adding() -> None:
+    s = FakeSession()
+    first = ingest(s, _ListAdapter([_export("v1", (1, 2, 3))]), on_new_version="replace")
+    assert first.facts_replaced == 0  # a first version supersedes nothing
+    assert not any(c[0] == "delete_facts_for_document" for c in s.calls)
+
+    s.calls.clear()
+    report = ingest(s, _ListAdapter([_export("v2", (1, 2, 4))]), on_new_version="replace")
+    assert (report.documents_changed, report.facts, report.facts_replaced) == (1, 3, 3)
+    names = [c[0] for c in s.calls]
+    assert names.index("delete_facts_for_document") < names.index("add_facts")
+    assert ("delete_facts_for_document", "doc:plan.xlsx#Plan") in s.calls
+    assert [(r.doc_id, r.value) for r in s.facts_added] == [
+        ("doc:plan.xlsx#Plan@v2", 1),
+        ("doc:plan.xlsx#Plan@v2", 2),
+        ("doc:plan.xlsx#Plan@v2", 4),
+    ]
+
+    s.calls.clear()  # unchanged re-ingest: nothing deleted, nothing written
+    again = ingest(s, _ListAdapter([_export("v2", (1, 2, 4))]), on_new_version="replace")
+    assert (again.documents_changed, again.facts, again.facts_replaced) == (0, 0, 0)
+    assert not any(c[0] in ("delete_facts_for_document", "add_facts") for c in s.calls)
+
+
+def test_ingest_rejects_unknown_on_new_version() -> None:
+    s = FakeSession()
+    with pytest.raises(ValueError, match="on_new_version"):
+        ingest(s, _ListAdapter([_batch()]), on_new_version="purge")  # type: ignore[arg-type]
+    assert s.calls == []
+
+
+def test_ingest_job_kind_from_adapter_attributes() -> None:
+    s = FakeSession()
+    ingest(s, _ListAdapter([_batch()]))
+    assert s.jobs == [("adapter:fake", "", "")]
+
+    adapter = _ListAdapter([_batch()])
+    adapter.job_kind = "wrangle:plan@0123456789ab"  # type: ignore[attr-defined]
+    adapter.job_model = "none"  # type: ignore[attr-defined]
+    adapter.job_prompt_sha256 = "f" * 64  # type: ignore[attr-defined]
+    s = FakeSession()
+    ingest(s, adapter)
+    assert s.jobs == [("wrangle:plan@0123456789ab", "none", "f" * 64)]
 
 
 def test_ingest_rejects_fact_citing_unknown_document() -> None:
