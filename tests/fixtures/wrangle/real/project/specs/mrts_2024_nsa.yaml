@@ -1,0 +1,29 @@
+spec: mrts_2024_nsa
+version: 1
+dictionary: ../dictionary.yaml
+source:
+  sheet: "2024"
+  header_rows: [4, 5]
+  start_after: {column: Kind of Business, matches: "^NOT ADJUSTED$"}
+  stop_before: {column: Kind of Business, matches: "^ADJUSTED"}       # "ADJUSTED(2)", row 71
+entity:
+  kind: kind_of_business
+  parts:
+    - column: Kind of Business
+      ops: [{op: regex, pattern: "^(.+?)(?:\\(\\d+\\))?$"}]   # `GAFO(1)`: drop the footnote mark
+      resolve: {policy: open}
+period:
+  unpivot:
+    columns: {from: "Jan. 2024", to: "Dec. 2024"}
+    ops: [{op: period, format: ["%b. %Y", "%b %Y"], grain: month}]   # "Jan. 2024", but "May 2024"
+measures:
+  - field: retail_sales_nsa
+    ops: [{op: number}]
+    scale: 1000000
+    nulls: ["(S)", "(NA)"]
+notes: |
+  Row 2: "Estimates are shown in millions of dollars". The sheet stacks two tables: NOT
+  ADJUSTED (rows 7-70) and ADJUSTED (rows 72-109); this spec reads the first. `(S)` is
+  suppressed, `(NA)` not available (older sheets). The TOTAL column is not loaded.
+  NAICS 4522 and 45221 are both "Department stores" with the same values: the second row's
+  cells are duplicates_dropped.

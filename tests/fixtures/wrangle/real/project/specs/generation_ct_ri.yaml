@@ -1,0 +1,28 @@
+spec: generation_ct_ri
+version: 1
+dictionary: ../dictionary.yaml
+source:
+  sheet: 2024_Final
+  header_rows: [5]
+entity:
+  kind: generation_series
+  parts:
+    - column: STATE
+      resolve: {policy: open}
+    - column: TYPE OF PRODUCER
+      resolve: {policy: open}
+    - column: ENERGY SOURCE
+      resolve: {policy: open}
+  template: "{0}/{1}/{2}"
+period:
+  column:
+    name: [YEAR, MONTH]                       # 2024 and 1 -> "2024-1"
+    ops: [{op: period, format: "%Y-%m", grain: month}]
+measures:
+  - field: net_generation
+    column: GENERATION (Megawatthours)
+    ops: [{op: number}]
+notes: |
+  `Total` energy-source rows are EIA's totals for the producer type, not sums of the rows
+  shown (some sources are withheld), so they load as their own series. Net generation can be
+  negative (Petroleum, CHP commercial, CT, January).

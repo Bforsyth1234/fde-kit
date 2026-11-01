@@ -1,0 +1,16 @@
+# Target fields for the wrangle fixtures (a list of rag DictEntry).
+- field: shipped_units
+  definition: Units shipped from the plant to customers in the period.
+  unit: units
+- field: returned_units
+  definition: Units returned by customers in the period, as a negative number (0 when none).
+  unit: units
+- field: revenue_eur
+  definition: Net revenue for the plant in the period, in euros.
+  unit: EUR
+- field: demand_forecast_units
+  definition: Forecast customer demand for the period, in units.
+  unit: units
+- field: line_total_usd
+  definition: Line total (quantity times unit price) on a calculation sheet, in US dollars.
+  unit: USD

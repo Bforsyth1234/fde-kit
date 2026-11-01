@@ -1,0 +1,18 @@
+- field: population
+  definition: Resident population estimate (as of July 1).
+  unit: persons
+- field: residential_price
+  definition: Average retail electricity price, residential sector.
+  unit: cents/kWh
+- field: transportation_price
+  definition: Average retail electricity price, transportation sector.
+  unit: cents/kWh
+- field: retail_sales_nsa
+  definition: Monthly retail and food services sales, not seasonally adjusted.
+  unit: USD
+- field: retail_sales_sa
+  definition: Monthly retail and food services sales, adjusted for seasonal variation and holiday and trading-day differences.
+  unit: USD
+- field: net_generation
+  definition: Monthly net electricity generation.
+  unit: MWh

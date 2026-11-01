@@ -14,12 +14,13 @@ knowing whether it works, with every answer traceable to the records and the pro
 | Run records | A run as a JSONL file: replay it exactly, replay with a live model, or fork it at a turn. Durable runs export to the same file. | `src/fde_kit/record.py` |
 | Eval harness | 25-case golden set, deterministic checks (incl. `cites` / `cites_only`, replayed runs) + optional LLM-as-judge, pass-rate and citation-precision gates wired into CI. | `evals/` |
 
-**Optional extras** (`pip install -e ".[durable]"`, `".[rag]"`):
+**Optional extras** (`pip install -e ".[durable]"`, `".[rag]"`, `".[wrangle]"`):
 
 | Piece | What it is | Where |
 | --- | --- | --- |
 | Durable runtime | The same loop as a Temporal workflow. Kill the worker mid-run; the run finishes on the next one. | `src/fde_kit/durable/` |
 | Multi-tenant retrieval | Hybrid search (pgvector + BM25) over versioned documents, plus a fact table with provenance and precision-aware conflicts, with tenant isolation enforced by Postgres: forced RLS, a partition per tenant, no parameter logging, redacted traces. Three cited tools: `search_documents`, `fetch_document`, `query_table` (read-only SQL). Source adapters load SEC EDGAR filings and local files. 100+ tests, including timing. | `src/fde_kit/rag/`, `rag/adapters/` |
+| Wrangle | Messy CSV/XLSX exports into facts with the exact cell each came from: profile, a reviewed YAML mapping spec, dry run, all-or-nothing apply with a reject gate. No LLM. | `src/fde_kit/wrangle/` |
 
 What building and testing it turned up (live eval scores, real SEC data, the isolation
 attacks, a measured timing leak) is in **[docs/FINDINGS.md](docs/FINDINGS.md)**.
@@ -52,7 +53,7 @@ built in for tests and offline eval runs.
 Sections below: [Quick start](#quick-start) · [Add a tool](#add-a-tool) ·
 [Citations](#citations) · [Prompt versioning](#prompt-versioning) ·
 [Record, replay, fork](#record-replay-fork) · [Evals](#evals) ·
-[Durable runs](#durable-runs-temporal) · [Multi-tenant retrieval](#multi-tenant-retrieval) ·
+[Durable runs](#durable-runs-temporal) · [Multi-tenant retrieval](#multi-tenant-retrieval) · [Wrangle messy tables](#wrangle-messy-tables) ·
 [Baseline results](#baseline-results) · [Configuration](#configuration) ·
 [What's not here yet](#whats-not-here-yet)
 
@@ -797,6 +798,70 @@ Measured results:
 - [Retrieval numbers](docs/FINDINGS.md#retrieval-numbers): hybrid hit@1 0.96, cross-tenant hits 0.
 - [Costs and limits](docs/FINDINGS.md#costs-and-limits).
 
+## Wrangle messy tables
+
+Install: `pip install -e ".[wrangle,rag]"`. Spec: [docs/pr5-wrangle-core.md](docs/pr5-wrangle-core.md).
+
+Customer numbers usually arrive as exports that were never meant to meet: plant `1007` here,
+`DET-07` there, thousands in one file and units in the next, months across the columns, a
+"Subtotal" row every few lines. `fde_kit.wrangle` loads them into the fact table with
+**the exact cell each number came from**.
+
+The rule: **a mapping spec says what each column means, a person approves it, and plain code
+applies it.** The spec is a small YAML file (entity, period, measures, and a closed set of parse
+ops, with no expressions). An approval is bound to a hash of the spec plus its crosswalks and
+dictionary, so editing either one after approval invalidates it.
+
+```bash
+fde wrangle profile planner.xlsx                 # header rows, formats, totals, unpivot and scale hints
+fde wrangle dry-run specs/planner_forecast.yaml planner.xlsx --out out/   # no database
+fde wrangle approve specs/planner_forecast.yaml --by brooks
+fde wrangle apply   specs/planner_forecast.yaml planner.xlsx --tenant acme
+```
+
+```
+──────────── planner_forecast  bundle b848aef9e343  (not approved) ─────────────
+facts 35  rejects 0 (rate 0.0000)  duplicates dropped 0
+entities by strategy: exact 4  normalised 1  fuzzy 0  new 3
+conflicts within load: 0
+possible duplicate entities: 0
+apply now would refuse (max reject rate 0.02):
+  - spec 'planner_forecast' is not approved (run `fde wrangle approve`, or load with --draft)
+```
+
+What a load guarantees:
+
+- **Cell-level provenance.** Every fact's `source_ref` is `Plan!D14@wrangle:<spec>/<bundle>/<file>`,
+  so `query_table` reports it as "reported as Plan!D14". Each sheet is stored as a document with
+  Excel row numbers, so `fetch_document` shows a person row 14 as row 14. A test re-reads every
+  loaded fact's cell from the file and checks that it parses back to the stored value.
+- **Nothing silent.** Every cell that didn't load goes to `rejects.jsonl` with its cell, raw
+  value, the op that failed and why. A formula with no cached value is a reject, never a 0. A
+  date that could be 3 April or 4 March is flagged by the profile, not guessed.
+- **All or nothing.** Apply writes nothing (exit 1) if the spec isn't approved at its current hash
+  or if the reject rate is over `--max-reject-rate` (default 2%). A load that is 30% rejects is a
+  wrong spec, not a dirty file. One load is one transaction.
+- **Conflicts kept.** Two sources that disagree on Toledo's October shipments land in one conflict
+  group; two that agree at the declared precision (48,613 vs "48,6" in thousands) do not.
+- **Re-exports replace.** With a fixed `document_key` (like `{spec}#{sheet}`), next month's
+  export supersedes this month's, and its facts replace the old version's instead of being added
+  on top (`ingest(..., on_new_version="replace")`). Each document's text names the spec's bundle
+  hash, so re-applying a corrected spec to the same file replaces its facts too. The default key,
+  `{spec}/{file}#{sheet}`, keeps files with different names, and different specs over one
+  file, as separate documents.
+- **No false merges by default.** Plant names resolve exact → normalised (`DET-07` = `det7`) →
+  optional fuzzy with a margin rule, against a reviewed crosswalk. Unknown names in a closed
+  crosswalk are rejects.
+
+Tested on real files as well as fixtures: Census and EIA spreadsheets with Latin-1 bytes,
+two tables on one sheet, `(S)` placeholders and a 19 MB workbook. `tests/test_wrangle_real.py` checks
+every loaded fact against an independent read of the file. What that turned up is in
+[FINDINGS](docs/FINDINGS.md#wrangling-real-government-files).
+
+There's no LLM in this path yet. A person writes the spec, helped by `profile`. The plan for an
+agent that proposes specs, measured against a benchmark with known answers, is in
+[docs/wrangle-plan.md](docs/wrangle-plan.md).
+
 ## Baseline results
 
 Live, against `claude-sonnet-5-5`, October 2026:
@@ -877,7 +942,8 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
 
 ## What's not here yet
 
-LLM extraction jobs (the table exists; `fde rag extract` does not), pairwise/A-B eval mode, a
+LLM extraction jobs (the table exists; `fde rag extract` does not), an agent that proposes
+wrangle specs (PR 7 in [the plan](docs/wrangle-plan.md)), summing line-level rows into one fact, pairwise/A-B eval mode, a
 customers/ onboarding directory, a one-command cloud deploy, and PDF ingestion in `local_files`
 (PDFs are skipped with a warning; there is no PDF dependency).
 

@@ -1,0 +1,45 @@
+spec: mrts_all_nsa
+version: 1
+dictionary: ../dictionary.yaml
+source:
+  sheets: {matching: "^\\d{4}$"}                  # every year sheet, 2026 back to 1992
+  header_rows: [4, 5]
+  start_after: {column: Kind of Business, matches: "^NOT ADJUSTED$"}
+  stop_before: {column: Kind of Business, matches: "^ADJUSTED"}       # "ADJUSTED(2)", row 71
+entity:
+  kind: kind_of_business
+  parts:
+    - column: Kind of Business
+      ops: [{op: regex, pattern: "^(.+?)(?:\\(\\d+\\))?$"}]   # `GAFO(1)`: drop the footnote mark
+      resolve:
+        policy: open
+        not_same:   # reviewed similar-name warning: NAICS 44811 and 44812, different stores
+          - ["Men's clothing stores", "Women's clothing stores"]
+period:
+  unpivot:
+    # Month labels only: "Jan. 2024", "May 2024", "Aug. 2026(p)". Not TOTAL (complete years),
+    # not CY CUM / PY CUM (the partial current year's year-to-date columns).
+    matching: "^[A-Z][a-z]{2}\\.? \\d{4}(\\(p\\))?$"
+    ops:
+      - {op: regex, pattern: "^(.+?)(?:\\(p\\))?$"}            # "(p)": preliminary estimate
+      - {op: period, format: ["%b. %Y", "%b %Y"], grain: month}
+measures:
+  - field: retail_sales_nsa
+    ops: [{op: number}]
+    scale: 1000000
+    nulls: ["(S)", "(NA)"]
+notes: |
+  The NOT ADJUSTED table of every year sheet (1992-2026), one document per sheet, in millions
+  of dollars (row 2 of each sheet). All 35 sheets share one layout: header rows 4-5, NOT
+  ADJUSTED at row 6, ADJUSTED(2) at row 71, the same 64 kinds of business in the same rows; so
+  no sheet is excluded. What does differ by year, and is handled here:
+  - Placeholders: `(S)` (suppressed) from 2017 on; `(NA)` (not available) in 1992-2000, for
+    the lines whose NAICS series start later. Both are nulls, counted per sheet.
+  - The 2026 sheet is the current, partial year: months through the latest release only, the
+    latest one marked `(p)` preliminary ("Aug. 2026(p)"), and CY CUM / PY CUM year-to-date
+    columns where full years have TOTAL. `matching` takes month labels only.
+  - Header row 4 has empty-string cells over the months from 2016 on and none before; the
+    joined labels are the same either way.
+  A preliminary month is revised in the next release; with the default document_key each
+  sheet is its own document, so reloading a newer file supersedes the 2026 sheet's facts.
+  NAICS 4522 and 45221 are both "Department stores" with equal values: duplicates_dropped.

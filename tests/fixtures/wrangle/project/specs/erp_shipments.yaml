@@ -1,0 +1,37 @@
+spec: erp_shipments
+version: 1
+dictionary: ../dictionary.yaml
+crosswalks:
+  plants: {path: ../crosswalks/plants.csv, kind: plant}
+
+source:
+  header_rows: [1]
+  delimiter: ","
+  # document_key: default "{spec}/{file}#{sheet}"
+
+entity:
+  kind: plant
+  parts:
+    - column: PLANT_CD
+      ops: [{op: text, strip: true}]
+      resolve: {crosswalk: plants, policy: closed, fuzzy: false}
+
+period:
+  column:
+    name: SHIP_DT
+    ops: [{op: text, strip: true}, {op: date, format: "%Y%m%d"}]
+    grain: month
+
+measures:
+  - field: shipped_units
+    column: QTY_SHIPPED
+    ops:
+      - {op: text, strip: true}
+      - {op: number, thousands: ",", decimal: "."}
+    unit: units
+    empty: skip
+
+notes: |
+  ERP extract, one row per plant per month; SHIP_DT is the month-end posting date (YYYYMMDD).
+  PLANT_CD is the 4-digit ERP code; some codes and quantities carry trailing spaces, and some
+  quantities have a thousands comma (quoted in the CSV). Exact units, so no precision.

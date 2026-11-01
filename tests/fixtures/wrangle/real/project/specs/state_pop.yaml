@@ -1,0 +1,25 @@
+spec: state_pop
+version: 1
+dictionary: ../dictionary.yaml
+source:
+  sheet: NST-EST2025-POP
+  header_rows: [3, 4]
+  skip_rows:
+    - {blank: ["Population Estimate (as of July 1) / 2025"]}   # the blank row 61, footnotes below
+entity:
+  kind: area
+  parts:
+    - column: Geographic Area
+      ops: [{op: regex, pattern: "^\\.?(.+)$"}]   # `.Alabama`: the dot marks a sub-part
+      resolve: {policy: open}
+period:
+  unpivot:
+    columns: {from: "Population Estimate (as of July 1) / 2020", to: "Population Estimate (as of July 1) / 2025"}
+    ops: [{op: regex, pattern: ".* / (\\d{4})"}, {op: period, format: "%Y", grain: year}]
+measures:
+  - field: population
+    ops: [{op: number}]
+notes: |
+  The year header cells (row 4) are numbers; the joined label is "Population Estimate (as of
+  July 1) / 2020". The estimate is as of July 1; the fact's period is the calendar year.
+  Column B (April 1, 2020 estimates base) is not loaded.
