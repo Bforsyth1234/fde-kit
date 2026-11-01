@@ -302,6 +302,18 @@ def values_agree(a: Num | str, pa: Num | None, b: Num | str, pb: Num | None) -> 
         return (da / p).quantize(one, ROUND_HALF_UP) == (db / p).quantize(one, ROUND_HALF_UP)
 
 
+def _stored_num(v: Num) -> Decimal:
+    """The NUMERIC that Postgres stores for `v` bound as `%s::numeric`, as a Decimal.
+
+    An int or a Decimal is stored exactly. A float is bound as float8, and Postgres's
+    float8 -> numeric cast keeps DBL_DIG (15) significant digits via `%.15g`: 0.1 + 0.2 is
+    stored as 0.3. `add_facts` compares a row with earlier rows of the same batch by these
+    stored values, as it would after reading them back, and writes them as Decimals."""
+    if isinstance(v, float):
+        return Decimal(f"{v:.15g}")
+    return v if isinstance(v, Decimal) else Decimal(v)
+
+
 def fuse(
     vec: list[Hit], kw: list[Hit], k: int, method: Fusion = "relative", alpha: float = 0.5
 ) -> list[Hit]:
@@ -471,6 +483,7 @@ class TenantSession:
         title: str = "",
         metadata: dict[str, Any] | None = None,
         max_chars: int = 900,
+        index: bool = True,
     ) -> IngestOutcome:
         """Idempotent by sha256 of `text`.
 
@@ -480,22 +493,38 @@ class TenantSession:
           only ever sees current chunks) and this tenant's cache cleared. The old row stays as
           provenance, so an old citation's doc_id + content_hash still resolves. Its doc_id is
           the outcome's `previous_doc_id`.
+
+        `index=False` stores the document without indexing it for search: the row (body, hash,
+        version, `superseded_by`) is written exactly as above, but no chunks are made or
+        embedded, so `search` never returns it while `fetch` (which reads the body) works as
+        for any document. Its metadata gets `"indexed": "false"` (a reserved key: passing it
+        in `metadata` is a ValueError). Use it for a body worth showing a person and not worth
+        searching, like a spreadsheet stored as CSV.
+
+        Same hash with the other `index` setting is not a new version: the current row is
+        indexed (chunks made and embedded, the key dropped from its metadata) or unindexed
+        (chunks deleted, the key set) in place, the cache is cleared, and the outcome still
+        has `changed=False`, since the text, and so any facts cited to it, didn't change.
         """
+        if metadata and "indexed" in metadata:
+            raise ValueError("metadata key 'indexed' is reserved: pass index=False instead")
         digest = content_hash(text)
         current = self.conn.execute(
             self.sql(
-                "SELECT doc_id::text, version, content_hash FROM @docs "
+                "SELECT doc_id::text, version, content_hash, metadata->>'indexed' FROM @docs "
                 "WHERE source = %s AND superseded_by IS NULL ORDER BY version DESC LIMIT 1"
             ),
             (source,),
         ).fetchone()
         if current is not None and current[2] == digest:
+            if (current[3] != "false") != index:
+                self._set_indexed(current[0], text, title, max_chars, index)
             outcome = IngestOutcome(current[0], int(current[1]), False, digest)
             self.last_ingest = outcome
             return outcome
 
-        chunks = chunk_text(text, title=title, max_chars=max_chars)
-        vecs = self.embedder.embed_documents(chunks) if chunks else []
+        if not index:
+            metadata = {**(metadata or {}), "indexed": "false"}
         row = self.conn.execute(
             self.sql("""
             INSERT INTO @docs (tenant_id, source, title, metadata, content_hash, version, body)
@@ -521,6 +550,20 @@ class TenantSession:
                 (doc_id, current[0]),
             )
             self.conn.execute(self.sql("DELETE FROM @chunks WHERE doc_id = %s"), (current[0],))
+        if index:
+            self._write_chunks(doc_id, text, title, max_chars)
+        # Anything cached for this tenant may now be stale.
+        self.conn.execute(self.sql("DELETE FROM @cache"))
+        outcome = IngestOutcome(
+            doc_id, version, True, digest, current[0] if current is not None else None
+        )
+        self.last_ingest = outcome
+        return outcome
+
+    def _write_chunks(self, doc_id: str, text: str, title: str, max_chars: int) -> None:
+        """Chunk, embed and insert one document's chunks."""
+        chunks = chunk_text(text, title=title, max_chars=max_chars)
+        vecs = self.embedder.embed_documents(chunks) if chunks else []
         spans = chunk_spans(text, chunks, title)
         with self.conn.cursor() as cur:
             cur.executemany(
@@ -534,13 +577,17 @@ class TenantSession:
                     for i, (c, v, (cs, ce)) in enumerate(zip(chunks, vecs, spans, strict=True))
                 ],
             )
-        # Anything cached for this tenant may now be stale.
-        self.conn.execute(self.sql("DELETE FROM @cache"))
-        outcome = IngestOutcome(
-            doc_id, version, True, digest, current[0] if current is not None else None
+
+    def _set_indexed(self, doc_id: str, text: str, title: str, max_chars: int, index: bool) -> None:
+        """Index (or unindex) the current version in place; see `ingest_versioned`."""
+        self.conn.execute(self.sql("DELETE FROM @chunks WHERE doc_id = %s"), (doc_id,))
+        if index:
+            self._write_chunks(doc_id, text, title, max_chars)
+        self.conn.execute(
+            self.sql("UPDATE @docs SET metadata = (metadata - 'indexed') || %s WHERE doc_id = %s"),
+            (Jsonb({} if index else {"indexed": "false"}), doc_id),
         )
-        self.last_ingest = outcome
-        return outcome
+        self.conn.execute(self.sql("DELETE FROM @cache"))
 
     # ------------------------------------------------------------------ entities / facts
 
@@ -574,6 +621,62 @@ class TenantSession:
         ).fetchone()
         return row[0] if row else None
 
+    def conflict_group_ids(self, entities: Iterable[str]) -> set[str]:
+        """The distinct conflict groups among the facts of these entities (canonical names or
+        aliases, resolved as `resolve_entity` does; unknown names are ignored). One statement:
+        the same answer as collecting `conflict_group_id` over `facts(entity=n)` for each name,
+        which cost one entity scan per name (17 s for the 3,144 counties of the Census file)."""
+        ids = sorted(set(self._resolve_entities(entities).values()))
+        if not ids:
+            return set()
+        rows = self.conn.execute(
+            self.sql(
+                "SELECT DISTINCT conflict_group_id::text FROM @facts "
+                "WHERE entity_id = ANY(%s::uuid[]) AND conflict_group_id IS NOT NULL"
+            ),
+            (ids,),
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def _resolve_entities(self, names: Iterable[str]) -> dict[str, str]:
+        """`resolve_entity` for many names in one statement: {name: entity_id} for the names
+        that resolve. Same rule, same SQL expressions (Postgres's `lower()` and the column's
+        collation for the canonical_name tie-break), so a name resolves here exactly as it
+        does there. Every canonical name and alias becomes one lowered key and the names
+        hash-join against them: one pass over the entities, not one scan per name.
+
+        Measured on PG 16 (one statement for 3,300 names): 23 ms at 3,100 entities and 274 ms
+        at 50,000, against 26 s and ~400 s for `resolve_entity` per name (each call scans every
+        entity's aliases) and the same for a LATERAL form of it. Loading the entities and
+        matching in Python was faster still (7 ms, 152 ms) but would use Python's `str.lower`
+        and code-point order where `resolve_entity` uses Postgres's `lower()` and collation,
+        so a name could resolve differently. One or two names go through `resolve_entity`,
+        which is cheaper than a pass over every alias."""
+        distinct = list(dict.fromkeys(names))
+        if len(distinct) <= 2:
+            return {n: e for n in distinct if (e := self.resolve_entity(n)) is not None}
+        rows = self.conn.execute(
+            self.sql("""
+            SELECT DISTINCT ON (q.name) q.name, k.entity_id::text
+            FROM unnest(%s::text[]) AS q(name)
+            JOIN (SELECT entity_id, canonical_name, lower(canonical_name) AS key FROM @entities
+                  UNION ALL
+                  SELECT entity_id, canonical_name, lower(al.a)
+                  FROM @entities, unnest(aliases) AS al(a)) AS k
+              ON k.key = lower(q.name)
+            ORDER BY q.name, (lower(k.canonical_name) = lower(q.name)) DESC, k.canonical_name
+            """),
+            (distinct,),
+        ).fetchall()
+        return dict(rows)
+
+    def _facts_lock_key(self) -> int:
+        """64-bit advisory lock key for this tenant's fact writes. Derived from the facts
+        partition name, which is an HMAC of the tenant id when a partition key is configured,
+        so `pg_locks` reveals no more about tenants than `pg_class` does."""
+        digest = hashlib.sha256(b"fde-kit add_facts " + self._tables["@facts"].encode()).digest()
+        return int.from_bytes(digest[:8], "big", signed=True)
+
     def start_extraction_job(self, kind: str, *, model: str = "", prompt_sha256: str = "") -> str:
         row = self.conn.execute(
             self.sql(
@@ -603,10 +706,39 @@ class TenantSession:
         disagrees with 51,750M, so it joins the group. A group means "the values on record for
         this key are not all the same", not "these are the outliers"; which member is current
         is for the reader (or the adapter's filing dates) to decide.
+
+        A list of rows is one batch with the same result as adding them one at a time, in
+        order: each row is compared with the facts on record *and* the batch's earlier rows
+        (by the values Postgres stores for them, see `_stored_num`), and group joining spans
+        both. What changes is the cost. Every row is validated first, so a bad row raises
+        before anything is written. Then: one statement resolves every distinct entity name,
+        one fetches the existing facts for every (entity, field, period) key in the batch, the
+        conflict rule runs in memory, and one INSERT writes the new facts (fact_ids are made
+        here, so the order of the returned list is the input's) and one UPDATE re-groups
+        existing facts that joined a group. Four round trips per call instead of 3-4 per row.
+
+        Concurrency: the candidate fetch and the writes run under a transaction-scoped advisory
+        lock on this tenant's facts (`pg_advisory_xact_lock`, released at commit or rollback).
+        Without it, two transactions adding facts for one key at the same time each miss the
+        other's uncommitted rows and neither records the conflict. The second waits for the
+        first to commit; under READ COMMITTED (the session's default) its candidate fetch, a
+        new statement, then sees the first's rows. It serializes fact loading per tenant, not
+        across tenants. Any other writer of rag_facts that wants the conflict rule to hold
+        must take the same lock (`_facts_lock_key`).
+
+        When a new fact disagrees with members of two different groups on one key (possible
+        only with mixed precisions: 10 and 10.3 exact are grouped, 10.4 at p=1 agrees with both,
+        then 10 at p=1.09 groups with 10.4 alone), the group it takes is the first differing
+        candidate's in physical (ctid) order, as before. That order is exact for facts on
+        record before the call; rows re-grouped earlier in the same call keep their position
+        here, while a row-at-a-time UPDATE would have moved them.
         """
-        out: list[str] = []
+        if not rows:
+            return []
+        resolved = self._resolve_entities(r.entity for r in rows)
+        checked: list[tuple[str, FactRow]] = []
         for r in rows:
-            entity_id = self.resolve_entity(r.entity)
+            entity_id = resolved.get(r.entity)
             if entity_id is None:
                 raise ValueError(f"unknown entity {r.entity!r} for tenant {self.tenant_id}")
             if isinstance(r.value, bool) or not isinstance(r.value, int | float | Decimal | str):
@@ -618,64 +750,131 @@ class TenantSession:
                     raise ValueError(f"precision applies to numbers only, got {r.value!r}")
                 if isinstance(r.precision, bool) or not r.precision > 0:
                     raise ValueError(f"precision must be positive, got {r.precision!r}")
-            num = r.value if isinstance(r.value, int | float | Decimal) else None
-            txt = r.value if isinstance(r.value, str) else None
-            candidates = self.conn.execute(
-                self.sql("""
-                SELECT fact_id::text, conflict_group_id::text, value_num, value_text, precision
-                FROM @facts
-                WHERE entity_id = %(e)s::uuid AND field = %(f)s::text
-                  AND period_start IS NOT DISTINCT FROM %(ps)s::date
-                  AND period_end IS NOT DISTINCT FROM %(pe)s::date
-                """),
-                {"e": entity_id, "f": r.field, "ps": r.period_start, "pe": r.period_end},
-            ).fetchall()
-            differing = [
-                (fid, grp)
-                for fid, grp, vnum, vtxt, prec in candidates
-                if not values_agree(
-                    r.value, r.precision, vnum if vnum is not None else vtxt, prec
-                )
-            ]
-            group: str | None = None
-            if differing:
-                group = next((g for _, g in differing if g), None) or str(uuid.uuid4())
-                self.conn.execute(
-                    self.sql(
-                        "UPDATE @facts SET conflict_group_id = %s::uuid "
-                        "WHERE fact_id = ANY(%s::uuid[]) "
-                        "AND conflict_group_id IS DISTINCT FROM %s::uuid"
-                    ),
-                    (group, [f for f, _ in differing], group),
-                )
-            row = self.conn.execute(
-                self.sql("""
-                INSERT INTO @facts (tenant_id, entity_id, field, period_start, period_end,
-                                    value_num, value_text, unit, doc_id, chunk_id,
-                                    conflict_group_id, extraction_job_id, precision, source_ref)
-                VALUES (%s, %s::uuid, %s, %s::date, %s::date, %s::numeric, %s::text, %s,
-                        %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::numeric, %s)
-                RETURNING fact_id::text
-                """),
+            checked.append((entity_id, r))
+        # A period that isn't a plain date (a str, a datetime) goes through the same `::date`
+        # cast as before, so in-memory keys equal the stored ones.
+        odd = {
+            p
+            for r in rows
+            for p in (r.period_start, r.period_end)
+            if p is not None and type(p) is not date
+        }
+        as_date = {
+            p: self.conn.execute("SELECT %s::date", (p,)).fetchone()[0]  # type: ignore[index]
+            for p in odd
+        }
+        Key = tuple[str, str, date | None, date | None]
+        prepared: list[tuple[Key, FactRow]] = [
+            (
                 (
-                    self.tenant_id,
                     entity_id,
                     r.field,
-                    r.period_start,
-                    r.period_end,
-                    num,
-                    txt,
+                    as_date.get(r.period_start, r.period_start),
+                    as_date.get(r.period_end, r.period_end),
+                ),
+                r,
+            )
+            for entity_id, r in checked
+        ]
+
+        self.conn.execute("SELECT pg_advisory_xact_lock(%s)", (self._facts_lock_key(),))
+        keys = list(dict.fromkeys(k for k, _ in prepared))
+        # Candidates per key, in the order the row-at-a-time SELECT returned them (heap order:
+        # equal index keys are ordered by ctid, and so is a seq scan), then this batch's rows.
+        # Each is [fact_id, conflict_group_id, value, precision].
+        cands: dict[Key, list[list[Any]]] = {}
+        original: dict[str, str | None] = {}
+        for fid, eid, fld, ps, pe, grp, vnum, vtxt, prec in self.conn.execute(
+            self.sql("""
+            SELECT f.fact_id::text, f.entity_id::text, f.field, f.period_start, f.period_end,
+                   f.conflict_group_id::text, f.value_num, f.value_text, f.precision
+            FROM unnest(%s::uuid[], %s::text[], %s::date[], %s::date[]) AS k(e, f, ps, pe)
+            JOIN @facts f ON f.entity_id = k.e AND f.field = k.f
+                         AND f.period_start IS NOT DISTINCT FROM k.ps
+                         AND f.period_end IS NOT DISTINCT FROM k.pe
+            ORDER BY f.ctid
+            """),
+            [list(c) for c in zip(*keys, strict=True)],
+        ).fetchall():
+            cands.setdefault((eid, fld, ps, pe), []).append(
+                [fid, grp, vnum if vnum is not None else vtxt, prec]
+            )
+            original[fid] = grp
+
+        out: list[str] = []
+        new: list[list[Any]] = []
+        for key, r in prepared:
+            group: str | None = None
+            on_record = cands.setdefault(key, [])
+            differing = [
+                c for c in on_record if not values_agree(r.value, r.precision, c[2], c[3])
+            ]
+            if differing:
+                group = next((c[1] for c in differing if c[1]), None) or str(uuid.uuid4())
+                for c in differing:
+                    c[1] = group
+            fact_id = str(uuid.uuid4())
+            stored = r.value if isinstance(r.value, str) else _stored_num(r.value)
+            prec = _stored_num(r.precision) if r.precision is not None else None
+            entry = [fact_id, group, stored, prec]
+            on_record.append(entry)
+            new.append([entry, key, r])
+            out.append(fact_id)
+
+        def _uuid(v: Any) -> str | None:
+            return None if v is None else str(v)
+
+        cols: list[list[Any]] = [[] for _ in range(13)]
+        for (fid, grp, stored, prec), (eid, fld, ps, pe), r in new:
+            for col, v in zip(
+                cols,
+                (
+                    fid,
+                    eid,
+                    fld,
+                    ps,
+                    pe,
+                    None if isinstance(stored, str) else stored,
+                    stored if isinstance(stored, str) else None,
                     r.unit,
-                    r.doc_id,
-                    r.chunk_id,
-                    group,
-                    extraction_job_id,
-                    r.precision,
+                    _uuid(r.doc_id),
+                    _uuid(r.chunk_id),
+                    grp,
+                    prec,
                     r.source_ref,
                 ),
-            ).fetchone()
-            assert row is not None
-            out.append(row[0])
+                strict=True,
+            ):
+                col.append(v)
+        self.conn.execute(
+            self.sql("""
+            INSERT INTO @facts (fact_id, tenant_id, entity_id, field, period_start, period_end,
+                                value_num, value_text, unit, doc_id, chunk_id,
+                                conflict_group_id, extraction_job_id, precision, source_ref)
+            SELECT u.fact_id, %s, u.entity_id, u.field, u.ps, u.pe, u.num, u.txt, u.unit,
+                   u.doc_id, u.chunk_id, u.grp, %s::uuid, u.prec, u.src
+            FROM unnest(%s::uuid[], %s::uuid[], %s::text[], %s::date[], %s::date[],
+                        %s::numeric[], %s::text[], %s::text[], %s::uuid[], %s::uuid[],
+                        %s::uuid[], %s::numeric[], %s::text[])
+                 AS u(fact_id, entity_id, field, ps, pe, num, txt, unit, doc_id, chunk_id,
+                      grp, prec, src)
+            """),
+            (self.tenant_id, _uuid(extraction_job_id), *cols),
+        )
+        regrouped = [
+            (fid, c[1])
+            for entries in cands.values()
+            for c in entries
+            if (fid := c[0]) in original and c[1] != original[fid]
+        ]
+        if regrouped:
+            self.conn.execute(
+                self.sql(
+                    "UPDATE @facts f SET conflict_group_id = u.g "
+                    "FROM unnest(%s::uuid[], %s::uuid[]) AS u(id, g) WHERE f.fact_id = u.id"
+                ),
+                ([f for f, _ in regrouped], [g for _, g in regrouped]),
+            )
         return out
 
     def delete_facts_for_document(self, doc_id: str) -> int:

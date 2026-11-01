@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 from pathlib import Path
 
 import pydantic
@@ -256,6 +257,38 @@ def test_header_fingerprint_checked_per_sheet(tmp_path: Path) -> None:
     with pytest.raises(SpecMismatch, match=r"c.xlsx sheet '2023': header_fingerprint is"):
         run(spec, [book2])
     assert run(spec, [book2], force=True).report["facts"] == 11
+
+
+def test_a_load_opens_and_hashes_each_workbook_once(
+    tmp_path: Path, book: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Listing the sheets and reading three of them: one `load_workbook`, one read of the
+    bytes for the hash, and the books are closed after the load, also when it is refused."""
+    from fde_kit.wrangle import read
+
+    spec = _project(tmp_path, MATCHING)
+    expected = run(spec, [book])
+    loads, reads, closed = [], [], []
+    real_load, real_read, real_close = (
+        openpyxl.load_workbook,
+        Path.read_bytes,
+        read.XlsxBook.close,
+    )
+    monkeypatch.setattr(
+        openpyxl, "load_workbook", lambda *a, **k: loads.append(1) or real_load(*a, **k)
+    )
+    monkeypatch.setattr(Path, "read_bytes", lambda self: reads.append(self) or real_read(self))
+    monkeypatch.setattr(read.XlsxBook, "close", lambda self: closed.append(1) or real_close(self))
+    result = run(spec, [book])
+    assert len(loads) == 1 and reads.count(book) == 1 and closed == [1]
+    assert result.report == expected.report and result.documents == expected.documents
+    assert {f.file_sha256 for f in result.files} == {hashlib.sha256(real_read(book)).hexdigest()}
+
+    closed.clear()
+    bad = _workbook(tmp_path / "bad.xlsx", {**SHEETS, "2021": (2021, [])}, **{"2021": "Shop"})
+    with pytest.raises(SpecMismatch, match="sheet '2021'"):
+        run(spec, [bad])
+    assert closed == [1]
 
 
 def test_document_key_without_sheet_collides(tmp_path: Path, book: Path) -> None:

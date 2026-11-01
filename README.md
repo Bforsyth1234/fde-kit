@@ -608,12 +608,17 @@ returns the `IngestOutcome` (`doc_id`, `version`, `changed`, `content_hash`), wh
 also leaves on `session.last_ingest`.
 
 - Same source, same hash: nothing is written; the current `doc_id` comes back with
-  `changed=False`.
+  `changed=False`. (Unless the call asks for the other `index` setting, below: then the current
+  version is indexed or unindexed in place, still with `changed=False`.)
 - Same source, new hash: a new row at `version = max + 1` with the new body, the previous
   current row's `superseded_by` pointed at it, the previous version's chunks deleted and the
   tenant's cache cleared. Search only ever sees current chunks. The old row stays, with its
   source, hash, version and body, so an old citation's `doc_id` + `content_hash` still
   resolves; its chunk ids do not.
+- `index=False` stores a document without indexing it: the same row, body, hash and
+  versioning, but no chunks and no embeddings, so search never returns it and `fetch` (which
+  reads the body) works as usual. Its metadata gets `"indexed": "false"`. Wrangle's
+  `source.index: false` uses it for sheets worth showing a person but not worth embedding.
 - `fetch(doc_id)` on a superseded document returns its old body with `superseded_by` set, so a
   reader can see what changed. An unknown `doc_id` raises `KeyError`, and under RLS another
   tenant's `doc_id` is unknown, so the error is identical for "no such document" and "not yours".

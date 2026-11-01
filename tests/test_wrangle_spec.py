@@ -529,3 +529,28 @@ def test_new_settings_enter_the_bundle_hash_only_when_set(tmp_path):
     one = load_project_spec(write_project(tmp_path / "d", spec_with(measures__0__nulls=["a", "b"])))
     two = load_project_spec(write_project(tmp_path / "e", spec_with(measures__0__nulls=["b", "a"])))
     assert one.bundle_sha256 != two.bundle_sha256
+
+
+def test_source_index_defaults_true_and_validates():
+    assert MappingSpec.model_validate(SPEC).source.index is True
+    assert MappingSpec.model_validate(spec_with(source__index=False)).source.index is False
+    for bad in ("maybe", [False], {"x": 1}):
+        with pytest.raises(ValidationError, match="index"):
+            MappingSpec.model_validate(spec_with(source__index=bad))
+
+
+def test_source_index_enters_the_bundle_hash_only_when_false(tmp_path):
+    """No `index`, or `index: true`, hashes as before the setting existed (approvals stay
+    valid); `index: false` is an edit. Turning it back on returns to the original hash, so the
+    document text changes again and the next load re-indexes (a new version)."""
+    assert "index" not in MappingSpec.model_validate(SPEC).hash_payload()["source"]
+    explicit = MappingSpec.model_validate(spec_with(source__index=True))
+    assert "index" not in explicit.hash_payload()["source"]
+    off = MappingSpec.model_validate(spec_with(source__index=False)).hash_payload()
+    assert off["source"]["index"] is False
+
+    base = load_project_spec(write_project(tmp_path / "a")).bundle_sha256
+    on = load_project_spec(write_project(tmp_path / "b", spec_with(source__index=True)))
+    unindexed = load_project_spec(write_project(tmp_path / "c", spec_with(source__index=False)))
+    assert on.bundle_sha256 == base
+    assert unindexed.bundle_sha256 != base

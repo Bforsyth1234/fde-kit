@@ -254,14 +254,16 @@ class FakeSession:
         self.versions: dict[str, int] = {}
         self.facts_added: list[FactRow] = []
         self.jobs: list[tuple[str, str, str]] = []
+        self.indexed: dict[str, bool] = {}
 
     def upsert_entity(self, kind, canonical_name, aliases=()):
         self.calls.append(("upsert_entity", kind, canonical_name, tuple(aliases)))
         return f"e:{canonical_name}"
 
-    def ingest_versioned(self, source, text, *, title="", metadata=None, max_chars=900):
+    def ingest_versioned(self, source, text, *, title="", metadata=None, max_chars=900, index=True):
         digest = hashlib.sha256(text.encode()).hexdigest()
         self.calls.append(("ingest_versioned", source, max_chars))
+        self.indexed[source] = index
         previous = self.doc_ids.get(source)
         if self.hashes.get(source) == digest:
             return IngestOutcome(previous or "", self.versions[source], False, digest)
@@ -331,6 +333,18 @@ def test_ingest_is_idempotent_and_fills_doc_id() -> None:
     assert len(s.facts_added) == 1
     assert sum(1 for c in s.calls if c[0] == "add_facts") == 1
     assert sum(1 for c in s.calls if c[0] == "start_extraction_job") == 1
+
+
+def test_ingest_passes_each_documents_index_flag() -> None:
+    s = FakeSession()
+    batch = AdapterBatch(
+        entities=[],
+        documents=[RawDocument("doc-a", "A", "alpha"), RawDocument("doc-b", "B", "b", index=False)],
+        facts=[],
+    )
+    assert RawDocument("x", "X", "x").index is True
+    ingest(s, _ListAdapter([batch]))
+    assert s.indexed == {"doc-a": True, "doc-b": False}
 
 
 def _export(text: str, values: tuple[int, ...]) -> AdapterBatch:

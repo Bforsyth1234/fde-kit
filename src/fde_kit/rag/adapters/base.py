@@ -26,6 +26,9 @@ class RawDocument:
     text: str
     """Already extracted plain text."""
     metadata: dict[str, str] = field(default_factory=dict)
+    index: bool = True
+    """False: stored (so `fetch_document` shows it) but not chunked or embedded, so search
+    never returns it (`TenantSession.ingest_versioned(index=False)`)."""
 
 
 @dataclass(frozen=True)
@@ -84,7 +87,8 @@ def ingest(
     max_chars: int = 900,
     on_new_version: Literal["keep", "replace"] = "keep",
 ) -> IngestReport:
-    """For each batch: upsert entities, ingest_versioned every document (idempotent by hash),
+    """For each batch: upsert entities, ingest_versioned every document (idempotent by hash;
+    a `RawDocument` with `index=False` is stored without search chunks),
     one extraction job per call, add_facts with doc_id filled from document_source,
     set_dictionary. A fact whose document_source was not in the batch is an error. Re-running
     on unchanged input writes no documents; facts are only added for documents whose ingest
@@ -123,7 +127,12 @@ def ingest(
         changed: dict[str, str] = {}
         for d in batch.documents:
             outcome = session.ingest_versioned(
-                d.source, d.text, title=d.title, metadata=dict(d.metadata), max_chars=max_chars
+                d.source,
+                d.text,
+                title=d.title,
+                metadata=dict(d.metadata),
+                max_chars=max_chars,
+                index=d.index,
             )
             n_docs += 1
             if outcome.changed:
@@ -144,12 +153,15 @@ def ingest(
             n_facts += len(session.add_facts(rows, extraction_job_id=job_id))
         if batch.dictionary:
             session.set_dictionary(batch.dictionary)
-    groups = {
-        f.conflict_group_id
-        for name in entity_names
-        for f in session.facts(entity=name)
-        if f.conflict_group_id
-    }
+    if hasattr(session, "conflict_group_ids"):
+        groups = session.conflict_group_ids(entity_names)
+    else:  # sessions without the batch query (test fakes): the same answer, one name at a time
+        groups = {
+            f.conflict_group_id
+            for name in entity_names
+            for f in session.facts(entity=name)
+            if f.conflict_group_id
+        }
     return IngestReport(
         documents=n_docs,
         documents_changed=n_changed,

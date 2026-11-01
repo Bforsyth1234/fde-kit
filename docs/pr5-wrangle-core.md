@@ -146,6 +146,7 @@ source:
     - {blank: [Site]}
   start_after: {column: Site, matches: "^FORECAST$"}   # optional; data begins after this row
   stop_before: {column: Site, matches: "^ACTUALS"}     # optional; data ends before this row
+  index: false                        # optional, default true; false: documents not searchable (§7.4)
 
 entity:
   kind: plant_part                    # single-column: kind of that column's entities
@@ -201,9 +202,9 @@ Whether a file is XLSX or CSV is known only at apply, so "neither for CSV" and "
 XLSX" are `SpecMismatch`es there (§7.4).
 
 **Bundle hash and later settings.** `start_after`, `stop_before`, `sheets` and `nulls` enter
-the bundle hash only when set (a non-empty `nulls`), so a spec that doesn't use them hashes
-exactly as it did before they existed and its approval stays valid. Setting one is an edit like
-any other and needs a re-approval.
+the bundle hash only when set (a non-empty `nulls`), and `index` only when `false`, so a spec
+that doesn't use them hashes exactly as it did before they existed and its approval stays
+valid. Setting one is an edit like any other and needs a re-approval.
 
 `resolve.similar_warn` and `resolve.not_same` never enter the bundle hash
 (`spec.WARNING_ONLY_RESOLVE_KEYS`). They decide only which possible-duplicate warnings are
@@ -446,7 +447,9 @@ worksheet whose name matches (`re.search`) and isn't excluded; `sheets: [names]`
 sheets. Either way they run in **workbook order**, and opening the workbook to list them is the
 first step of the load (`apply.unit_sheets`). A selection that matches no sheet, a listed or
 excluded name the workbook doesn't have, an XLSX with neither `sheet` nor `sheets`, or a CSV
-with either → `SpecMismatch`. Each selected sheet is a unit exactly as a one-sheet file is: its
+with either → `SpecMismatch`. A load opens and hashes each XLSX once (`read.XlsxBook`), however
+many of its sheets it reads: re-opening it per sheet re-parsed the styles, shared strings and
+every sheet's dimensions each time (35 MRTS sheets: parse 3.4-3.9 s before, 0.9 s after). Each selected sheet is a unit exactly as a one-sheet file is: its
 own document (so `document_key` should use `{sheet}`, as the default does: without it every
 sheet renders one key, a `SpecMismatch`), its own entry in the report's `files`, its own
 rejects (which carry `sheet`), and its own duplicate and within-load conflict scope. Any
@@ -530,7 +533,16 @@ text=…)`. The text's first line is `# wrangle spec=<spec> bundle=<bundle_sha25
 the sheet as CSV with a leading `row` column holding the Excel row number, title rows included.
 That way `fetch_document` shows a person row 42 as row 42, and a corrected (re-approved) spec
 over the same bytes is a new document version, so `replace` (§3) retires the wrong facts.
-`metadata` holds `file_sha256`, `spec`, `bundle_sha256` and `header_rows`. `document_key`
+`metadata` holds `file_sha256`, `spec`, `bundle_sha256` and `header_rows`.
+With `source.index: false` the document is `RawDocument(..., index=False)`: stored exactly as
+above (body, hash, versioning), but not chunked or embedded, so `search_documents` never returns
+it while `fetch_document` (which slices the stored body) works as for any document; its metadata
+gets `"indexed": "false"`. Use it for large sheets: the full 2 MB Census county CSV spends
+8.8-9.3 s in `ingest_versioned` with the hash embedder, chunking and embedding CSV rows nobody
+searches, and 0.1 s unindexed (`evals/bench_load.py`); a real embedding model costs far more. Turning it back on changes the
+bundle hash (it is hashed only when false), so the first line, so the next load writes a new,
+indexed version and replaces the facts; `ingest_versioned` also re-indexes (or unindexes) in
+place when the same text arrives with the other setting. `document_key`
 controls versioning. Its placeholders are `{spec}` (the spec name), `{file}` (the file's base
 name), `{path}` (the path as passed) and `{sheet}` (CSV: the file stem). With the default
 `{spec}/{file}#{sheet}`, `Forecast_Nov.xlsx` is a different document from `Forecast_Oct.xlsx`,
@@ -799,9 +811,9 @@ extra and Wave 3 only the CI line, so there's no overlap. `cli.py` is touched on
 - **Composite entities, not dimensions.** "All parts at Plant 7" in `query_table` is
   `canonical_name LIKE 'DET-07/%'`. That works, but it's a string convention. Revisit if the
   golden questions in PR 7 get awkward.
-- **`add_facts` is two statements per fact.** Fine at fixture scale and at a few thousand facts;
-  measure in PR 6 before batching it.
-- **Each sheet is embedded as a document.** A 10k-row sheet is ~700 chunks to embed. That's
-  acceptable for the hash embedder in CI; note the real cost in FINDINGS.
+- **`add_facts` was two statements per fact.** Measured on real data and since batched: see
+  FINDINGS, "Load speed".
+- **Each sheet is embedded as a document.** A 10k-row sheet is ~700 chunks to embed;
+  `source.index: false` stores the sheet for `fetch_document` without indexing it (§7.4).
 - **Crosswalks own their entities' aliases.** Loading a crosswalk replaces aliases another
   adapter set on the same entity. Wrangle and EDGAR entities don't overlap today.

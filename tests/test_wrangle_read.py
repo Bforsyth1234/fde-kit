@@ -13,6 +13,7 @@ from fde_kit.wrangle.read import (
     FORMULA_NO_VALUE,
     FORMULA_NOT_CALCULATED,
     Cell,
+    XlsxBook,
     col_letter,
     col_number,
     parse_ref,
@@ -615,3 +616,46 @@ def test_rows_and_cells_without_r_still_read(tmp_path):
         [("", "empty"), ("", "empty"), ("", "empty"), ("", "empty")],
         [("5", "number"), ("", "empty"), ("6", "number"), ("", "formula_no_value")],
     ]
+
+
+# --- XlsxBook: one open and one hash for several sheets ---------------------------------------
+
+
+def test_book_reads_the_same_grids_and_hashes_once(plan_xlsx, monkeypatch):
+    """Every sheet (and the default, and a missing one) through one book is exactly what
+    `read_grid` alone gives; the file is read for its hash once and opened once."""
+    plain = {name: read_grid(plan_xlsx, name) for name in (None, "Plan", "Notes")}
+    with pytest.raises(ValueError) as alone:
+        read_grid(plan_xlsx, "Forecast")
+
+    reads, loads = [], []
+    real_read_bytes, real_load = type(plan_xlsx).read_bytes, openpyxl.load_workbook
+    monkeypatch.setattr(
+        type(plan_xlsx), "read_bytes", lambda self: reads.append(self) or real_read_bytes(self)
+    )
+    monkeypatch.setattr(
+        openpyxl, "load_workbook", lambda *a, **k: loads.append(a) or real_load(*a, **k)
+    )
+    with XlsxBook(plan_xlsx) as book:
+        assert reads == [] and loads == []  # nothing touched until first use
+        for name, grid in plain.items():
+            assert read_grid(plan_xlsx, name, book=book) == grid
+        assert read_grid(plan_xlsx, "Plan", book=book) == plain["Plan"]  # twice is fine
+        with pytest.raises(ValueError) as booked:
+            read_grid(plan_xlsx, "Forecast", book=book)
+        assert str(booked.value) == str(alone.value)
+        assert book.file_sha256 == hashlib.sha256(plan_xlsx.read_bytes()).hexdigest()
+    assert len(reads) == 2 and len(loads) == 1  # one hash (+ the line above), one open
+    assert book._wb is None and book._zf is None  # closed
+
+
+def test_book_must_be_the_same_xlsx(plan_xlsx, tmp_path):
+    other = tmp_path / "other.xlsx"
+    other.write_bytes(plan_xlsx.read_bytes())
+    csv_path = tmp_path / "a.csv"
+    csv_path.write_text("x\n1\n", encoding="utf-8")
+    with XlsxBook(plan_xlsx) as book:
+        with pytest.raises(ValueError, match="book= is an XlsxBook of"):
+            read_grid(other, "Plan", book=book)
+        with pytest.raises(ValueError, match="book= is an XlsxBook of"):
+            read_grid(csv_path, book=book)
