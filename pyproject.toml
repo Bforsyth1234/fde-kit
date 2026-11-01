@@ -39,6 +39,9 @@ dev = [
     "openpyxl>=3.1",
     "pyyaml>=6.0",
     "rapidfuzz>=3.6",
+    # Not needed by wrangle; installed so CI runs the cdist fast path real installs get
+    # (numpy arrives with fastembed in the rag extra) and the cdist-vs-fallback test.
+    "numpy>=1.26",
 ]
 
 [project.scripts]
