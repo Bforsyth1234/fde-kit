@@ -620,6 +620,12 @@ def _meta(s, doc_id: str) -> dict:
     ).fetchone()[0]
 
 
+def _indexed(s, doc_id: str) -> bool:
+    return s.conn.execute(
+        "SELECT indexed FROM rag_documents WHERE doc_id = %s", (doc_id,)
+    ).fetchone()[0]
+
+
 def _searched_docs(s, query: str) -> set[str]:
     modes = ("keyword", "vector", "hybrid")
     return {h.doc_id for mode in modes for h in s.search(query, k=20, mode=mode)}
@@ -638,8 +644,8 @@ def test_unindexed_document_is_stored_fetchable_and_never_searched(make_tenant, 
         )
         assert raw.changed and raw.version == 1 and raw.previous_doc_id is None
         assert _chunks(s, idx.doc_id) > 0 and _chunks(s, raw.doc_id) == 0
-        assert _meta(s, raw.doc_id) == {"spec": "x", "indexed": "false"}
-        assert "indexed" not in _meta(s, idx.doc_id)
+        assert _indexed(s, raw.doc_id) is False and _indexed(s, idx.doc_id) is True
+        assert _meta(s, raw.doc_id) == {"spec": "x"}  # metadata as given, nothing added
         body, digest = s.conn.execute(
             "SELECT body, content_hash FROM rag_documents WHERE doc_id = %s", (raw.doc_id,)
         ).fetchone()
@@ -654,13 +660,18 @@ def test_unindexed_document_is_stored_fetchable_and_never_searched(make_tenant, 
         assert _searched_docs(s, "zebrafish") == {idx.doc_id}
         assert raw.doc_id not in _searched_docs(s, "quokka")
         assert raw.doc_id not in {h.doc_id for h in s.cached_search("quokka zebrafish").hits}
-        assert s.search("quokka", filters={"indexed": "false"}) == []
+        assert s.search("quokka", filters={"spec": "x"}) == []
 
         # Re-ingesting the same text unindexed is a no-op.
         again = s.ingest_versioned("sheet.csv", UNINDEXED, title="Sheet", index=False)
         assert (again.doc_id, again.changed) == (raw.doc_id, False)
-        with pytest.raises(ValueError, match="reserved"):
-            s.ingest_versioned("x.csv", "x", metadata={"indexed": "false"})
+        # "indexed" is an ordinary metadata key: stored as given, and it doesn't decide
+        # anything (the column does).
+        own = s.ingest_versioned("own.csv", "own", metadata={"indexed": "false"})
+        assert _indexed(s, own.doc_id) is True and _chunks(s, own.doc_id) > 0
+        assert _meta(s, own.doc_id) == {"indexed": "false"}
+        mine = s.ingest_versioned("mine.csv", "mine", metadata={"indexed": "yes"}, index=False)
+        assert _indexed(s, mine.doc_id) is False and _meta(s, mine.doc_id) == {"indexed": "yes"}
 
     out = tenant_search_registry(store, tid, tools=("fetch_document",)).execute(
         "fetch_document", {"doc_id": raw.doc_id, "char_start": 0, "char_end": 30}
@@ -692,38 +703,88 @@ def test_unindexed_versions_supersede_like_any_other(make_tenant, store):
         v3 = s.ingest_versioned(src, v3_text)
         assert v3.version == 3 and v3.previous_doc_id == v2.doc_id
         assert s.fetch(v2.doc_id).superseded_by == v3.doc_id
-        assert _chunks(s, v3.doc_id) > 0 and "indexed" not in _meta(s, v3.doc_id)
+        assert _chunks(s, v3.doc_id) > 0 and _indexed(s, v3.doc_id) is True
+        assert [_indexed(s, v.doc_id) for v in (v1, v2)] == [True, False]
         assert _searched_docs(s, "zebrafish") == {v3.doc_id}
 
 
-def test_same_text_with_the_other_index_setting_flips_in_place(make_tenant, store):
-    """No new version (the text, and so the facts cited to it, didn't change): the current row
-    is indexed or unindexed where it stands, and the cache is cleared each time."""
+def test_same_text_with_the_other_index_setting_is_a_new_version(make_tenant, store):
+    """A version is its hash and its index setting. The same text with the other setting is a
+    new version like any content change: `changed=True`, `previous_doc_id` set, the old
+    version superseded (its chunks deleted, its row kept for provenance), the cache cleared,
+    and this call's title. Facts cited to the old version stay on it."""
     tid = make_tenant("unindexed-flip")
     with store.session(tid) as s:
         raw = s.ingest_versioned("sheet.csv", UNINDEXED, title="Sheet", index=False)
-        ent = s.upsert_entity("thing", "Quokka")
-        assert ent
+        s.upsert_entity("thing", "Quokka")
         (fact_id,) = s.add_facts([FactRow("Quokka", "count", 42, doc_id=raw.doc_id)])
         s.cached_search("quokka")
 
-        on = s.ingest_versioned("sheet.csv", UNINDEXED, title="Sheet")
-        assert (on.doc_id, on.version, on.changed) == (raw.doc_id, 1, False)
-        assert _chunks(s, raw.doc_id) > 0 and "indexed" not in _meta(s, raw.doc_id)
+        on = s.ingest_versioned("sheet.csv", UNINDEXED, title="Sheet, indexed")
+        assert on.changed and (on.version, on.previous_doc_id) == (2, raw.doc_id)
+        assert on.doc_id != raw.doc_id and on.content_hash == raw.content_hash
+        assert _indexed(s, on.doc_id) is True and _chunks(s, on.doc_id) > 0
+        assert s.fetch(raw.doc_id).superseded_by == on.doc_id
         assert s.conn.execute("SELECT count(*) FROM rag_cache").fetchone()[0] == 0
-        assert raw.doc_id in _searched_docs(s, "quokka")
-        n = _chunks(s, raw.doc_id)
+        assert {h.doc_id for h in s.search("quokka", k=5)} == {on.doc_id}
+        assert {h.title for h in s.search("quokka", k=5)} == {"Sheet, indexed"}
+        n = _chunks(s, on.doc_id)
         assert s.ingest_versioned("sheet.csv", UNINDEXED, title="Sheet").changed is False
-        assert _chunks(s, raw.doc_id) == n  # already indexed: untouched
+        assert _chunks(s, on.doc_id) == n  # same text, same setting: untouched
 
+        chunk_id = s.search("quokka", k=1)[0].chunk_id
+        (cited,) = s.add_facts(
+            [FactRow("Quokka", "count", 42, doc_id=on.doc_id, chunk_id=chunk_id)]
+        )
         s.cached_search("quokka")
         off = s.ingest_versioned("sheet.csv", UNINDEXED, title="Sheet", index=False)
-        assert (off.doc_id, off.changed) == (raw.doc_id, False)
-        assert _chunks(s, raw.doc_id) == 0 and _meta(s, raw.doc_id) == {"indexed": "false"}
+        assert off.changed and (off.version, off.previous_doc_id) == (3, on.doc_id)
+        assert _indexed(s, off.doc_id) is False and _chunks(s, off.doc_id) == 0
+        assert _chunks(s, on.doc_id) == 0  # the superseded version's chunks, as always
         assert s.conn.execute("SELECT count(*) FROM rag_cache").fetchone()[0] == 0
         assert _searched_docs(s, "quokka") == set()
-        assert [f.fact_id for f in s.facts(entity="Quokka")] == [fact_id]
-        assert s.conn.execute("SELECT count(*) FROM rag_documents").fetchone()[0] == 1
+        facts = {f.fact_id: f for f in s.facts(entity="Quokka")}
+        assert facts[fact_id].doc_id == raw.doc_id
+        # Reported as a change, so a caller knows the chunk it cited is gone.
+        assert (facts[cited].doc_id, facts[cited].chunk_id) == (on.doc_id, None)
+        assert s.conn.execute("SELECT count(*) FROM rag_documents").fetchone()[0] == 3
+
+
+def test_index_flip_through_ingest_replaces_facts_like_any_version(make_tenant, store):
+    """`ingest(on_new_version="replace")`: flipping a document's index setting replaces its
+    facts exactly as a new text would (before, the flip was in place and reported no change,
+    so the facts stayed on a version whose chunks had changed under them)."""
+    from fde_kit.rag.adapters.base import AdapterBatch, RawDocument, RawEntity, RawFact, ingest
+
+    class _One:
+        name = "flip"
+
+        def __init__(self, index: bool):
+            self.index = index
+
+        def batches(self):
+            yield AdapterBatch(
+                entities=[RawEntity("thing", "Quokka")],
+                documents=[RawDocument("sheet.csv", "Sheet", UNINDEXED, index=self.index)],
+                facts=[RawFact("sheet.csv", FactRow("Quokka", "count", 42))],
+            )
+
+    tid = make_tenant("unindexed-flip-ingest")
+    with store.session(tid) as s:
+        first = ingest(s, _One(False), on_new_version="replace")
+        same = ingest(s, _One(False), on_new_version="replace")
+        flip = ingest(s, _One(True), on_new_version="replace")
+        back = ingest(s, _One(False), on_new_version="replace")
+        current = s.conn.execute(
+            "SELECT doc_id::text, version FROM rag_documents WHERE superseded_by IS NULL"
+        ).fetchall()
+        facts = s.facts(entity="Quokka")
+    assert (first.documents_changed, first.facts) == (1, 1)
+    assert (same.documents_changed, same.facts, same.facts_replaced) == (0, 0, 0)
+    assert (flip.documents_changed, flip.facts, flip.facts_replaced) == (1, 1, 1)
+    assert (back.documents_changed, back.facts, back.facts_replaced) == (1, 1, 1)
+    assert [c[1] for c in current] == [3]
+    assert [(f.doc_id, f.conflict_group_id) for f in facts] == [(current[0][0], None)]
 
 
 def test_wrangle_index_false_loads_unindexed_and_flipping_back_reindexes(
@@ -743,8 +804,11 @@ def test_wrangle_index_false_loads_unindexed_and_flipping_back_reindexes(
     assert report.facts == len(result.facts) == 35
     with store.session(tid) as s:
         assert s.count_chunks() == 0
-        doc_id, meta = s.conn.execute("SELECT doc_id::text, metadata FROM rag_documents").fetchone()
-        assert meta["indexed"] == "false" and meta["bundle_sha256"] == off.bundle_sha256
+        doc_id, meta, indexed = s.conn.execute(
+            "SELECT doc_id::text, metadata, indexed FROM rag_documents"
+        ).fetchone()
+        assert indexed is False and meta["bundle_sha256"] == off.bundle_sha256
+        assert "indexed" not in meta
         assert s.search("Puebla Machining", k=5) == []
         fact = next(
             f
@@ -770,9 +834,9 @@ def test_wrangle_index_false_loads_unindexed_and_flipping_back_reindexes(
     assert back.facts == 35 and back.facts_replaced == 35
     with store.session(tid) as s:
         rows = s.conn.execute(
-            "SELECT doc_id::text, version, superseded_by::text, metadata ? 'indexed' "
+            "SELECT doc_id::text, version, superseded_by::text, indexed "
             "FROM rag_documents ORDER BY version"
         ).fetchall()
-        assert [(r[1], r[2] is None, r[3]) for r in rows] == [(1, False, True), (2, True, False)]
+        assert [(r[1], r[2] is None, r[3]) for r in rows] == [(1, False, False), (2, True, True)]
         assert _chunks(s, rows[0][0]) == 0 and _chunks(s, rows[1][0]) > 0
         assert {h.doc_id for h in s.search("Puebla Machining", k=5)} == {rows[1][0]}

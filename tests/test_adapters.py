@@ -256,6 +256,9 @@ class FakeSession:
         self.jobs: list[tuple[str, str, str]] = []
         self.indexed: dict[str, bool] = {}
 
+    def lock_tenant_writes(self):
+        self.calls.append(("lock_tenant_writes",))
+
     def upsert_entity(self, kind, canonical_name, aliases=()):
         self.calls.append(("upsert_entity", kind, canonical_name, tuple(aliases)))
         return f"e:{canonical_name}"
@@ -408,6 +411,22 @@ def test_ingest_replace_deletes_superseded_facts_before_adding() -> None:
     again = ingest(s, _ListAdapter([_export("v2", (1, 2, 4))]), on_new_version="replace")
     assert (again.documents_changed, again.facts, again.facts_replaced) == (0, 0, 0)
     assert not any(c[0] in ("delete_facts_for_document", "add_facts") for c in s.calls)
+
+
+def test_ingest_takes_the_tenant_write_lock_before_writing_anything() -> None:
+    """The lock comes first, once: taken after an entity upsert or a document insert, two loads
+    could each hold a row the other waits on (tests/test_add_facts_batch.py has the deadlock).
+    `add_facts` itself takes no lock."""
+    s = FakeSession()
+    second = AdapterBatch(
+        entities=[RawEntity("company", "Other")],
+        documents=[RawDocument("doc-b", "B", "beta")],
+        facts=[RawFact("doc-b", FactRow("Other", "revenue", 2))],
+    )
+    ingest(s, _ListAdapter([_batch(), second]), on_new_version="replace")
+    names = [c[0] for c in s.calls]
+    assert names[0] == "lock_tenant_writes" and names.count("lock_tenant_writes") == 1
+    assert {"upsert_entity", "ingest_versioned", "add_facts"} <= set(names[1:])
 
 
 def test_ingest_rejects_unknown_on_new_version() -> None:

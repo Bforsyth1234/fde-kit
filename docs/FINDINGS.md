@@ -391,7 +391,9 @@ one `facts(entity=…)` per entity, each paying the same alias scan. That was **
 county load, invisible to a facts-only timer; it is now one statement
 (`TenantSession.conflict_group_ids`). Sheets stored with `source.index: false` skip chunking and
 embedding (county document: 7.8 s to 0.1 s with the hash embedder; a real embedding model costs
-far more). Each workbook is now opened and hashed once per load, not once per sheet. End to end
+far more). Each workbook is now read once per load, not once per sheet: its bytes are hashed
+and the workbook and its zip opened from that one in-memory copy, so a file replaced mid-load
+can't mix versions. End to end
 (`evals/bench_load.py`, PG 16, hash embedder):
 
 | Load | Before | After |
@@ -487,12 +489,29 @@ far more). Each workbook is now opened and hashed once per load, not once per sh
 - Onboarding a tenant is DDL (`create_tenant`), run by an operator connection, not the app.
 - BM25's document frequencies are recomputed from the tenant's chunks on every keyword query.
   Fine at this size; a large tenant would want a maintained term-stats table.
-- Fact loads into one tenant are serialized: `add_facts` takes a transaction-scoped advisory
-  lock on the tenant before it reads conflict candidates, because two concurrent loads could
-  otherwise each miss the other's rows and record no conflict. The lock is held until the
-  session's transaction ends, so a long load blocks another load into the same tenant (not
-  other tenants, and not readers). Entity resolution costs one pass over the tenant's entities
-  per call: 23 ms at 3,100 entities, 274 ms at 50,000.
+- Adapter loads into one tenant are serialized: `ingest` takes a transaction-scoped advisory
+  lock on the tenant (`lock_tenant_writes`) before it writes anything, because two concurrent
+  loads could otherwise each miss the other's facts and record no conflict. It has to be the
+  first thing the load does. The first version took the lock inside `add_facts`, after the
+  batch's entity upserts and document inserts, and two loads sharing an entity or a document
+  deadlocked: load 2 locked entity Y's row and queued for the lock, which load 1 held while
+  it queued for Y (`test_ingests_sharing_an_entity_and_a_document_do_not_deadlock`). The lock
+  is held until the session's transaction ends, so a long load blocks another load into the
+  same tenant (not other tenants, and not readers). Direct `add_facts` callers outside `ingest`
+  take no lock and are not serialized, as before batching; one that needs the guarantee calls
+  `lock_tenant_writes` first in its transaction. Entity resolution costs one pass over the
+  tenant's entities per call: 23 ms at 3,100 entities, 274 ms at 50,000. A name that matches
+  several entities (one canonical name under two kinds, or a shared alias) resolves by a fixed
+  order: canonical match, then canonical_name, kind, entity_id, the same in `resolve_entity`
+  and the batch path. Before that rule the pick was whatever row the plan returned first, so
+  it could differ between a 1-name and a 3-name `add_facts`.
+- A float with more than 15 significant digits disagrees with its own stored value.
+  `values_agree` compares a float by its shortest repr (0.1 + 0.2 is 0.30000000000000004),
+  while Postgres's float8 → numeric cast stores 15 significant digits (0.3). So the same float
+  reported twice for one key, 1/3 say, forms a conflict group of two facts whose stored values
+  are equal. Pre-existing (the row-at-a-time `add_facts` did the same) and kept as is; wrangle
+  passes Decimals, which are stored exactly. `test_same_float_reported_twice_conflicts_as_before`
+  pins it.
 
 ### What's not covered
 

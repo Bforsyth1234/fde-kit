@@ -447,8 +447,10 @@ worksheet whose name matches (`re.search`) and isn't excluded; `sheets: [names]`
 sheets. Either way they run in **workbook order**, and opening the workbook to list them is the
 first step of the load (`apply.unit_sheets`). A selection that matches no sheet, a listed or
 excluded name the workbook doesn't have, an XLSX with neither `sheet` nor `sheets`, or a CSV
-with either → `SpecMismatch`. A load opens and hashes each XLSX once (`read.XlsxBook`), however
-many of its sheets it reads: re-opening it per sheet re-parsed the styles, shared strings and
+with either → `SpecMismatch`. A load reads each XLSX once (`read.XlsxBook`), however many of
+its sheets it reads: the bytes are hashed and the workbook and zip are opened on that one
+in-memory copy, so a file replaced mid-load can't give one sheet's values with another
+version's hash or formula scan. Re-opening it per sheet re-parsed the styles, shared strings and
 every sheet's dimensions each time (35 MRTS sheets: parse 3.4-3.9 s before, 0.9 s after). Each selected sheet is a unit exactly as a one-sheet file is: its
 own document (so `document_key` should use `{sheet}`, as the default does: without it every
 sheet renders one key, a `SpecMismatch`), its own entry in the report's `files`, its own
@@ -536,14 +538,13 @@ over the same bytes is a new document version, so `replace` (§3) retires the wr
 `metadata` holds `file_sha256`, `spec`, `bundle_sha256` and `header_rows`.
 With `source.index: false` the document is `RawDocument(..., index=False)`: stored exactly as
 above (body, hash, versioning), but not chunked or embedded, so `search_documents` never returns
-it while `fetch_document` (which slices the stored body) works as for any document; its metadata
-gets `"indexed": "false"`. Use it for large sheets: the full 2 MB Census county CSV spends
+it while `fetch_document` (which slices the stored body) works as for any document; its row's
+`indexed` column is false (metadata is unchanged). Use it for large sheets: the full 2 MB Census county CSV spends
 8.8-9.3 s in `ingest_versioned` with the hash embedder, chunking and embedding CSV rows nobody
 searches, and 0.1 s unindexed (`evals/bench_load.py`); a real embedding model costs far more. Turning it back on changes the
 bundle hash (it is hashed only when false), so the first line, so the next load writes a new,
-indexed version and replaces the facts; `ingest_versioned` also re-indexes (or unindexes) in
-place when the same text arrives with the other setting. `document_key`
-controls versioning. Its placeholders are `{spec}` (the spec name), `{file}` (the file's base
+indexed version and replaces the facts. (`ingest_versioned` treats the index setting as part of
+a version's identity anyway: the same text with the other setting is a new version too.) controls versioning. Its placeholders are `{spec}` (the spec name), `{file}` (the file's base
 name), `{path}` (the path as passed) and `{sheet}` (CSV: the file stem). With the default
 `{spec}/{file}#{sheet}`, `Forecast_Nov.xlsx` is a different document from `Forecast_Oct.xlsx`,
 two specs over one file never share a document, and the key doesn't depend on how the path was

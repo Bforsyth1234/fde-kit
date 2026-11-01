@@ -106,6 +106,9 @@ CREATE TABLE IF NOT EXISTS rag_documents (
     fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     superseded_by UUID,
     body          TEXT NOT NULL DEFAULT '',
+    -- False: stored for fetch, never chunked or embedded, so search can't return it. Part of
+    -- a version's identity with content_hash (store.py, ingest_versioned).
+    indexed       BOOLEAN NOT NULL DEFAULT true,
     PRIMARY KEY (tenant_id, doc_id),
     CONSTRAINT rag_documents_source_version_key UNIQUE (tenant_id, source, version)
 ) PARTITION BY LIST (tenant_id);
@@ -118,6 +121,7 @@ ALTER TABLE rag_documents ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 
 ALTER TABLE rag_documents ADD COLUMN IF NOT EXISTS fetched_at TIMESTAMPTZ NOT NULL DEFAULT now();
 ALTER TABLE rag_documents ADD COLUMN IF NOT EXISTS superseded_by UUID;
 ALTER TABLE rag_documents ADD COLUMN IF NOT EXISTS body TEXT NOT NULL DEFAULT '';
+ALTER TABLE rag_documents ADD COLUMN IF NOT EXISTS indexed BOOLEAN NOT NULL DEFAULT true;
 
 -- Token count for BM25 length normalisation. IMMUTABLE so it can back a generated column.
 CREATE OR REPLACE FUNCTION rag_token_count(content TEXT) RETURNS INT

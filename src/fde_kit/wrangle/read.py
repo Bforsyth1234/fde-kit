@@ -155,21 +155,33 @@ class XlsxBook:
     Without it, every `read_grid` re-reads and re-hashes the file and re-runs
     `openpyxl.load_workbook`, which parses the styles, the shared strings and every
     worksheet's `<dimension>`, so a load of n sheets does that n times (35 sheets of the
-    441 KB Census workbook: about 70% of its parse time). The book hashes the bytes once
-    (`file_sha256`) and opens the workbook and the zip on first use. The `Grid`s it reads are
-    exactly the ones `read_grid` without it gives, errors included."""
+    441 KB Census workbook: about 70% of its parse time). The `Grid`s it reads are exactly the
+    ones `read_grid` without it gives, errors included.
 
-    def __init__(self, path: str | Path):
-        """Touches nothing on disk: the file is hashed and opened on first use."""
+    On first use the book reads the file's bytes once and keeps them: `file_sha256` is their
+    hash, and the workbook and the zip are both opened on an in-memory copy of them, never on
+    the path. So a file replaced on disk mid-load can't mix versions: every sheet the book
+    reads, and the hash each `Grid` carries, come from the same bytes. The cost is the file's
+    size in memory until `close()`."""
+
+    def __init__(self, path: str | Path, *, data: bytes | None = None):
+        """Touches nothing on disk: the file is read on first use. `data`: the file's bytes,
+        already read (`read_grid` passes them), used instead of reading the path."""
         self.path = Path(path)
+        self._data = data
         self._sha: str | None = None
         self._wb = None
         self._zf: zipfile.ZipFile | None = None
 
+    def _bytes(self) -> bytes:
+        if self._data is None:
+            self._data = self.path.read_bytes()
+        return self._data
+
     @property
     def file_sha256(self) -> str:
         if self._sha is None:
-            self._sha = hashlib.sha256(self.path.read_bytes()).hexdigest()
+            self._sha = hashlib.sha256(self._bytes()).hexdigest()
         return self._sha
 
     @property
@@ -181,13 +193,15 @@ class XlsxBook:
                 raise ImportError(
                     "reading XLSX needs openpyxl: pip install 'fde-kit[wrangle]'"
                 ) from e
-            self._wb = openpyxl.load_workbook(self.path, read_only=True, data_only=True)
+            self._wb = openpyxl.load_workbook(
+                io.BytesIO(self._bytes()), read_only=True, data_only=True
+            )
         return self._wb
 
     @property
     def zip(self) -> zipfile.ZipFile:
         if self._zf is None:
-            self._zf = zipfile.ZipFile(self.path)
+            self._zf = zipfile.ZipFile(io.BytesIO(self._bytes()))
         return self._zf
 
     def close(self) -> None:
@@ -197,6 +211,9 @@ class XlsxBook:
         if self._zf is not None:
             self._zf.close()
             self._zf = None
+        # A later use reads the file again, hash included: still one version per open.
+        self._data = None
+        self._sha = None
 
     def __enter__(self) -> XlsxBook:
         return self
@@ -217,7 +234,9 @@ def read_grid(
     equal the file stem; `encoding` and `delimiter` apply to CSV only.
 
     `book`: an `XlsxBook` already open on this XLSX file, so reading several of its sheets
-    opens and hashes the file once. The result is the same as without it."""
+    opens and hashes the file once. The result is the same as without it. Either way the
+    file is read once per call and everything (values, formula scan, hash) comes from those
+    bytes."""
     p = Path(path)
     suffix = p.suffix.lower()
     if book is not None:
@@ -227,7 +246,8 @@ def read_grid(
     data = p.read_bytes()
     sha = hashlib.sha256(data).hexdigest()
     if suffix in XLSX_SUFFIXES:
-        return _read_xlsx(p, sheet, sha)
+        with XlsxBook(p, data=data) as one:
+            return _read_xlsx(p, sheet, sha, one)
     if suffix in CSV_SUFFIXES:
         if sheet is not None and sheet != p.stem:
             raise ValueError(f"{p.name} is a CSV; its only sheet is {p.stem!r}, not {sheet!r}")
@@ -440,7 +460,7 @@ def _scan_sheet_xml(
     return no_value, merged
 
 
-def _read_xlsx(p: Path, sheet: str | None, sha: str, book: XlsxBook | None = None) -> Grid:
+def _read_xlsx(p: Path, sheet: str | None, sha: str, book: XlsxBook) -> Grid:
     """Two streaming passes over the requested sheet only, both on public or standard APIs.
 
     1. Values: `openpyxl.load_workbook(read_only=True, data_only=True)` and `iter_rows` on the
@@ -456,35 +476,25 @@ def _read_xlsx(p: Path, sheet: str | None, sha: str, book: XlsxBook | None = Non
 
     Memory is the grid itself, not openpyxl's worksheet model.
 
-    With `book`, both passes use its open workbook and zip, and neither is closed here.
+    Both passes use `book`'s workbook and zip, opened on the same bytes as `sha` (the caller
+    closes it), so the values, the formula scan and the hash are one version of the file.
     """
-    if book is not None:
-        wb = book.workbook
-    else:
-        try:
-            import openpyxl
-        except ImportError as e:  # pragma: no cover - depends on the install
-            raise ImportError("reading XLSX needs openpyxl: pip install 'fde-kit[wrangle]'") from e
-        wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
-    try:
-        names = wb.sheetnames
-        name = sheet if sheet is not None else names[0]
-        if name not in names:
-            raise ValueError(f"{p.name} has no sheet {name!r}; available sheets: {names}")
-        ws = wb[name]
-        if ws not in wb.worksheets:  # a chartsheet
-            raise ValueError(f"{p.name}: sheet {name!r} is not a worksheet")
-        ws.reset_dimensions()
-        values: dict[tuple[int, int], object] = {}
-        for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
-            for c_idx, value in enumerate(row, start=1):
-                if value is not None:
-                    values[(r_idx, c_idx)] = value
-    finally:
-        if book is None:
-            wb.close()
+    wb = book.workbook
+    names = wb.sheetnames
+    name = sheet if sheet is not None else names[0]
+    if name not in names:
+        raise ValueError(f"{p.name} has no sheet {name!r}; available sheets: {names}")
+    ws = wb[name]
+    if ws not in wb.worksheets:  # a chartsheet
+        raise ValueError(f"{p.name}: sheet {name!r} is not a worksheet")
+    ws.reset_dimensions()
+    values: dict[tuple[int, int], object] = {}
+    for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        for c_idx, value in enumerate(row, start=1):
+            if value is not None:
+                values[(r_idx, c_idx)] = value
 
-    with contextlib.nullcontext(book.zip) if book is not None else zipfile.ZipFile(p) as zf:
+    with contextlib.nullcontext(book.zip) as zf:
         part, full_calc = _sheet_xml_path(zf, name)
         with zf.open(part) as src:
             try:

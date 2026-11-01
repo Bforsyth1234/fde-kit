@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import os
 
 import openpyxl
 import pytest
@@ -659,3 +660,38 @@ def test_book_must_be_the_same_xlsx(plan_xlsx, tmp_path):
             read_grid(other, "Plan", book=book)
         with pytest.raises(ValueError, match="book= is an XlsxBook of"):
             read_grid(csv_path, book=book)
+
+
+@pytest.mark.parametrize("first_use", ["file_sha256", "workbook", "read"])
+def test_book_reads_one_version_of_a_file_replaced_mid_load(plan_xlsx, tmp_path, first_use):
+    """A load that replaces the file on disk between sheets (an export landing mid-load) must
+    not mix versions: the book reads the bytes once, and the hash, the openpyxl values and the
+    formula/merge scan all come from them. Before, the hash, the workbook and the zip were each
+    opened from the path at first use, so a Grid could carry v1's hash with v2's values, or
+    v1's values with v2's formula scan."""
+    v2 = tmp_path / "v2.xlsx"
+    wb = openpyxl.load_workbook(plan_xlsx)
+    wb["Plan"]["B4"] = 9999  # a different value
+    wb["Plan"]["D4"] = 77  # and no formula where v1 has one with no cached value
+    wb["Plan"].unmerge_cells("B2:D2")
+    wb.save(v2)
+    want_v1 = {name: read_grid(plan_xlsx, name) for name in ("Plan", "Notes")}
+    want_v2 = read_grid(v2, "Plan")
+    assert want_v2.rows != want_v1["Plan"].rows
+
+    with XlsxBook(plan_xlsx) as book:
+        if first_use == "file_sha256":
+            assert book.file_sha256 == want_v1["Plan"].file_sha256
+        elif first_use == "workbook":
+            assert book.workbook.sheetnames == ["Plan", "Notes"]  # what unit_sheets does
+        else:
+            assert read_grid(plan_xlsx, "Notes", book=book) == want_v1["Notes"]
+        os.replace(v2, plan_xlsx)  # the file is replaced mid-load
+        assert read_grid(plan_xlsx, "Plan", book=book) == want_v1["Plan"]
+        assert read_grid(plan_xlsx, "Notes", book=book) == want_v1["Notes"]
+        assert book.file_sha256 == want_v1["Plan"].file_sha256
+    # A new book (the next load) sees the new file, consistently.
+    with XlsxBook(plan_xlsx) as book:
+        got = read_grid(plan_xlsx, "Plan", book=book)
+    assert got.rows == want_v2.rows and got.merged == want_v2.merged == []
+    assert got.file_sha256 == hashlib.sha256(plan_xlsx.read_bytes()).hexdigest()
