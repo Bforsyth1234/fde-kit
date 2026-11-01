@@ -211,6 +211,50 @@ def test_dry_run_all_year_sheets(out):
     assert "placeholders skipped as empty (1992): '(NA)' 48" in text
     assert "section 1992: start_after_row 6  stop_before_row 71" in text
     assert "possible duplicate entities: 0" in text
+    assert (
+        "warning 2026: 3 column(s) with data the spec doesn't read: 'NAICS Code', 'CY CUM', "
+        "'PY CUM'"
+    ) in text
+    assert "warning 1992: 2 column(s) with data the spec doesn't read: 'NAICS Code', 'TOTAL'" in (
+        text
+    )
+
+
+def test_dry_run_caps_similar_entities(out, tmp_path):
+    openpyxl = pytest.importorskip("openpyxl")
+    pytest.importorskip("rapidfuzz")
+    (tmp_path / "specs").mkdir()
+    (tmp_path / "dictionary.yaml").write_text(
+        "- field: sales\n  definition: Sales.\n  unit: USD\n", encoding="utf-8"
+    )
+    spec = tmp_path / "specs" / "stores.yaml"
+    spec.write_text(
+        "spec: stores\nversion: 1\ndictionary: ../dictionary.yaml\n"
+        "source: {sheet: S, header_rows: [1]}\n"
+        "entity: {kind: store, parts: [{column: Store, resolve: {policy: open}}]}\n"
+        "period: {cell: {ref: C1, ops: [{op: period, format: '%Y', grain: year}]}}\n"
+        "measures: [{field: sales, column: Sales, ops: [{op: number}]}]\n",
+        encoding="utf-8",
+    )
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "S"
+    ws.append(["Store", "Sales", "2024"])
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    for a in letters:
+        for b in letters:
+            ws.append([f"Store {a}{b}xyz", 1])
+    wb.save(tmp_path / "s.xlsx")
+    dest = tmp_path / "out"
+    argv = ["wrangle", "dry-run", str(spec), str(tmp_path / "s.xlsx"), "--out", str(dest)]
+    assert cli.main(argv) == 0
+    text = out()
+    report = json.loads((dest / "report.json").read_text())
+    total = report["similar_entities_total"]
+    assert total > 200 and len(report["similar_entities"]) == 200
+    assert f"possible duplicate entities: {total} (showing 200)" in text
+    assert f"... and {total - 20} more (the first 200 in similar.csv with --out;" in text
+    assert len((dest / "similar.csv").read_text(encoding="utf-8").splitlines()) == 201
 
 
 def test_dry_run_prints_and_writes_similar_entities(out, tmp_path):

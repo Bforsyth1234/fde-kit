@@ -117,7 +117,8 @@ entities with exactly these aliases (`upsert_entity` replaces aliases).
 the spec with its `approval` block removed, plus `{name: sha256(bytes)}` for the dictionary
 and each crosswalk the spec references. Approval, the job kind and every `source_ref` carry it,
 so changing a crosswalk after approval invalidates the approval exactly as editing the spec
-would.
+would. The two warning-only settings `resolve.similar_warn` and `resolve.not_same` are left out
+of the spec as hashed (§5): they cannot change a fact.
 
 ## 5. MappingSpec (FROZEN) — `wrangle/spec.py`
 
@@ -199,11 +200,17 @@ regex compiles and `sheets.exclude` names no sheet twice; `similar_warn` is 0..1
 Whether a file is XLSX or CSV is known only at apply, so "neither for CSV" and "one of them for
 XLSX" are `SpecMismatch`es there (§7.4).
 
-**Bundle hash and later settings.** `start_after`, `stop_before`, `sheets`, `nulls`,
-`not_same` and `similar_warn` enter the bundle hash only when set (a non-empty `nulls` or
-`not_same`; a `similar_warn` other than the default 90), so a spec that doesn't use them hashes
+**Bundle hash and later settings.** `start_after`, `stop_before`, `sheets` and `nulls` enter
+the bundle hash only when set (a non-empty `nulls`), so a spec that doesn't use them hashes
 exactly as it did before they existed and its approval stays valid. Setting one is an edit like
-any other: reviewing a warning pair into `not_same` needs a re-approval.
+any other and needs a re-approval.
+
+`resolve.similar_warn` and `resolve.not_same` never enter the bundle hash
+(`spec.WARNING_ONLY_RESOLVE_KEYS`). They decide only which possible-duplicate warnings are
+reported (§7.3); no fact, reject, count or gate depends on them. The bundle hash is in every
+document's first line and every `source_ref`, so hashing them would mean that reviewing one
+warning pair into `not_same` re-versions every document and rewrites every fact of the spec
+(25,207 for `mrts_all_nsa`) for no change in the data. Editing them keeps an approval valid.
 
 **Text values.** A measure whose last op is `text` or `map` produces a text fact (`value_text`).
 `precision` with a text measure is a validation error.
@@ -248,6 +255,7 @@ class Grid:
     path: str; sheet: str; file_sha256: str
     rows: list[list[Cell]]
     merged: list[tuple[int, int, int, int]]
+    recalc_on_open: bool = False  # XLSX workbook sets <calcPr fullCalcOnLoad="1"/>
 ```
 
 - XLSX via `openpyxl.load_workbook(read_only=True, data_only=True)` and `iter_rows` on the
@@ -257,9 +265,32 @@ class Grid:
   sheet's `<mergeCells>`, which read-only openpyxl doesn't expose. Public API only, no version
   pin (a 25k-row sheet of a 19 MB workbook: 1.3 s and 128 MB, was 76 s and 2.8 GB with the full
   model).
-  A formula cell whose cached value is `None` is `formula_no_value`, and is a reject wherever a
-  spec reads it, **never** a 0.
+  A formula cell with no cached value is `formula_no_value`, and is a reject wherever a spec
+  reads it, **never** a 0. "No cached value" means no `<v>`, or an empty `<v>` without
+  `t="str"` (how openpyxl writes formulas). With `t="str"` an empty `<v>` (or `<v/>`) is a
+  cached empty string, as Excel and LibreOffice save `=IF(..,"",..)`: Excel shows a blank, so
+  the cell is `empty`.
+- **`fullCalcOnLoad`.** A workbook whose `xl/workbook.xml` has `<calcPr fullCalcOnLoad="1"/>`
+  asks the app to recalculate on open, and its cached results can't be trusted: XlsxWriter (so
+  pandas' `to_excel`) writes every formula as `<f>D2*2</f><v>0</v>`. In such a workbook
+  **every** formula cell (and every cell of an array formula's range) is `formula_no_value`,
+  whatever its `<v>`, and `Grid.recalc_on_open` is set. The consequence: a workbook saved by a
+  tool that sets the flag (XlsxWriter, openpyxl) must be opened and saved in Excel or
+  LibreOffice before its formulas load; they drop the flag and write real cached values.
+  `read.read_failure_reason(grid, cell)` gives the reject reason: `"formula not calculated
+  (workbook asks for recalculation on open)"` for this case (`read.FORMULA_NOT_CALCULATED`),
+  `"formula without cached value"` otherwise, `"error cell"` for errors. Plain value cells in
+  such workbooks read as usual (openpyxl-written fixtures with no formulas are unaffected).
   `#N/A`, `#REF!` and the like are `error`.
+- **Out-of-order sheet XML is refused.** Read-only openpyxl assumes rows and cells in order: a
+  `<c r="C1">` before `<c r="A1">` loses C1, `<row r="5">` before `<row r="3">` loses row 3, a
+  repeated `<row r="2">` loses the second, and `<row r="2"><c r="A3">` puts A3's value at A2.
+  Excel writes canonical order; other writers may not. The XML pass checks every row and cell
+  (row numbers strictly increasing, columns strictly increasing within a row, each cell's `r`
+  on its row) and raises a `ValueError` naming the file, the sheet and the first offending
+  cell: "sheet XML is not in row/column order; open and re-save the file in Excel or
+  LibreOffice". Rows and cells without an `r` are numbered on from the previous one, as
+  openpyxl does, and are in order by construction.
 - In a merged range only the top-left cell has a value. `read` does **not** fill the others;
   header joining (§7.2) does that for header rows only, where it's always meant.
 - CSV via the `csv` module; encoding `utf-8-sig` by default; delimiter sniffed from the first
@@ -310,8 +341,16 @@ The profile proposes; the spec decides. Apply never reads the profile.
 
 ### 7.3 Entity resolution — `wrangle/resolve.py`
 
-`norm_key(s)`: casefold, NFKC, strip leading zeros from each digit run, then drop the characters
-`- _ . # / ,` and spaces (zeros first, so `10-07` and `100-7` stay distinct). So `DET-07` → `det7`, `Plant 07` → `plant7`, `1007` → `1007`.
+`norm_key(s)`: casefold, NFKC, strip leading zeros from each digit run, and drop the
+characters `- _ . # / ,` and whitespace, **except a separator run with a digit on both sides**:
+that is kept as written, minus its whitespace (a run of only whitespace becomes one space).
+So `DET-07` → `det7`, `Plant 07` → `plant7`, `1007` → `1007`, `10-07` → `10-7`, `100-7` →
+`100-7`, `1.5` → `1.5`, `Grid A-1 / 10` → `grida1/10`. A digit run right after a kept `.` or `,`
+keeps its leading zeros (`1.05` → `1.05`, not `1.5`). Dropping separators between digits would
+merge different values: `Pipe 1.5 in` with `Pipe 15 in`, `Transformer 2.25 MVA` with
+`22.5 MVA`, `Grid A-1/10` with `A-11/0`, part `12-345` with `123-45` — a crosswalk would then
+resolve one to the other's canonical as `normalised`, a silent misattribution. The cost is
+misses (`12-345` and `12345` don't normalise together), which a crosswalk alias fixes.
 
 For each part with `resolve.crosswalk`:
 
@@ -352,15 +391,45 @@ entry then carries `within` (those left parts); `similar.csv` has a `within` col
 tables list parents beside children (`Clothing stores` / `Men's clothing stores`), which would
 flood the report with pairs that are certainly different. The cost: short names one letter
 apart (`Lee County` / `Lea County`) fire. `resolve.not_same: [[a, b], ...]` (exact strings,
-either order) drops pairs a person reviewed and found different. The pairwise pass is
-`rapidfuzz.process.cdist` with `score_cutoff`, in 512-row chunks, when numpy is importable,
-else `process.extract_iter` per name with the same scorer and cutoff (same pairs; the wrangle
-extra doesn't pull in numpy). 1,882 distinct county names: 0.04 s with cdist, 0.13–0.17 s
-without.
+either order) drops pairs a person reviewed and found different.
+
+**Names that differ only in their digits are not a `similar spelling` pair**: when the two
+`similar_key`s are equal once every digit run is removed (`Building 00001` / `Building 00002`,
+`Unit 4` / `Unit 5`, `Q1 sales` / `Q2 sales`), the pair is not reported however high it
+scores. A numbered series is almost always different things, and an open part of 10,000
+`Building NNNNN` names otherwise gave 651k warnings (a 166 MB report). Two spellings of one
+number (`Unit 4` / `Unit 04`) are still found, by the `norm_key` half.
+
+**Bounded work.** `fuzz.ratio = 100 · 2M / (la + lb)` with M ≤ the shorter length, so with
+la ≤ lb it is at most `200 la / (la + lb)`, which reaches the cutoff t only when
+`lb ≤ la · (200 − t) / t` (`resolve.max_length_ratio`: at 90 the longer key is at most 22.2%
+longer). Keys are sorted by length and each is scored only against the keys inside that window,
+and keys of one length and one digits-removed form sort together so a numbered series of one
+width is never scored against itself. The scoring is `rapidfuzz.process.cdist` with
+`score_cutoff`, in 512-row chunks over the window, when numpy is importable, else
+`process.extract_iter` per name with the same scorer and cutoff (same pairs, tested against
+scoring every pair; the wrangle extra doesn't pull in numpy). Apply skips the scored half for a
+scope (one part within one set of left parts) with more than
+`resolve.SIMILAR_MAX_SCORED_NAMES` (20,000) distinct names and says so in the report
+(`similar_skipped: [{part, within, names}]`); the `norm_key` half is a hash grouping and
+always runs. Measured (`similar_names`, threshold 90):
+
+| names | with numpy (cdist) | without numpy |
+| --- | --- | --- |
+| 1,882 county names | 0.04 s | 0.13–0.17 s |
+| 10,000 `Building 00001`… | 0.11 s (was 3.4 s, 651,555 pairs) | 0.09 s (was 6.8 s) |
+| 10,000 `Building 1`… (unpadded) | 0.25 s (was 3.6 s, 672,473 pairs) | 1.2 s (was 6.7 s) |
+| 10,000 random, 8–40 chars | 0.4 s (was 0.9 s) | 1.5 s (was 5.8 s) |
+| 30,000 random, 8–40 chars | 1.8 s (was 7.7 s) | 12.9 s (was 49.6 s); apply skips it (> 20,000) |
 
 Warnings never change a fact, a count, the reject rate or the gate. They are in the report as
-`similar_entities` (§7.4), printed by `dry-run` / `apply` (top 20), and written to
-`similar.csv`.
+`similar_entities` (§7.4), at most `apply.SIMILAR_REPORTED` (200) per load, the first in report
+order, with the true count in `similar_entities_total`; printed by `dry-run` / `apply` (top
+20, and `N (showing 200)` when capped), and written to `similar.csv` (the same 200). In a load
+of more than one file, each warning cell is prefixed with its file's base name,
+`east.xlsx#Sheet!A1` (the path as given if two files share a base name), since sheet names
+repeat across files; a one-file load keeps `Sheet!A1`. (`conflicts_within_load` cells need no
+prefix: each entry names its `document`, and two units of a load never share one.)
 
 ### 7.4 Apply — `wrangle/apply.py`
 
@@ -477,7 +546,8 @@ distinct fields.
 {"spec": "planner_forecast", "bundle_sha256": "…", "approved": true,
  "files": [{"path": "…", "sheet": "Plan", "file_sha256": "…", "rows_read": 412,
             "rows_skipped": {"skip_rows[0]": 20, "skip_rows[1]": 3},
-            "empty_skipped": 37, "null_skipped": {"--": 4}}],
+            "empty_skipped": 37, "null_skipped": {"--": 4},
+            "unused_columns": ["Total"]}],
  "facts": 4632, "duplicates_dropped": 0,
  "rejects": {"total": 14, "rate": 0.003,
              "by_reason": {"unknown entity": 12, "number: unparseable": 2}},
@@ -487,13 +557,28 @@ distinct fields.
                             "cells": ["Plan!G42", "Plan!G97"]}],
  "similar_entities": [{"part": "Part No", "kind": "plant_part", "a": "P-1234", "b": "P1234",
                        "score": 100.0, "reason": "same apart from punctuation/spacing",
-                       "cells": ["Plan!B9", "Plan!B31"]}]}
+                       "cells": ["Plan!B9", "Plan!B31"]}],
+ "similar_entities_total": 1,
+ "similar_skipped": []}
 ```
 
 `files` has one entry per unit (§7.4, units): with `source.sheets`, one per selected sheet, in
 workbook order. `similar_entities` (§7.3) is sorted by score descending, then `a`, then `b`;
 `a` < `b`, and `cells` are the first cell each name was read from (on a row that loaded a
-fact). It is empty when nothing fires and never affects the other keys.
+fact). It is empty when nothing fires and never affects the other keys. It holds at most 200
+entries; `similar_entities_total` is the full count, and `similar_skipped` lists the scopes
+whose similar-spelling half wasn't run (§7.3).
+
+**`unused_columns`** (per file entry): the labels, in sheet order, of the columns that have a
+non-blank header label and at least one non-empty cell in the section's data rows, but that no
+part of the spec reads. Read means: an entity part, the period column(s), a measure column, an
+unpivoted column, a `skip_rows` column, a `start_after` / `stop_before` column. A warning only
+(it changes nothing else and never gates), printed by `dry-run` / `apply` as one line per
+sheet. It exists because an unpivot `matching` (or `from`/`to`) that stops covering a column
+drops that column's data with 0 rejects: when Census relabels `Aug. 2026(p)` as
+`Aug. 2026 (p)`, the month is silently gone, and `unused_columns` shows `Aug. 2026 (p)`. The
+real-data tests pin each real spec's list (MRTS: `NAICS Code`, `TOTAL`; the 2026 sheet
+`NAICS Code`, `CY CUM`, `PY CUM`).
 
 `reject rate = rejects.total / (facts + rejects.total)`. Rows skipped by rule and empty skips
 are not in the denominator.
@@ -531,8 +616,10 @@ one `store.session(tenant)`, so the load is one transaction.
 - **Reject fields.** `file` is the path as passed on the command line; `raw` is `Cell.raw` (a CSV
   cell after unquoting; `#DIV/0!` for an error cell; `""` for `formula_no_value`); `op` is the
   failing op's name, `"resolve"` for an entity that didn't resolve and `"read"` for an error or
-  `formula_no_value` cell. Reasons for read failures are `"error cell"` and `"formula without
-  cached value"`; others are `ParseError.reason` or `unknown entity` / `ambiguous entity`.
+  `formula_no_value` cell. Reasons for read failures are `"error cell"`, `"formula without
+  cached value"`, and `"formula not calculated (workbook asks for recalculation on open)"` when
+  the workbook sets `fullCalcOnLoad` (§7.1); others are `ParseError.reason` or `unknown entity`
+  / `ambiguous entity`.
 - **Duplicates.** "First kept" means the first row's cell is the fact's `source_ref`.
 - **Later additions (real-data gaps).** `nulls`, `start_after`/`stop_before`, a `format` list and
   a `period.column.name` list (§7.4) came from loading real government files
@@ -547,6 +634,13 @@ one `store.session(tenant)`, so the load is one transaction.
   `write_outputs` also writes `similar.csv`
   (`part,kind,a,b,score,reason,cell_a,cell_b`). An XLSX spec with `source.sheet` over a CSV file
   is now a `SpecMismatch` (it was ignored).
+- **Review fixes (third pass).** `norm_key` keeps a separator between two digits (§7.3: `1.5`
+  vs `15` had merged). Possible-duplicate warnings skip digits-only pairs, score only inside
+  the length window, are capped at 200 per load with `similar_entities_total`, and skip the
+  scored half over 20,000 names per scope (`similar_skipped`); their cells name the file in a
+  multi-file load. Each file entry carries `unused_columns` (§7.4). `similar_warn` / `not_same`
+  left the bundle hash (§5). The report gained `similar_entities_total` and `similar_skipped`
+  (always present) and each file entry `unused_columns` (always present, `[]` when none).
 
 ## 8. Gates (FROZEN)
 
@@ -584,8 +678,11 @@ unpivot candidates, scale hints, keys. `--json` prints the model. Exit codes fol
 the CLI: 0 ok, 1 refused or failed, 2 bad arguments.
 
 `dry-run` and `apply` print a row per unit (one per sheet with `source.sheets`), then
-`conflicts within load: N` and `possible duplicate entities: N`, each with its first 20 lines
-(the rest are in `report.json` / `similar.csv` with `--out`).
+`conflicts within load: N` and `possible duplicate entities: N` (`N (showing 200)` when the
+report holds only the first 200), each with its first 20 lines (the rest are in `report.json`
+/ `similar.csv` with `--out`). A unit with `unused_columns` gets a line
+`warning <sheet>: K column(s) with data the spec doesn't read: …`; a skipped scored half gets a
+`not scored` line.
 
 ## 10. Fixtures (FROZEN layout) — `tests/fixtures/wrangle/`
 

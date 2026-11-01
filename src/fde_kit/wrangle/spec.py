@@ -103,6 +103,8 @@ SPEC_NAME = re.compile(r"^[a-z0-9_]+$")
 CELL_REF = re.compile(r"^[A-Z]{1,3}[1-9][0-9]*$")
 DOCUMENT_KEY_FIELDS = frozenset({"spec", "file", "path", "sheet"})
 SIMILAR_WARN_DEFAULT = 90
+WARNING_ONLY_RESOLVE_KEYS = ("similar_warn", "not_same")
+"""`resolve` settings that only shape warnings; left out of the bundle hash (`hash_payload`)."""
 
 
 class SpecError(ValueError):
@@ -614,9 +616,14 @@ class MappingSpec(_Model):
         """The spec as it enters the bundle hash: JSON-mode, aliases, no approval.
 
         Settings added after the first release (`source.start_after`, `source.stop_before`,
-        `source.sheets`, `measures[].nulls`, `resolve.similar_warn`, `resolve.not_same`) enter
-        only when set (`similar_warn`: when not the default), so a spec that doesn't use them
-        hashes as it did before they existed and its approval stays valid."""
+        `source.sheets`, `measures[].nulls`) enter only when set, so a spec that doesn't use
+        them hashes as it did before they existed and its approval stays valid.
+
+        `resolve.similar_warn` and `resolve.not_same` never enter (`WARNING_ONLY_RESOLVE_KEYS`):
+        they only decide which possible-duplicate warnings are reported and cannot change a
+        fact, a reject or the gate. The bundle hash is in every document's first line and every
+        `source_ref`, so hashing them would re-version every document and rewrite every fact
+        each time a person reviews one warning pair into `not_same`."""
         out = self.model_dump(mode="json", by_alias=True, exclude={"approval"})
         for key in _LATER_SOURCE_KEYS:
             if out["source"].get(key) is None:
@@ -625,11 +632,8 @@ class MappingSpec(_Model):
             if not m.get("nulls"):
                 m.pop("nulls", None)
         for part in out["entity"]["parts"]:
-            res = part["resolve"]
-            if res.get("similar_warn") == SIMILAR_WARN_DEFAULT:
-                res.pop("similar_warn", None)
-            if not res.get("not_same"):
-                res.pop("not_same", None)
+            for key in WARNING_ONLY_RESOLVE_KEYS:
+                part["resolve"].pop(key, None)
         return out
 
 

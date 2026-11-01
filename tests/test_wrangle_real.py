@@ -456,6 +456,66 @@ def test_without_sections_mrts_tables_conflict(project_copy: Path) -> None:
     assert len(result.report["conflicts_within_load"]) > 300
 
 
+# --- columns the spec doesn't read --------------------------------------------------------
+
+
+def _county_unused() -> list[str]:
+    """Every column of the county CSV (all have data) except the ones county_pop reads."""
+    with (REAL / SOURCES["county_pop"]).open(encoding="latin-1", newline="") as fh:
+        header = next(csv.reader(fh))
+    read = {"SUMLEV", "STNAME", "CTYNAME", *(f"POPESTIMATE{y}" for y in range(2020, 2026))}
+    return [h for h in header if h not in read]
+
+
+def _eia_unused(sector: str) -> list[str]:
+    sectors = ["Residential", "Commercial", "Industrial", "Transportation", "All Sectors"]
+    return [f"{s} / August {y}" for s in sectors if s != sector for y in (2026, 2025)]
+
+
+# Labelled columns with data that each spec leaves alone, by sheet. A rename that makes an
+# unpivot or measure stop matching shows up here instead of silently dropping data.
+UNUSED = {
+    "state_pop": ["April 1, 2020 Estimates Base"],
+    "eia_residential": _eia_unused("Residential"),
+    "eia_transport": _eia_unused("Transportation"),
+    "county_pop": _county_unused(),
+    "mrts_2024_nsa": ["NAICS Code", "TOTAL"],
+    "mrts_2024_sa": ["NAICS Code"],  # the adjusted table has no TOTAL values
+    "generation_ct_ri": [],
+}
+
+
+@pytest.mark.parametrize("name", list(SOURCES))
+def test_unused_columns(name: str, results: dict[str, ApplyResult]) -> None:
+    (f,) = results[name].report["files"]
+    assert f["unused_columns"] == UNUSED[name]
+
+
+def test_all_years_unused_columns(all_nsa: ApplyResult) -> None:
+    unused = {f["sheet"]: f["unused_columns"] for f in all_nsa.report["files"]}
+    assert unused.pop("2026") == ["NAICS Code", "CY CUM", "PY CUM"]
+    assert len(unused) == 34
+    assert all(cols == ["NAICS Code", "TOTAL"] for cols in unused.values()), unused
+
+
+def test_renamed_month_is_an_unused_column(tmp_path: Path, project_copy: Path) -> None:
+    """`Aug. 2026(p)` re-labelled `Aug. 2026 (p)` no longer matches the unpivot: the month
+    drops out with 0 rejects, and the only sign is the unused column."""
+    wb = openpyxl.load_workbook(REAL / SOURCES["mrts_2024_nsa"])
+    for name in wb.sheetnames:
+        if name != "2026":
+            wb.remove(wb[name])
+    assert wb["2026"]["J5"].value == "Aug. 2026(p)"
+    wb["2026"]["J5"].value = "Aug. 2026 (p)"
+    wb.save(tmp_path / "renamed.xlsx")
+    spec = project_copy / "specs" / "mrts_all_nsa.yaml"
+    result = run(spec, [tmp_path / "renamed.xlsx"])
+    (f,) = result.report["files"]
+    assert result.report["rejects"]["total"] == 0 and gate(result, draft=True) == []
+    assert not any(r.fact.row.period_start == date(2026, 8, 1) for r in result.files[0].facts)
+    assert f["unused_columns"] == ["NAICS Code", "Aug. 2026 (p)", "CY CUM", "PY CUM"]
+
+
 # --- all 35 year sheets in one spec (source.sheets) -----------------------------------------
 
 

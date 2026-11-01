@@ -27,8 +27,10 @@ in one load are a `SpecMismatch` (one would supersede the other within the load)
 `SpecMismatch` on any unit refuses the whole load; with `source.sheets` it names the sheet.
 
 After every unit, each open entity part's new names are compared pairwise for possible
-duplicates (`resolve.similar_names`): `similar_entities` in the report and `similar.csv`.
-Warnings only; they change no fact, count or gate.
+duplicates (`resolve.similar_names`): `similar_entities` in the report (the first
+`SIMILAR_REPORTED`, with `similar_entities_total`) and `similar.csv`. Each unit also reports
+`unused_columns`, labelled columns with data that the spec doesn't read. Warnings only; they
+change no fact, count or gate.
 
 **Native XLSX cells** (`cell_pipeline`): when a pipeline's first op is `number` and the cell is
 a number, the cell's value is taken as is (`Decimal(raw)`) and only the later ops run, so a
@@ -67,8 +69,22 @@ from ..rag.adapters.base import RawDocument, RawEntity, RawFact
 from ..rag.store import FactRow
 from .labels import header_fingerprint, header_labels
 from .parse import ParseError, apply_text, compile_ops, period_of, to_fact_value
-from .read import XLSX_SUFFIXES, Cell, Grid, col_letter, parse_ref, read_grid
-from .resolve import STRATEGIES, FuzzyMatch, Resolver, similar_names
+from .read import (
+    XLSX_SUFFIXES,
+    Cell,
+    Grid,
+    col_letter,
+    parse_ref,
+    read_failure_reason,
+    read_grid,
+)
+from .resolve import (
+    SIMILAR_MAX_SCORED_NAMES,
+    STRATEGIES,
+    FuzzyMatch,
+    Resolver,
+    similar_names,
+)
 from .spec import PERIOD_JOIN, LoadedSpec, Measure, SkipBlank, SpecError, load_project_spec
 
 __all__ = [
@@ -87,6 +103,9 @@ __all__ = [
 ]
 
 PREVIEW_FACTS = 50
+SIMILAR_REPORTED = 200
+"""At most this many possible-duplicate warnings are kept per load (report, similar.csv), the
+first in report order; `similar_entities_total` is the true count."""
 _SOURCE_REF = re.compile(
     r"^(?P<sheet>.+)!(?P<cell>[A-Z]{1,3}[1-9][0-9]*)"
     r"@wrangle:(?P<spec>[a-z0-9_]+)/(?P<bundle>[0-9a-f]{12})/(?P<file>[0-9a-f]{12})$"
@@ -153,6 +172,8 @@ class FileResult:
     """Measure cells skipped as a `nulls` placeholder, by placeholder."""
     section: dict[str, int] | None = None
     """With `start_after` / `stop_before`: the rows that matched them."""
+    unused_columns: list[str] = field(default_factory=list)
+    """Labelled columns with data in the section that no part of the spec reads (§7.4)."""
 
 
 @dataclass
@@ -166,7 +187,8 @@ class ApplyResult:
     duplicates_dropped: int = 0
     conflicts: list[dict[str, Any]] = field(default_factory=list)
     similar_entities: list[dict[str, Any]] = field(default_factory=list)
-    """Possible duplicate entity names (warnings only; see `_similar_entities`)."""
+    """Possible duplicate entity names, the first `SIMILAR_REPORTED` (warnings only; see
+    `_Run.similar_entities`)."""
 
     @property
     def approved(self) -> bool:
@@ -485,11 +507,20 @@ class _Run:
         self.part_names: list[dict[tuple[tuple[str, ...], str], str]] = [
             {} for _ in self.spec.entity.parts
         ]
+        # str(path) -> what a warning's cell is prefixed with: "" for a one-file load, else
+        # "<file name>#" (set by `run`).
+        self.cell_prefix: dict[str, str] = {}
 
-    def similar_entities(self) -> list[dict[str, Any]]:
+    def similar_entities(self) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
         """Possible duplicates among each open part's new canonicals, compared per part (never
-        the composite string): `resolve.similar_warn` and `not_same` (§7.3). Warnings only."""
+        the composite string): `resolve.similar_warn` and `not_same` (§7.3). Warnings only.
+
+        (the first `SIMILAR_REPORTED` warnings in report order, how many there were in all,
+        the scopes whose scored half was skipped). A scope with more than
+        `SIMILAR_MAX_SCORED_NAMES` distinct names gets only the norm_key half (a hash grouping,
+        linear), so one open part of 100k codes can't stall a load or flood its report."""
         out: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
         kind = self.spec.entity.kind
         for i, part in enumerate(self.spec.entity.parts):
             if not self.open_parts[i]:
@@ -498,9 +529,15 @@ class _Run:
             for (ctx, name), where in self.part_names[i].items():
                 groups.setdefault(ctx, {})[name] = where
             for ctx, names in groups.items():
-                for p in similar_names(
-                    list(names), part.resolve.similar_warn, not_same=part.resolve.not_same
-                ):
+                threshold = part.resolve.similar_warn
+                if threshold > 0 and len(names) > SIMILAR_MAX_SCORED_NAMES:
+                    threshold = 0
+                    skip: dict[str, Any] = {"part": part.column}
+                    if ctx:
+                        skip["within"] = list(ctx)
+                    skip["names"] = len(names)
+                    skipped.append(skip)
+                for p in similar_names(list(names), threshold, not_same=part.resolve.not_same):
                     item = {
                         "part": part.column,
                         "kind": kind,
@@ -513,7 +550,8 @@ class _Run:
                     if ctx:
                         item["within"] = list(ctx)
                     out.append(item)
-        return sorted(out, key=lambda d: (-d["score"], d["a"], d["b"], d["part"]))
+        out.sort(key=lambda d: (-d["score"], d["a"], d["b"], d["part"], d.get("within", [])))
+        return out[:SIMILAR_REPORTED], len(out), skipped
 
     def _reject(self, fr: FileResult, *, where: dict[str, Any], **kw: Any) -> None:
         rec: dict[str, Any] = {"file": fr.path, "sheet": fr.sheet, **where}
@@ -559,6 +597,8 @@ class _Run:
             )
         except ValueError as e:
             raise SpecMismatch(shown, str(e), msheet) from e
+        # Reject reasons for unreadable cells depend on the workbook (`read_failure_reason`).
+        self.grid = grid
 
         labels = header_labels(grid, list(src.header_rows))
         if src.header_fingerprint and not self.force:
@@ -605,6 +645,13 @@ class _Run:
             (m, fn, cols.find(m.column, "measure column") if m.column is not None else None)
             for m, fn in self.c.measures
         ]
+        used = {*part_cols, *period_cols, *unpivot_cols}
+        used.update(c for _, _, c in measure_cols if c is not None)
+        for kind, how in skip_cols:
+            used.update(how if kind == "blank" else [how[0]])
+        for bound in (src.start_after, src.stop_before):
+            if bound is not None:
+                used.add(cols.find(bound.column, "section column"))
 
         document = RawDocument(
             source=source,
@@ -624,6 +671,7 @@ class _Run:
             document=document,
             rows_skipped={f"skip_rows[{i}]": 0 for i in range(len(self.c.skips))},
         )
+        fr.unused_columns = self._unused_columns(grid, labels, used, first_row, last_row)
         if src.start_after is not None or src.stop_before is not None:
             fr.section = {}
             if src.start_after is not None:
@@ -648,6 +696,7 @@ class _Run:
 
         entities: dict[str, RawEntity] = {}
         self.seen = {}
+        cell_prefix = f"{self.cell_prefix.get(shown, '')}{grid.sheet}!"
         for r in range(first_row, last_row + 1):
             row = grid.rows[r - 1]
             if all(c.kind == "empty" for c in row):
@@ -662,7 +711,7 @@ class _Run:
             for (fn, resolver), col in zip(self.c.parts, part_cols, strict=True):
                 cell = grid.cell(r, col)
                 if cell.kind in _READ_FAILURES:
-                    self._row_reject(fr, r, cell, "entity", "read", _READ_FAILURES[cell.kind])
+                    self._row_reject(fr, r, cell, "entity", "read", self._read_reason(cell))
                     failed = True
                     break
                 try:
@@ -681,7 +730,7 @@ class _Run:
                 continue
             # Each open part's new name and its cell, noted once the row loads a fact.
             new_names = [
-                (i, (_others(canonicals, i), canonical), f"{grid.sheet}!{col_letter(col)}{r}")
+                (i, (_others(canonicals, i), canonical), f"{cell_prefix}{col_letter(col)}{r}")
                 for i, (canonical, col) in enumerate(zip(canonicals, part_cols, strict=True))
                 if self.open_parts[i]
                 and (_others(canonicals, i), canonical) not in self.part_names[i]
@@ -777,6 +826,26 @@ class _Run:
         )
         return fr
 
+    @staticmethod
+    def _unused_columns(
+        grid: Grid, labels: list[str], used: set[int], first: int, last: int
+    ) -> list[str]:
+        """Labels of the columns that have a header label and a non-empty cell in rows
+        `first..last`, but that no part of the spec reads (entity parts, period column(s),
+        measure columns, unpivoted columns, skip_rows and section-bound columns). A warning:
+        an unpivot `matching` that stops matching a renamed month, or a measure column the
+        spec never named, would otherwise drop data with no reject."""
+        out = []
+        for c, label in enumerate(labels, 1):
+            if not label or c in used:
+                continue
+            for r in range(first, last + 1):
+                cell = grid.cell(r, c)
+                if cell.kind != "empty" and cell.raw.strip():
+                    out.append(label)
+                    break
+        return out
+
     def _section(
         self, grid: Grid, cols: _Columns, shown: str, msheet: str | None
     ) -> tuple[int, int]:
@@ -851,11 +920,16 @@ class _Run:
                 return True
         return False
 
-    @staticmethod
-    def _period(cell: Cell, fn: Pipeline) -> tuple[tuple[date, date] | None, ParseError | None]:
+    def _read_reason(self, cell: Cell) -> str:
+        """Why an unreadable cell (`_READ_FAILURES` kinds) can't be read, for its reject."""
+        return read_failure_reason(self.grid, cell) or _READ_FAILURES[cell.kind]
+
+    def _period(
+        self, cell: Cell, fn: Pipeline
+    ) -> tuple[tuple[date, date] | None, ParseError | None]:
         """(period, None), or (None, the failure)."""
         if cell.kind in _READ_FAILURES:
-            return None, ParseError(_READ_FAILURES[cell.kind], "read")
+            return None, ParseError(self._read_reason(cell), "read")
         try:
             return fn(cell), None  # type: ignore[return-value]
         except ParseError as e:
@@ -865,7 +939,7 @@ class _Run:
         self, fr: FileResult, cell: Cell, m: Measure, fn: Pipeline | None
     ) -> int | Decimal | str | None:
         if cell.kind in _READ_FAILURES:
-            self._cell_reject(fr, cell, cell.raw, "measure", "read", _READ_FAILURES[cell.kind])
+            self._cell_reject(fr, cell, cell.raw, "measure", "read", self._read_reason(cell))
             return None
         try:
             out = fn(cell) if fn else cell.raw
@@ -888,6 +962,19 @@ class _Run:
             return False
         prior.append((value, cell_name))
         return True
+
+
+def _cell_prefixes(files: list[str | Path]) -> dict[str, str]:
+    """str(path) -> the prefix of a warning's cell. A one-file load keeps `Sheet!A1`; with
+    several files, sheet names can repeat across them, so each cell starts with its file's
+    base name and `#` (`east.xlsx#Sheet!A1`), or the path as given when two files share a
+    base name."""
+    paths = list(dict.fromkeys(str(f) for f in files))
+    if len(paths) < 2:
+        return {}
+    names = [Path(p).name for p in paths]
+    unique = len(set(names)) == len(names)
+    return {p: f"{n if unique else p}#" for p, n in zip(paths, names, strict=True)}
 
 
 def run(
@@ -919,8 +1006,9 @@ def run(
             )
         keys[key] = shown
     state = _Run(loaded, force)
+    state.cell_prefix = _cell_prefixes(files)
     results = [state.file(f, sheet) for f, sheet in units]
-    similar = state.similar_entities()
+    similar, similar_total, similar_skipped = state.similar_entities()
 
     crosswalk_entities = [
         RawEntity(cw.kind, canonical, cw.aliases_for(canonical))
@@ -951,6 +1039,7 @@ def run(
                 "empty_skipped": f.empty_skipped,
                 "null_skipped": dict(sorted(f.null_skipped.items())),
                 **({"section": dict(f.section)} if f.section is not None else {}),
+                "unused_columns": list(f.unused_columns),
             }
             for f in results
         ],
@@ -964,6 +1053,8 @@ def run(
         "entities": counts,
         "conflicts_within_load": conflicts,
         "similar_entities": similar,
+        "similar_entities_total": similar_total,
+        "similar_skipped": similar_skipped,
     }
     return ApplyResult(
         loaded=loaded,

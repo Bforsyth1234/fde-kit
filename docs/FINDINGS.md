@@ -319,7 +319,13 @@ Four bugs the fixtures and tests caught before anything shipped:
   groups and dissolves any whose remaining members agree.
 - **`10-07` and `100-7` normalised to the same plant.** Dropping separators before stripping leading
   zeros merges digit runs. Zeros now go first. A false merge silently sums two plants' numbers,
-  which is worse than any reject.
+  which is worse than any reject. A later review found the same class of bug wider: dropping
+  *any* separator between digits merged `Pipe 1.5 in` with `Pipe 15 in`, `2.25 MVA` with
+  `22.5 MVA`, `A-1/10` with `A-11/0` and part `12-345` with `123-45`, and a crosswalk resolved
+  one to the other's canonical as `normalised`. `norm_key` now keeps a separator run that has a
+  digit on both sides (`10-07` → `10-7`, `1.5` → `1.5`), and a digit run after a kept `.` or
+  `,` keeps its zeros (`1.05` is not `1.5`). Separators elsewhere still go (`DET-07` → `det7`);
+  every fixture alias resolves as before.
 - **`DET-07` parsed as the number −7.** The number parser stripped "any three capital letters" as a
   currency code. Only ISO 4217 codes count now.
 
@@ -388,6 +394,23 @@ for exports in the thousands, and slow at 100k. The next step is batching the co
   within the parts to its left (counties within one state). That leaves 46, all in one state,
   like Coke vs Cooke County TX and East vs West Baton Rouge Parish: still different places, but
   the kind a careless merge gets wrong, and short enough to review.
+  A review then broke it with synthetic data: an open part of 10,000 names like `Building 00001`
+  gave 651k warnings and a 166 MB report, and 30,000 random names took 47 s without numpy. Names
+  equal apart from their digits are no longer a pair (a numbered series is different things);
+  only pairs whose lengths allow `ratio` ≥ the threshold are scored (at 90 the longer name is
+  at most 22% longer); a load keeps the first 200 warnings and reports the true total; and a
+  scope over 20,000 names gets only the punctuation check, and the report says so. The same
+  10,000 names now take 0.1 s and report nothing; 30,000 random names 1.8 s with numpy, 12.9 s
+  without (and are skipped by apply). Reviewing a pair into `not_same` also used to change the
+  bundle hash, which is in every document and `source_ref`, so it re-versioned every document
+  and rewrote all 25,207 facts of the all-years MRTS spec; warning-only settings are now outside
+  the hash.
+- **A renamed column dropped a month with 0 rejects.** The MRTS all-years spec unpivots month
+  labels by regex. Relabel `Aug. 2026(p)` as `Aug. 2026 (p)` and the regex stops matching: the
+  month is gone, no reject, gate passes, and the per-fact oracle can't notice a column it was
+  never told about. Each file entry now lists `unused_columns`: columns with a label and data
+  that the spec doesn't read. The real-data tests pin the list per spec and sheet (`NAICS Code`
+  and `TOTAL`; `CY CUM` / `PY CUM` for 2026), so a lost column fails CI.
 - **No hierarchy.** Regions beside states, divisions beside states, NAICS parents beside children all
   load as flat entities, so summing a column double-counts.
 - **No per-fact status.** `Aug. 2026(p)` (preliminary) and EIA's "not meaningful" vs "not
@@ -413,6 +436,20 @@ for exports in the thousands, and slow at 100k. The next step is batching the co
   openpyxl doesn't expose. That second pass costs about 0.3 s on the 19 MB EIA workbook (1.3 s
   in all). python-calamine would be faster, but it doesn't expose formulas, so a formula with no
   cached value would read as an empty cell instead of a reject.
+- **A review of that reader found three ways it still misread a file, all fixed with tests.**
+  (1) A formula whose cached result is an empty string (`=IF(..,"",..)`, saved as `t="str"`
+  with an empty `<v>`) was a reject; it is now an empty cell, as Excel shows it. (2) XlsxWriter,
+  which pandas uses, writes uncalculated formulas as `<v>0</v>` and sets
+  `<calcPr fullCalcOnLoad="1"/>`: those loaded as 0. Now every formula in a workbook with that
+  flag is a reject, "formula not calculated (workbook asks for recalculation on open)", and the
+  fix is to open and save the file in Excel or LibreOffice. openpyxl sets the flag too; the
+  committed openpyxl-written fixtures have no formulas, and `formulas.xlsx` (saved by
+  LibreOffice) doesn't set it, so no fixture's facts or rejects changed. (3) Read-only openpyxl
+  silently drops or misplaces cells when the sheet XML isn't in row/column order (a cell before
+  an earlier column, rows out of order or repeated, a cell off its row). Excel never writes
+  that, but other tools may; the XML pass now refuses such a sheet with an error naming the
+  cell. All 41 fixture sheets read byte-identically before and after, and the 25k-row EIA sheet
+  takes the same time and memory.
 
 ## Costs and limits
 

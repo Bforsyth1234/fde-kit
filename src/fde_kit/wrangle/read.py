@@ -5,12 +5,20 @@ the Python objects openpyxl returns. That keeps one parse path for CSV and XLSX,
 `source_ref` read-back exact: re-reading the cell gives the same string, which the same ops turn
 into the same value.
 
-Two XLSX cases matter because getting them wrong silently loads a wrong number:
+Three XLSX cases matter because getting them wrong silently loads a wrong number:
 
 - A formula cell with no cached value (a file written by a script and never opened in Excel)
   reads as `None` under `data_only=True`. It's `formula_no_value`, so a spec that reads it
-  rejects the cell instead of loading 0 or skipping it as empty.
+  rejects the cell instead of loading 0 or skipping it as empty. A cached empty string
+  (`=IF(..,"",..)`, stored as `t="str"` with an empty `<v>`) is a real result: `empty`.
+- A workbook whose `<calcPr fullCalcOnLoad="1"/>` asks Excel to recalculate on open (XlsxWriter,
+  so pandas, and openpyxl set it) may hold placeholder results: XlsxWriter writes `<v>0</v>` for
+  every formula. Every formula cell in such a workbook is `formula_no_value`, and
+  `Grid.recalc_on_open` is set so the reject can say why (`FORMULA_NOT_CALCULATED`).
 - Excel error values (`#N/A`, `#REF!`, ...) are `error`, never text that a `map` could rescue.
+
+Sheet XML whose rows or cells are out of order (which read-only openpyxl silently drops or
+misplaces) is a `ValueError`, never a partial grid.
 
 Numbers are `str(Decimal(repr(float)))` in plain notation (no exponent), so `0.1` is `"0.1"`
 and not `0.1000000000000000055...`, and the `number` op's strict grammar accepts it.
@@ -56,6 +64,11 @@ SNIFF_BYTES = 64 * 1024
 SNIFF_DELIMITERS = ",;\t|"
 
 _REF_RE = re.compile(r"\$?([A-Za-z]{1,3})\$?([1-9][0-9]*)")
+_CELL_R_RE = re.compile(r"([A-Za-z]{1,3})([0-9]+)")
+
+FORMULA_NO_VALUE = "formula without cached value"
+FORMULA_NOT_CALCULATED = "formula not calculated (workbook asks for recalculation on open)"
+""" Reject reasons for a `formula_no_value` cell; see `read_failure_reason`."""
 
 
 def col_letter(n: int) -> str:
@@ -111,12 +124,27 @@ class Grid:
     """Rectangular: every row has the same length, padded with empty cells."""
     merged: list[tuple[int, int, int, int]]
     """(min_row, min_col, max_row, max_col), 1-based, inclusive; empty for CSV."""
+    recalc_on_open: bool = False
+    """The workbook sets `<calcPr fullCalcOnLoad="1"/>`: its cached formula results can't be
+    trusted, so every formula cell is `formula_no_value`. Open and save the file in Excel or
+    LibreOffice to get real cached values."""
 
     def cell(self, row: int, col: int) -> Cell:
         """The cell at 1-based (row, col); an empty cell outside the read area."""
         if 1 <= row <= len(self.rows) and 1 <= col <= len(self.rows[row - 1]):
             return self.rows[row - 1][col - 1]
         return Cell(row, col, "", "empty")
+
+
+def read_failure_reason(grid: Grid, cell: Cell) -> str | None:
+    """Why `cell` can't be read as a value, or None if it can: `error cell`, or one of the two
+    `formula_no_value` reasons (`FORMULA_NOT_CALCULATED` when the workbook asks for
+    recalculation on open, so the fix is to open and save it in Excel or LibreOffice)."""
+    if cell.kind == "error":
+        return "error cell"
+    if cell.kind == "formula_no_value":
+        return FORMULA_NOT_CALCULATED if grid.recalc_on_open else FORMULA_NO_VALUE
+    return None
 
 
 def read_grid(
@@ -223,19 +251,23 @@ def _rel_targets(zf: zipfile.ZipFile, part: str) -> dict[str, tuple[str, str]]:
     return out
 
 
-def _sheet_xml_path(zf: zipfile.ZipFile, sheet: str) -> str:
-    """The zip member holding `sheet`'s XML: sheet name -> r:id in the workbook part ->
-    relationship target. File names (`sheet3.xml`) need not follow sheet order."""
+def _sheet_xml_path(zf: zipfile.ZipFile, sheet: str) -> tuple[str, bool]:
+    """The zip member holding `sheet`'s XML (sheet name -> r:id in the workbook part ->
+    relationship target; file names like `sheet3.xml` need not follow sheet order), and whether
+    the workbook's `<calcPr>` sets `fullCalcOnLoad`."""
     workbook = next(
         (t for typ, t in _rel_targets(zf, "").values() if typ == _OFFICE_DOCUMENT_REL),
         "xl/workbook.xml",
     )
     rels = _rel_targets(zf, workbook)
-    for el in ET.fromstring(zf.read(workbook)).iter(f"{_MAIN_NS}sheet"):
+    root = ET.fromstring(zf.read(workbook))
+    calc = root.find(f"{_MAIN_NS}calcPr")
+    full_calc = calc is not None and calc.get("fullCalcOnLoad", "").lower() in ("1", "true")
+    for el in root.iter(f"{_MAIN_NS}sheet"):
         if el.get("name") == sheet:
             rid = el.get(f"{_DOC_RELS_NS}id")
             if rid in rels:
-                return rels[rid][1]
+                return rels[rid][1], full_calc
             break
     raise ValueError(f"no worksheet part found for sheet {sheet!r}")
 
@@ -251,22 +283,36 @@ def _row_number(r: str) -> int:
         return int(val)
 
 
+class _OutOfOrder(ValueError):
+    def __init__(self, ref: str):
+        super().__init__(ref)
+        self.ref = ref
+
+
 def _scan_sheet_xml(
-    src: IO[bytes],
+    src: IO[bytes], full_calc: bool = False
 ) -> tuple[set[tuple[int, int]], list[tuple[int, int, int, int]]]:
     """One streaming pass over a sheet's XML for what read-only openpyxl doesn't expose: the
-    cells that hold a formula but no cached value (`<f>`, shared formulas' empty `<f t="shared"
-    si=".."/>` included, with no or an empty `<v>`), and the `<mergeCells>` ranges.
+    cells that hold a formula but no cached value, and the `<mergeCells>` ranges.
+
+    A formula (`<f>`, shared formulas' empty `<f t="shared" si=".."/>` included) has no cached
+    value when it has no `<v>`, or an empty `<v>` without `t="str"`. With `t="str"` an empty
+    `<v>` is a cached empty string (`=IF(..,"",..)`), so it isn't listed. With `full_calc`
+    every formula cell is listed, and every cell of an array formula's `ref` range.
 
     Cell coordinates follow openpyxl's parser exactly, including rows and cells written without
     an `r` attribute (numbered on from the previous one), so both passes agree on every cell.
+    Read-only openpyxl assumes rows and cells in order and drops or misplaces any that aren't,
+    so a row number that doesn't increase, a column that doesn't increase within its row, or a
+    cell `r` off its row raises `_OutOfOrder` naming the first such cell.
     """
-    from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
+    from openpyxl.utils.cell import range_boundaries
 
     no_value: set[tuple[int, int]] = set()
     merged: list[tuple[int, int, int, int]] = []
     c_tag, row_tag, f_tag, v_tag = (f"{_MAIN_NS}{t}" for t in ("c", "row", "f", "v"))
     merge_tag, data_tag = f"{_MAIN_NS}mergeCell", f"{_MAIN_NS}sheetData"
+    col_cache: dict[str, int] = {}
     sheet_data = None
     row = 0
     for event, el in ET.iterparse(src, events=("start", "end")):
@@ -278,22 +324,45 @@ def _scan_sheet_xml(
         if tag == row_tag:
             # A row's cells are read when the row ends; then the row is dropped.
             r = el.get("r")
+            prev_row = row
             row = row + 1 if r is None else _row_number(r)
+            if row <= prev_row:
+                first = next((c.get("r") for c in el if c.tag == c_tag and c.get("r")), None)
+                raise _OutOfOrder(first or f"row {row}")
             col = 0  # the previous cell's column, as openpyxl counts it
-            last_ref = None  # ... or the previous cell's `r`, parsed only when needed
             for c in el:
                 if c.tag != c_tag:
                     continue
                 ref = c.get("r")
                 if ref:
-                    last_ref = ref
+                    m = _CELL_R_RE.fullmatch(ref)
+                    if m is None:
+                        raise ValueError(f"not a cell reference: {ref!r}")
+                    letters = m.group(1)
+                    cc = col_cache.get(letters)
+                    if cc is None:
+                        cc = col_cache[letters] = col_number(letters)
+                    if int(m.group(2)) != row or cc <= col:
+                        raise _OutOfOrder(ref)
+                    col = cc
                 else:
-                    if last_ref is not None:
-                        col = coordinate_to_tuple(last_ref)[1]
-                        last_ref = None
                     col += 1
-                if c.find(f_tag) is not None and not c.findtext(v_tag):
-                    no_value.add(coordinate_to_tuple(ref) if ref else (row, col))
+                f = c.find(f_tag)
+                if f is None:
+                    continue
+                if full_calc:
+                    no_value.add((row, col))
+                    if f.get("t") == "array" and f.get("ref"):
+                        min_c, min_r, max_c, max_r = range_boundaries(f.get("ref"))
+                        no_value.update(
+                            (ri, ci)
+                            for ri in range(min_r, max_r + 1)
+                            for ci in range(min_c, max_c + 1)
+                        )
+                    continue
+                v = c.find(v_tag)
+                if v is None or (not v.text and c.get("t") != "str"):
+                    no_value.add((row, col))
             el.clear()
             if sheet_data is not None:
                 sheet_data.clear()
@@ -315,7 +384,9 @@ def _read_xlsx(p: Path, sheet: str | None, sha: str) -> Grid:
     2. A stdlib `iterparse` of the same sheet XML (found through the workbook's relationships)
        for formula cells without a cached value and the `<mergeCells>`, which read-only
        worksheets don't expose. A formula with no cached value reads as `None` in pass 1, the
-       same as an empty cell; pass 2 is what tells them apart.
+       same as an empty cell; pass 2 is what tells them apart. When the workbook asks for
+       recalculation on open, pass 2 overrides every formula's cached value. Pass 2 also
+       refuses sheet XML that isn't in row/column order, which pass 1 would silently misread.
 
     Memory is the grid itself, not openpyxl's worksheet model.
     """
@@ -342,13 +413,21 @@ def _read_xlsx(p: Path, sheet: str | None, sha: str) -> Grid:
     finally:
         wb.close()
 
-    with zipfile.ZipFile(p) as zf, zf.open(_sheet_xml_path(zf, name)) as src:
-        no_value, merged = _scan_sheet_xml(src)
+    with zipfile.ZipFile(p) as zf:
+        part, full_calc = _sheet_xml_path(zf, name)
+        with zf.open(part) as src:
+            try:
+                no_value, merged = _scan_sheet_xml(src, full_calc)
+            except _OutOfOrder as e:
+                raise ValueError(
+                    f"{p}: sheet {name!r}: sheet XML is not in row/column order (first at "
+                    f"{e.ref}); open and re-save the file in Excel or LibreOffice"
+                ) from None
 
     sparse = {k: _xlsx_cell(k[0], k[1], v, False) for k, v in values.items()}
     for r_idx, c_idx in no_value:
-        if (r_idx, c_idx) not in values:
-            sparse[(r_idx, c_idx)] = Cell(r_idx, c_idx, "", "formula_no_value")
+        # Overrides a cached value: with fullCalcOnLoad it may be a placeholder like 0.
+        sparse[(r_idx, c_idx)] = Cell(r_idx, c_idx, "", "formula_no_value")
 
     for min_row, min_col, max_row, max_col in merged:
         # As openpyxl's full model does: only the top-left cell of a merged range keeps a value.
@@ -376,7 +455,14 @@ def _read_xlsx(p: Path, sheet: str | None, sha: str) -> Grid:
         ]
         for r_idx in range(1, height + 1)
     ]
-    return Grid(path=str(p), sheet=name, file_sha256=sha, rows=_trim(rows), merged=merged)
+    return Grid(
+        path=str(p),
+        sheet=name,
+        file_sha256=sha,
+        rows=_trim(rows),
+        merged=merged,
+        recalc_on_open=full_calc,
+    )
 
 
 def sniff_delimiter(sample: str) -> str:

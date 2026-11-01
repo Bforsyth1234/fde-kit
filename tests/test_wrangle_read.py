@@ -9,7 +9,16 @@ import openpyxl
 import pytest
 
 from fde_kit.wrangle.parse import ParseError, run_ops
-from fde_kit.wrangle.read import Cell, col_letter, col_number, parse_ref, read_grid
+from fde_kit.wrangle.read import (
+    FORMULA_NO_VALUE,
+    FORMULA_NOT_CALCULATED,
+    Cell,
+    col_letter,
+    col_number,
+    parse_ref,
+    read_failure_reason,
+    read_grid,
+)
 
 
 @pytest.mark.parametrize(
@@ -156,7 +165,8 @@ def test_missing_sheet_lists_available(plan_xlsx):
 def test_cached_formula_value_is_read(tmp_path):
     """A formula whose cached value is present reads as that value (as LibreOffice saves it).
 
-    openpyxl can't write cached values, so patch one into the sheet XML by hand."""
+    openpyxl can't write cached values, so patch one into the sheet XML by hand, and drop the
+    `fullCalcOnLoad` flag openpyxl sets (a file LibreOffice or Excel saved doesn't have it)."""
     import re
     import zipfile
 
@@ -177,6 +187,8 @@ def test_cached_formula_value_is_read(tmp_path):
                 xml = xml.replace('<c r="A3"', '<c r="A3" t="e"')
                 xml = re.sub(r"<f>1/0</f>(<v\s*/>|<v></v>)?", "<f>1/0</f><v>#DIV/0!</v>", xml)
                 data = xml.encode()
+            elif item.filename == "xl/workbook.xml":
+                data = _without_full_calc(data)
             zout.writestr(item, data)
     g = read_grid(dst)
     assert (g.cell(2, 1).raw, g.cell(2, 1).kind) == ("6", "number")
@@ -318,6 +330,15 @@ def test_xlsx_reads_only_the_requested_sheet(tmp_path, monkeypatch):
     assert calls == [{"read_only": True, "data_only": True}]
 
 
+def _without_full_calc(workbook_xml: bytes) -> bytes:
+    """openpyxl's `<calcPr calcId=".." fullCalcOnLoad="1"/>` without the flag, as Excel saves it."""
+    import re
+
+    out, n = re.subn(rb'\s*fullCalcOnLoad="(1|true)"', b"", workbook_xml)
+    assert n == 1, "openpyxl no longer writes fullCalcOnLoad; revisit these tests"
+    return out
+
+
 def _patch_xlsx(src, dst, replace):
     """Copy an xlsx, with `replace[member] = new bytes or None (drop)` and renamed members."""
     import zipfile
@@ -351,11 +372,13 @@ def test_shared_formulas_without_cached_values(tmp_path):
         "</sheetData></worksheet>"
     )
     strings = f'<sst xmlns="{ns}" count="1" uniqueCount="1"><si><t>n</t></si></sst>'
-    dst = tmp_path / "shared.xlsx"
-    _patch_xlsx(src, dst, {"xl/worksheets/sheet1.xml": sheet.encode()})
-    # add a shared-strings part the workbook relationships point to
     import zipfile
 
+    dst = tmp_path / "shared.xlsx"
+    with zipfile.ZipFile(src) as z:
+        workbook = _without_full_calc(z.read("xl/workbook.xml"))
+    _patch_xlsx(src, dst, {"xl/worksheets/sheet1.xml": sheet.encode(), "xl/workbook.xml": workbook})
+    # add a shared-strings part the workbook relationships point to
     with zipfile.ZipFile(dst) as z:
         rels = z.read("xl/_rels/workbook.xml.rels").decode()
         types = z.read("[Content_Types].xml").decode()
@@ -438,3 +461,157 @@ def test_sheet_xml_found_through_relationships_not_file_order(tmp_path):
     assert g.cell(1, 1).raw == "third" and g.cell(3, 3).raw == "3"
     assert {c.kind for r in g.rows for c in r} == {"text", "number", "empty"}
     assert read_grid(dst, "Second").rows == [[Cell(1, 1, "second", "text")]]
+
+
+# ------------------------------------------------- hand-written sheet XML (review findings)
+
+_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+
+
+def _sheet_xlsx(tmp_path, sheet_data, *, full_calc=False, name="hand.xlsx"):
+    """An xlsx whose one sheet "S" is `<sheetData>{sheet_data}</sheetData>`; `full_calc` keeps
+    openpyxl's `fullCalcOnLoad="1"`, otherwise it's dropped (as Excel or LibreOffice save)."""
+    import zipfile
+
+    wb = openpyxl.Workbook()
+    wb.active.title = "S"
+    src = tmp_path / f"src-{name}"
+    wb.save(src)
+    with zipfile.ZipFile(src) as z:
+        workbook = z.read("xl/workbook.xml")
+    assert b'fullCalcOnLoad="1"' in workbook
+    if not full_calc:
+        workbook = _without_full_calc(workbook)
+    sheet = f'<worksheet xmlns="{_NS}"><sheetData>{sheet_data}</sheetData></worksheet>'
+    dst = tmp_path / name
+    _patch_xlsx(src, dst, {"xl/worksheets/sheet1.xml": sheet.encode(), "xl/workbook.xml": workbook})
+    return dst
+
+
+def _cells(g):
+    return [[(c.raw, c.kind) for c in r] for r in g.rows]
+
+
+def test_formula_cached_empty_string_is_empty_not_a_reject(tmp_path):
+    """`=IF(..,"",..)` saved by Excel/LibreOffice is `t="str"` with an empty (or self-closed)
+    `<v>`: a cached "" that Excel shows as a blank, so `empty`. Without `t="str"`, an empty
+    `<v>` (or none at all) is still no cached value (openpyxl writes formulas that way)."""
+    path = _sheet_xlsx(
+        tmp_path,
+        '<row r="1"><c r="A1"><v>1</v></c>'
+        '<c r="B1" t="str"><f>IF(A1=1,"",A1)</f><v></v></c>'
+        '<c r="C1" t="str"><f>IF(A1=1,"",A1)</f><v/></c>'
+        '<c r="D1" t="str"><f>IF(A1=1,"",A1)</f></c>'  # t="str" but no <v>: not calculated
+        '<c r="E1"><f>A1*2</f><v></v></c>'  # empty <v> without t="str": not calculated
+        '<c r="F1" t="str"><f>"x"&amp;A1</f><v>x1</v></c>'
+        '<c r="G1"><v>9</v></c></row>',
+    )
+    g = read_grid(path)
+    fnv = ("", "formula_no_value")
+    assert _cells(g) == [
+        [("1", "number"), ("", "empty"), ("", "empty"), fnv, fnv, ("x1", "text"), ("9", "number")]
+    ]
+    assert g.recalc_on_open is False
+    assert read_failure_reason(g, g.cell(1, 4)) == FORMULA_NO_VALUE
+    assert read_failure_reason(g, g.cell(1, 2)) is None
+
+
+def test_full_calc_on_load_formulas_are_never_their_placeholder(tmp_path):
+    """XlsxWriter (what pandas uses) writes an uncalculated formula as `<f>D2*2</f><v>0</v>` and
+    sets `<calcPr fullCalcOnLoad="1"/>`. With that flag no formula's `<v>` is trusted: every
+    formula cell, and every cell of an array formula's range, is `formula_no_value`, with its
+    own reject reason. Plain values are read as usual."""
+    data = (
+        '<row r="1"><c r="A1"><v>3</v></c><c r="B1"><f>A1*2</f><v>0</v></c>'
+        '<c r="C1" t="str"><f>IF(A1=1,"",A1)</f><v></v></c>'
+        '<c r="D1" t="e"><f>1/0</f><v>#DIV/0!</v></c></row>'
+        '<row r="2"><c r="A2"><v>4</v></c><c r="B2"><f t="array" ref="B2:B3">A2:A3*2</f>'
+        "<v>0</v></c></row>"
+        '<row r="3"><c r="A3"><v>5</v></c><c r="B3"><v>0</v></c></row>'
+    )
+    g = read_grid(_sheet_xlsx(tmp_path, data, full_calc=True))
+    fnv = ("", "formula_no_value")
+    assert _cells(g) == [
+        [("3", "number"), fnv, fnv, fnv],
+        [("4", "number"), fnv, ("", "empty"), ("", "empty")],
+        [("5", "number"), fnv, ("", "empty"), ("", "empty")],
+    ]
+    assert g.recalc_on_open is True
+    assert read_failure_reason(g, g.cell(1, 2)) == FORMULA_NOT_CALCULATED
+    assert "recalculation on open" in FORMULA_NOT_CALCULATED
+    assert read_failure_reason(g, g.cell(1, 1)) is None
+    with pytest.raises(ParseError):
+        run_ops(g.cell(1, 2).raw, [{"op": "number"}])
+
+    # The same sheet saved by Excel or LibreOffice (no flag) reads its cached values.
+    g = read_grid(_sheet_xlsx(tmp_path, data, name="saved.xlsx"))
+    assert g.recalc_on_open is False
+    assert _cells(g)[0] == [("3", "number"), ("0", "number"), ("", "empty"), ("#DIV/0!", "error")]
+    assert g.cell(3, 2) == Cell(3, 2, "0", "number")
+
+
+def test_openpyxl_written_workbook_rejects_with_recalc_reason(plan_xlsx):
+    g = read_grid(plan_xlsx, "Plan")
+    assert g.recalc_on_open is True  # openpyxl sets fullCalcOnLoad
+    assert read_failure_reason(g, g.cell(4, 4)) == FORMULA_NOT_CALCULATED
+    assert read_failure_reason(g, g.cell(5, 2)) == "error cell"
+
+
+def test_committed_formula_fixture_has_real_cached_values():
+    """formulas.xlsx was saved by LibreOffice, which doesn't set fullCalcOnLoad: its cached
+    values are real, so only the stripped D4 is formula_no_value."""
+    from pathlib import Path
+
+    path = Path(__file__).parent / "fixtures" / "wrangle" / "formulas.xlsx"
+    g = read_grid(path, "Calc")
+    assert g.recalc_on_open is False
+    assert [c.ref for r in g.rows for c in r if c.kind == "formula_no_value"] == ["D4"]
+
+
+@pytest.mark.parametrize(
+    ("sheet_data", "first_bad"),
+    [
+        # a cell before an earlier column: read-only openpyxl loses C1
+        ('<row r="1"><c r="C1"><v>3</v></c><c r="A1"><v>1</v></c></row>', "A1"),
+        # rows out of order: row 3 is lost
+        ('<row r="5"><c r="A5"><v>5</v></c></row><row r="3"><c r="A3"><v>3</v></c></row>', "A3"),
+        # the same row twice: the second is lost
+        ('<row r="2"><c r="A2"><v>1</v></c></row><row r="2"><c r="B2"><v>2</v></c></row>', "B2"),
+        # a cell off its row: the value lands at A2, the formula pass looks at A3
+        ('<row r="2"><c r="A3"><f>1+1</f></c></row>', "A3"),
+        # the same cell twice
+        ('<row r="1"><c r="A1"><v>1</v></c><c r="A1"><v>2</v></c></row>', "A1"),
+        # an empty row out of order
+        ('<row r="4"><c r="A4"><v>1</v></c></row><row r="4"/>', "row 4"),
+        # a row without `r` is numbered on, so an explicit earlier row after it is out of order
+        (
+            '<row r="2"><c r="A2"><v>1</v></c></row><row><c><v>2</v></c></row>'
+            '<row r="3"><c r="A3"><v>3</v></c></row>',
+            "A3",
+        ),
+    ],
+)
+def test_out_of_order_sheet_xml_is_refused_not_misread(tmp_path, sheet_data, first_bad):
+    path = _sheet_xlsx(tmp_path, sheet_data)
+    with pytest.raises(ValueError) as e:
+        read_grid(path, "S")
+    msg = str(e.value)
+    assert str(path) in msg and "'S'" in msg and f"(first at {first_bad})" in msg
+    assert "not in row/column order" in msg
+    assert "open and re-save the file in Excel or LibreOffice" in msg
+
+
+def test_rows_and_cells_without_r_still_read(tmp_path):
+    """No `r` anywhere, or mixed: numbered on from the previous row or cell, as openpyxl does."""
+    path = _sheet_xlsx(
+        tmp_path,
+        "<row><c><v>1</v></c><c><v>2</v></c></row>"
+        '<row><c r="B2"><v>3</v></c><c><v>4</v></c></row>'
+        '<row r="4"><c><v>5</v></c><c r="C4"><v>6</v></c><c><f>1+1</f></c></row>',
+    )
+    assert _cells(read_grid(path)) == [
+        [("1", "number"), ("2", "number"), ("", "empty"), ("", "empty")],
+        [("", "empty"), ("3", "number"), ("4", "number"), ("", "empty")],
+        [("", "empty"), ("", "empty"), ("", "empty"), ("", "empty")],
+        [("5", "number"), ("", "empty"), ("6", "number"), ("", "formula_no_value")],
+    ]

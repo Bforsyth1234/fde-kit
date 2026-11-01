@@ -165,6 +165,7 @@ def test_formula_cells_are_rejects_never_zero(results: dict[str, ApplyResult]) -
 
 REPORTS = {
     "erp_shipments": dict(
+        unused_columns=[],
         rows_read=61,
         rows_skipped={},
         empty_skipped=0,
@@ -175,6 +176,7 @@ REPORTS = {
         by_reason={"number: unparseable": 1},
     ),
     "planner_forecast": dict(
+        unused_columns=["Total"],
         rows_read=15,
         rows_skipped={"skip_rows[0]": 6},
         empty_skipped=1,
@@ -186,6 +188,7 @@ REPORTS = {
         by_reason={},
     ),
     "legacy_report": dict(
+        unused_columns=[],
         rows_read=33,
         rows_skipped={},
         empty_skipped=0,
@@ -196,6 +199,7 @@ REPORTS = {
         by_reason={"unknown entity": 1},
     ),
     "formulas": dict(
+        unused_columns=["Qty", "Unit Price"],
         rows_read=5,
         rows_skipped={"skip_rows[0]": 1},
         empty_skipped=0,
@@ -223,6 +227,8 @@ def test_report(name: str, results: dict[str, ApplyResult]) -> None:
         "entities",
         "conflicts_within_load",
         "similar_entities",
+        "similar_entities_total",
+        "similar_skipped",
     ]
     assert rep["spec"] == name and rep["bundle_sha256"] == result.loaded.bundle_sha256
     assert rep["approved"] is False
@@ -234,6 +240,7 @@ def test_report(name: str, results: dict[str, ApplyResult]) -> None:
     assert f["rows_read"] == want["rows_read"]
     assert f["rows_skipped"] == want["rows_skipped"]
     assert f["empty_skipped"] == want["empty_skipped"]
+    assert f["unused_columns"] == want["unused_columns"]
     assert rep["facts"] == want["facts"]
     assert rep["duplicates_dropped"] == want["duplicates_dropped"]
     assert rep["rejects"]["total"] == want["rejects"]
@@ -1169,3 +1176,27 @@ measures: [{field: line_total_usd, column: MWH, ops: [{op: number}]}]
     _edit(spec, 'format: "%Y-%m", grain: month', 'format: "%Y", grain: year')
     one = [r for f in run(spec, [csv_path]).files for r in f.facts]
     assert one[0].period_from == "A2" and one[0].period_cells == ("A2",)
+
+
+def test_uncalculated_workbook_rejects_say_so(tmp_path: Path) -> None:
+    """A formula in a workbook that asks for recalculation on open (openpyxl, XlsxWriter) is
+    rejected with the reason that tells the user to open and save it, not the generic one."""
+    import shutil
+
+    import openpyxl
+
+    from fde_kit.wrangle.read import FORMULA_NOT_CALCULATED
+
+    project = tmp_path / "project"
+    shutil.copytree(FIXTURES / "project", project)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Calc"
+    ws.append(["Period: Mar 2026"])
+    ws.append(["Item", "Qty", "Unit Price", "Total"])
+    ws.append(["Bolts", 2, 3, "=B3*C3"])
+    path = tmp_path / "formulas.xlsx"
+    wb.save(path)  # openpyxl writes fullCalcOnLoad="1" and no cached values
+    result = run(load_project_spec(project / "specs" / "formulas.yaml"), [path], force=True)
+    reasons = {r["reason"] for r in result.rejects}
+    assert FORMULA_NOT_CALCULATED in reasons, result.rejects

@@ -45,9 +45,9 @@ PLANTS = _crosswalk(
         ("Plant 07", "plant7"),
         ("1007", "1007"),
         ("000", "0"),
-        # Separators go first, so digit runs either side of one merge: one run, one strip.
-        ("0012-007", "127"),
-        ("Plt 012 / 0", "plt120"),
+        # A separator between two digits is kept (without its spaces); each run loses zeros.
+        ("0012-007", "12-7"),
+        ("Plt 012 / 0", "plt12/0"),
         ("A_b.c#d/e,f g", "abcdefg"),
         ("TOLEDO PLT 12", "toledoplt12"),
         ("  Toledo\tPlt   12 ", "toledoplt12"),
@@ -227,8 +227,70 @@ def test_for_part_reads_spec_resolve_block() -> None:
     assert d.policy == "closed"
 
 
-def test_norm_key_strips_zeros_before_dropping_separators() -> None:
-    # Merging digit runs first would turn both into "1007": a false merge of two codes.
-    assert norm_key("10-07") == "107"
-    assert norm_key("100-7") == "1007"
+def test_norm_key_strips_zeros_but_keeps_separators_between_digits() -> None:
+    assert norm_key("10-07") == "10-7"
+    assert norm_key("100-7") == "100-7"
     assert norm_key("10-07") != norm_key("100-7")
+
+
+# The reviewer's cases: each pair is two different things. Before separators between digits
+# were kept, both sides of every pair had one norm_key, and a crosswalk resolved one to the
+# other's canonical (strategy `normalised`): a silent misattribution.
+DIGIT_PAIRS = [
+    ("Pipe 1.5 in", "Pipe 15 in", "pipe1.5in", "pipe15in"),
+    ("Transformer 2.25 MVA", "Transformer 22.5 MVA", "transformer2.25mva", "transformer22.5mva"),
+    ("Grid A-1/10", "Grid A-11/0", "grida1/10", "grida11/0"),
+    ("12-345", "123-45", "12-345", "123-45"),
+    ("Pipe 1.05 in", "Pipe 1.5 in", "pipe1.05in", "pipe1.5in"),  # fraction keeps its zeros
+    ("Unit 1 2", "Unit 12", "unit1 2", "unit12"),  # only spaces between digits: one space
+]
+
+
+@pytest.mark.parametrize(("a", "b", "key_a", "key_b"), DIGIT_PAIRS)
+def test_norm_key_keeps_separators_between_digits(a: str, b: str, key_a: str, key_b: str) -> None:
+    assert (norm_key(a), norm_key(b)) == (key_a, key_b)
+    assert norm_key(a) != norm_key(b)
+
+
+@pytest.mark.parametrize(("a", "b", "key_a", "key_b"), DIGIT_PAIRS)
+def test_crosswalk_does_not_resolve_across_digit_separators(
+    a: str, b: str, key_a: str, key_b: str
+) -> None:
+    cw = _crosswalk([(b, f"canonical {b}")], name="items")
+    r = Resolver(cw, "closed")
+    res = r.resolve(a)
+    assert res.canonical is None and res.reason == UNKNOWN, res
+    opened = Resolver(cw, "open").resolve(a)
+    assert (opened.canonical, opened.strategy) == (a, "new")
+
+
+@pytest.mark.parametrize(
+    ("raw", "alias"),
+    [
+        ("Pipe 1.5in", "Pipe 1.5 in"),  # spacing elsewhere still normalises
+        ("pipe 1 . 5 in", "Pipe 1.5 in"),  # spaces around a kept separator go
+        ("Grid A 1 / 10", "Grid A-1/10"),
+        ("TRANSFORMER 2.25MVA", "Transformer 2.25 MVA"),
+        ("012-0345", "12-345"),
+        ("DET 7", "DET-07"),
+    ],
+)
+def test_crosswalk_still_normalises_spelling_variants(raw: str, alias: str) -> None:
+    cw = _crosswalk([(alias, f"canonical {alias}")], name="items")
+    res = Resolver(cw, "closed").resolve(raw)
+    assert (res.canonical, res.strategy) == (f"canonical {alias}", "normalised")
+
+
+def test_fixture_crosswalk_aliases_still_resolve() -> None:
+    loaded = load_project_spec(FIXTURES / "project" / "specs" / "planner_forecast.yaml")
+    r = Resolver(loaded.crosswalks["plants"], "closed")
+    for raw, want in [
+        ("DET-07", "Detroit Stamping 07"),
+        ("det 07", "Detroit Stamping 07"),
+        ("1007", "Detroit Stamping 07"),
+        ("Detroit Plt 07", "Detroit Stamping 07"),
+        ("DETROIT PLT 7", "Detroit Stamping 07"),
+        ("TOLEDO PLT 12", "Toledo Assembly 12"),
+        ("1021 ", "Saltillo Castings 21"),
+    ]:
+        assert r.resolve(raw).canonical == want, raw

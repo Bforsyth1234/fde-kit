@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from bisect import bisect_right
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Literal
@@ -38,6 +39,7 @@ __all__ = [
     "AMBIGUOUS",
     "FUZZY_MARGIN",
     "SAME_BUT_PUNCTUATION",
+    "SIMILAR_MAX_SCORED_NAMES",
     "SIMILAR_SPELLING",
     "UNKNOWN",
     "FuzzyMatch",
@@ -47,6 +49,7 @@ __all__ = [
     "Strategy",
     "check_crosswalk",
     "fuzzy_accepts",
+    "max_length_ratio",
     "norm_key",
     "similar_key",
     "similar_names",
@@ -58,20 +61,40 @@ UNKNOWN = "unknown entity"
 AMBIGUOUS = "ambiguous entity"
 FUZZY_MARGIN = 5
 
-_DROP = re.compile(r"[-_.#/,\s]+")
-_DIGITS = re.compile(r"[0-9]+")
+_TOKENS = re.compile(r"([0-9]+)|([-_.#/,\s]+)|[^-_.#/,\s0-9]+")
+_FRACTION = frozenset(".,")
 
 
 def norm_key(s: str) -> str:
-    """casefold, NFKC, strip leading zeros from each digit run, then drop `- _ . # / ,` and
-    whitespace. `DET-07` -> `det7`, `Plant 07` -> `plant7`, `1007` -> `1007`, `000` -> `0`.
+    """casefold, NFKC, strip leading zeros from each digit run, drop the separators
+    `- _ . # / ,` and whitespace, except between two digits.
 
-    Zeros go first, while separators still delimit the runs: `10-07` -> `107` and `100-7` ->
-    `1007` stay distinct. Dropping separators first would merge both into `1007`, a false merge
-    of two different codes, which is the worst failure this step can have."""
+    `DET-07` -> `det7`, `Plant 07` -> `plant7`, `1007` -> `1007`, `000` -> `0`.
+
+    A run of separators with a digit on both sides is kept, without its whitespace (one space
+    if it is only whitespace): `10-07` -> `10-7`, `1.5` -> `1.5`, `A-1 / 10` -> `a1/10`,
+    `12 345` -> `12 345`. Dropping it would merge different numbers and codes, `Pipe 1.5 in` with
+    `Pipe 15 in`, `2.25` with `22.5`, `A-1/10` with `A-11/0`, `12-345` with `123-45`: a false
+    merge, which is the worst failure this step can have. A digit run after a kept `.` or `,`
+    keeps its leading zeros (`1.05` is not `1.5`); every other digit run loses them."""
     s = unicodedata.normalize("NFKC", s.casefold())
-    s = _DIGITS.sub(lambda m: m.group().lstrip("0") or "0", s)
-    return _DROP.sub("", s)
+    tokens = [
+        (m.group(), m.group(1) is not None, m.group(2) is not None) for m in _TOKENS.finditer(s)
+    ]
+    out: list[str] = []
+    kept_sep = ""
+    for i, (text, digits, sep) in enumerate(tokens):
+        if digits:
+            out.append(text if _FRACTION & set(kept_sep) else (text.lstrip("0") or "0"))
+            kept_sep = ""
+        elif sep:
+            between = 0 < i < len(tokens) - 1 and tokens[i - 1][1] and tokens[i + 1][1]
+            kept_sep = ("".join(text.split()) or " ") if between else ""
+            out.append(kept_sep)
+        else:
+            out.append(text)
+            kept_sep = ""
+    return "".join(out)
 
 
 def fuzzy_accepts(best: float, second: float, threshold: float) -> bool:
@@ -217,7 +240,12 @@ class Resolver:
 
 SAME_BUT_PUNCTUATION = "same apart from punctuation/spacing"
 SIMILAR_SPELLING = "similar spelling"
+SIMILAR_MAX_SCORED_NAMES = 20_000
+"""Apply scores a part's names (within one scope) only up to this many distinct names; above
+it the scored half is skipped and reported as `similar_skipped` (the norm_key half, a hash
+grouping, always runs)."""
 _SPACES = re.compile(r"\s+")
+_ANY_DIGITS = re.compile(r"\d+")
 _CDIST_CHUNK = 512
 
 
@@ -240,15 +268,32 @@ def similar_key(s: str) -> str:
     return _SPACES.sub(" ", unicodedata.normalize("NFKC", s.casefold())).strip()
 
 
-def _scored_pairs(
-    keys: list[str], cutoff: float, use_cdist: bool | None
-) -> list[tuple[int, int, float]]:
-    """(i, j, score) for i < j with `fuzz.ratio(keys[i], keys[j]) >= cutoff`.
+def max_length_ratio(cutoff: float) -> float:
+    """How much longer one key may be than the other and still reach `fuzz.ratio >= cutoff`.
 
-    `process.cdist` (C++, all cores, chunked by rows so memory is 512 x n, not n x n) when
-    numpy is importable; otherwise `process.extract_iter` per row with the same scorer and
-    cutoff. Both give the same pairs; cdist needs numpy, which the wrangle extra doesn't pull
-    in. `use_cdist` forces one path (tests)."""
+    `ratio = 100 * 2M / (la + lb)` with M matched characters, and M <= la when la <= lb, so
+    `ratio <= 200 la / (la + lb)`. That is >= cutoff only when `lb <= la (200 - cutoff) /
+    cutoff`: at 90, the longer key is at most 22.2% longer. Pairs outside are never scored."""
+    return (200.0 - cutoff) / cutoff
+
+
+def _scored_pairs(
+    keys: list[str],
+    cutoff: float,
+    use_cdist: bool | None,
+    groups: list[str] | None = None,
+) -> list[tuple[int, int, float]]:
+    """(i, j, score) for i < j with `fuzz.ratio(keys[i], keys[j]) >= cutoff`, leaving out
+    pairs with `groups[i] == groups[j]` when `groups` is given.
+
+    Keys are sorted by length and each is scored only against the longer keys inside the
+    `max_length_ratio` window, which drops pairs that cannot reach the cutoff before any
+    scoring. Within one length, keys of one group sort together, so the extract_iter path
+    skips a key's own group by slicing (a numbered series of one width is never scored
+    against itself). Then `process.cdist` (C++, all cores, chunked by rows so memory is 512 x the
+    window, not n x n) when numpy is importable; otherwise `process.extract_iter` per row with
+    the same scorer and cutoff. Both give the same pairs; cdist needs numpy, which the wrangle
+    extra doesn't pull in. `use_cdist` forces one path (tests)."""
     from rapidfuzz import fuzz, process
 
     if use_cdist is None:
@@ -258,15 +303,38 @@ def _scored_pairs(
             use_cdist = False
         else:
             use_cdist = True
-    out: list[tuple[int, int, float]] = []
     n = len(keys)
+    grp = groups if groups is not None else [""] * n
+    order = sorted(range(n), key=lambda i: (len(keys[i]), grp[i], i))
+    sk = [keys[i] for i in order]
+    sg = [grp[i] for i in order]
+    lens = [len(k) for k in sk]
+    factor = max_length_ratio(cutoff)
+    # hi[p]: one past the last position whose key may still reach the cutoff with sk[p].
+    hi = [bisect_right(lens, ln * factor + 1e-9) for ln in lens]
+    # own[p]: one past the run of positions with sk[p]'s length and group (p + 1 without
+    # groups); every pair of p is at or after it.
+    own = list(range(1, n + 1))
+    if groups is not None:
+        for p in range(n - 2, -1, -1):
+            if lens[p] == lens[p + 1] and sg[p] == sg[p + 1]:
+                own[p] = own[p + 1]
+    out: list[tuple[int, int, float]] = []
+
+    def add(p: int, q: int, score: float) -> None:
+        i, j = order[p], order[q]
+        out.append((i, j, score) if i < j else (j, i, score))
+
     if use_cdist:
         import numpy as np
 
         for lo in range(0, n, _CDIST_CHUNK):
+            rows_end = min(lo + _CDIST_CHUNK, n)
+            cols_end = hi[rows_end - 1]  # lengths ascend, so the last row's window is widest
+            cols_lo = min(own[lo:rows_end])  # no row needs a column before its own group's end
             block = process.cdist(
-                keys[lo : lo + _CDIST_CHUNK],
-                keys,
+                sk[lo:rows_end],
+                sk[cols_lo:cols_end],
                 scorer=fuzz.ratio,
                 score_cutoff=cutoff,
                 dtype=np.float32,
@@ -274,16 +342,23 @@ def _scored_pairs(
             )
             rows, cols = np.nonzero(block >= cutoff)
             for r, c in zip(rows.tolist(), cols.tolist(), strict=True):
-                i = lo + r
-                if c > i:
-                    out.append((i, c, float(fuzz.ratio(keys[i], keys[c]))))
+                p, q = lo + r, cols_lo + c
+                if q > p and (groups is None or sg[p] != sg[q]):
+                    add(p, q, float(fuzz.ratio(sk[p], sk[q])))
     else:
-        for i in range(n - 1):
+        for p in range(n - 1):
+            start = own[p]
             for _, score, j in process.extract_iter(
-                keys[i], keys[i + 1 :], scorer=fuzz.ratio, score_cutoff=cutoff
+                sk[p], sk[start : hi[p]], scorer=fuzz.ratio, score_cutoff=cutoff
             ):
-                out.append((i, i + 1 + j, float(score)))
-    return out
+                q = start + j
+                if groups is None or sg[p] != sg[q]:
+                    add(p, q, float(score))
+    return sorted(out)
+
+
+def _without_digits(key: str) -> str:
+    return _ANY_DIGITS.sub("", key)
 
 
 def similar_names(
@@ -299,7 +374,10 @@ def similar_names(
       reason `same apart from punctuation/spacing` (`Beer, wine, and liquor stores` /
       `Beer, wine and liquor stores`).
     - With `threshold` > 0, pairs whose `fuzz.ratio` on `similar_key` is >= `threshold`, reason
-      `similar spelling`.
+      `similar spelling`, **unless the two keys are equal once digits are removed**: names
+      that differ only in their numbers (`Building 00001` / `Building 00002`, `Unit 4` /
+      `Unit 5`, `Q1 sales` / `Q2 sales`) are almost always different things, and a numbered
+      series would otherwise produce a pair for nearly every two members.
 
     **Why `fuzz.ratio`.** It is the normalised Indel similarity of the whole strings, so every
     added, dropped or changed character costs in proportion to the length: a typo or a dropped
@@ -327,10 +405,12 @@ def similar_names(
 
     if threshold > 0 and len(distinct) > 1:
         keys = [similar_key(n) for n in distinct]
-        for i, j, score in _scored_pairs(keys, float(threshold), use_cdist):
+        no_digits = [_without_digits(k) for k in keys]
+        for i, j, score in _scored_pairs(keys, float(threshold), use_cdist, no_digits):
             a, b = distinct[i], distinct[j]
-            if (a, b) not in found:
-                found[(a, b)] = SimilarPair(a, b, round(score, 1), SIMILAR_SPELLING)
+            if (a, b) in found:
+                continue
+            found[(a, b)] = SimilarPair(a, b, round(score, 1), SIMILAR_SPELLING)
 
     pairs = [p for p in found.values() if frozenset((p.a, p.b)) not in suppressed]
     return sorted(pairs, key=lambda p: (-p.score, p.a, p.b))

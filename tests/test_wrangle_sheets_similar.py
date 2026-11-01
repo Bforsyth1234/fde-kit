@@ -13,6 +13,7 @@ openpyxl = pytest.importorskip("openpyxl")
 pytest.importorskip("rapidfuzz")
 
 from fde_kit.wrangle.apply import (  # noqa: E402
+    SIMILAR_REPORTED,
     SpecMismatch,
     document_key,
     gate,
@@ -24,10 +25,15 @@ from fde_kit.wrangle.labels import header_fingerprint  # noqa: E402
 from fde_kit.wrangle.resolve import (  # noqa: E402
     SAME_BUT_PUNCTUATION,
     SIMILAR_SPELLING,
+    max_length_ratio,
     similar_key,
     similar_names,
 )
-from fde_kit.wrangle.spec import MappingSpec, load_project_spec  # noqa: E402
+from fde_kit.wrangle.spec import (  # noqa: E402
+    MappingSpec,
+    bundle_sha256,
+    load_project_spec,
+)
 
 DICTIONARY = """\
 - field: sales
@@ -478,20 +484,219 @@ def test_resolve_warning_settings_validate(resolve: dict, message: str) -> None:
         )
 
 
-def test_resolve_warning_settings_hash_only_when_set() -> None:
+def _spec(resolve: dict, **over) -> MappingSpec:
+    raw = {
+        "spec": "s",
+        "dictionary": "d.yaml",
+        "entity": {"kind": "k", "parts": [{"column": "A", "resolve": resolve}]},
+        "period": {"cell": {"ref": "A1", "ops": [{"op": "date"}]}},
+        "measures": [{"field": "f", "column": "B", "ops": [{"op": "number"}]}],
+    }
+    raw.update(over)
+    return MappingSpec.model_validate(raw)
+
+
+def test_resolve_warning_settings_never_enter_the_hash() -> None:
+    """They only shape warnings, and the bundle hash is in every document and source_ref:
+    reviewing one pair into `not_same` must not re-version every document and fact."""
+
     def payload(resolve: dict) -> dict:
-        spec = MappingSpec.model_validate(
-            {
-                "spec": "s",
-                "dictionary": "d.yaml",
-                "entity": {"kind": "k", "parts": [{"column": "A", "resolve": resolve}]},
-                "period": {"cell": {"ref": "A1", "ops": [{"op": "date"}]}},
-                "measures": [{"field": "f", "column": "B", "ops": [{"op": "number"}]}],
-            }
-        )
-        return spec.hash_payload()["entity"]["parts"][0]["resolve"]
+        return _spec(resolve).hash_payload()["entity"]["parts"][0]["resolve"]
 
     assert payload({}) == payload({"similar_warn": 90}) == payload({"not_same": []})
+    assert payload({}) == payload({"similar_warn": 95, "not_same": [["a", "b"]]})
     assert "similar_warn" not in payload({}) and "not_same" not in payload({})
-    assert payload({"similar_warn": 95})["similar_warn"] == 95
-    assert payload({"not_same": [["a", "b"]]})["not_same"] == [["a", "b"]]
+
+
+def test_warning_settings_leave_bundle_sha256_unchanged() -> None:
+    files = {"d.yaml": "0" * 64}
+    base = bundle_sha256(_spec({}), files)
+    for resolve in ({"similar_warn": 0}, {"similar_warn": 99}, {"not_same": [["a", "b"]]}):
+        assert bundle_sha256(_spec(resolve), files) == base, resolve
+    # Every fact-affecting setting still changes it.
+    changed = [
+        _spec({}, entity={"kind": "k", "parts": [{"column": "A", "ops": [{"op": "text"}]}]}),
+        _spec({"fuzzy": True}),
+        _spec({"threshold": 80}),
+        _spec({}, entity={"kind": "k2", "parts": [{"column": "A"}]}),
+        _spec({}, entity={"kind": "k", "parts": [{"column": "A2"}]}),
+        _spec({}, period={"cell": {"ref": "A2", "ops": [{"op": "date"}]}}),
+        _spec({}, measures=[{"field": "f", "column": "C", "ops": [{"op": "number"}]}]),
+    ]
+    for spec in changed:
+        assert bundle_sha256(spec, files) != base, spec
+    assert bundle_sha256(_spec({}), {"d.yaml": "1" * 64}) != base
+
+
+def test_reviewing_a_pair_keeps_documents_and_facts(tmp_path: Path) -> None:
+    """Adding `not_same` / `similar_warn` keeps the bundle, every document text and every
+    source_ref byte-identical; only the warnings change."""
+    before = run(_composite(tmp_path), [tmp_path / "s.xlsx"])
+    after = run(_composite(tmp_path, ", similar_warn: 0, not_same: [[Lee, Le-e]]"),
+                [tmp_path / "s.xlsx"])  # fmt: skip
+    assert before.loaded.bundle_sha256 == after.loaded.bundle_sha256
+    assert [d.text for d in before.documents] == [d.text for d in after.documents]
+    assert [f.row.source_ref for f in before.facts] == [f.row.source_ref for f in after.facts]
+    assert before.report["similar_entities"] != after.report["similar_entities"]
+
+
+# --- bounded warnings: digits-only pairs, the length window, the cap, the name limit ---------
+
+
+def test_names_differing_only_in_digits_are_not_similar_spelling() -> None:
+    names = ["Building 00001", "Building 00002", "Building 00010", "Unit 4", "Unit 5", "Q1 sales",
+             "Q2 sales"]  # fmt: skip
+    assert similar_names(names, 90) == []
+    assert similar_names(names, 50) == []  # however low the threshold
+    # A letter changed as well still fires; zeros alone are a punctuation pair (norm_key).
+    got = similar_names(["Building 00001", "Bilding 00002", "Unit 4", "Unit 04"], 80)
+    assert [(p.a, p.b, p.reason) for p in got] == [
+        ("Unit 04", "Unit 4", SAME_BUT_PUNCTUATION),
+        ("Bilding 00002", "Building 00001", SIMILAR_SPELLING),
+    ]
+
+
+def test_max_length_ratio_is_the_ratio_bound() -> None:
+    from rapidfuzz import fuzz
+
+    assert max_length_ratio(90) == pytest.approx(110 / 90)
+    assert max_length_ratio(100) == 1.0
+    # The bound is tight: a key and its own extension reach exactly the cutoff at the edge.
+    base = "a" * 9
+    assert fuzz.ratio(base, base + "b" * 2) >= 90 and 11 <= 9 * max_length_ratio(90)
+    assert fuzz.ratio(base, base + "b" * 3) < 90 and 12 > 9 * max_length_ratio(90)
+
+
+def _brute_force(
+    keys: list[str], cutoff: float, groups: list[str] | None = None
+) -> list[tuple[int, int]]:
+    from rapidfuzz import fuzz
+
+    return [
+        (i, j)
+        for i in range(len(keys))
+        for j in range(i + 1, len(keys))
+        if fuzz.ratio(keys[i], keys[j]) >= cutoff and (groups is None or groups[i] != groups[j])
+    ]
+
+
+@pytest.mark.parametrize("cutoff", [60, 85, 90, 100])
+@pytest.mark.parametrize("use_cdist", [False, True])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_length_window_finds_every_pair(cutoff: float, use_cdist: bool, grouped: bool) -> None:
+    """Skipping pairs outside the length window (and, with groups, a key's own group) loses
+    nothing against scoring every pair."""
+    if use_cdist:
+        pytest.importorskip("numpy")
+    import random
+
+    from fde_kit.wrangle.resolve import _scored_pairs, _without_digits
+
+    rng = random.Random(7)
+    keys = ["", "ab", "abc", "abcd", "abc", "a1", "a2", "a10", "b1"]
+    for _ in range(700):  # more than one cdist chunk, lengths 1..30
+        keys.append("".join(rng.choice("abc 0123") for _ in range(rng.randint(1, 30))))
+    groups = [_without_digits(k) for k in keys] if grouped else None
+    got = [(i, j) for i, j, _ in _scored_pairs(keys, cutoff, use_cdist, groups)]
+    assert got == _brute_force(keys, cutoff, groups)
+
+
+def _many_names_project(tmp_path: Path, names: list[str], resolve: str = RESOLVE_OPEN) -> Path:
+    _workbook(tmp_path / "many.xlsx", {"2024": (2024, [(n, 1, 2) for n in names])})
+    return _project(tmp_path, '  sheet: "2024"\n  header_rows: [2]', resolve)
+
+
+# 676 names; one changed letter (or a swap or shift of the pair) scores 90.9, so thousands of
+# pairs fire.
+ONE_LETTER_APART = [f"Store {a}{b}xyz" for a in "abcdefghijklmnopqrstuvwxyz" for b in
+                    "abcdefghijklmnopqrstuvwxyz"]  # fmt: skip
+
+
+def test_warnings_capped_with_true_total(tmp_path: Path) -> None:
+    result = run(_many_names_project(tmp_path, ONE_LETTER_APART), [tmp_path / "many.xlsx"])
+    rep = result.report
+    keys = [similar_key(n) for n in sorted(ONE_LETTER_APART)]
+    assert rep["similar_entities_total"] == len(_brute_force(keys, 90)) > 30_000
+    assert len(rep["similar_entities"]) == SIMILAR_REPORTED == 200
+    assert result.similar_entities == rep["similar_entities"]
+    order = [(-d["score"], d["a"], d["b"]) for d in rep["similar_entities"]]
+    assert order == sorted(order)
+    assert rep["similar_entities"][0]["a"] == "Store aaxyz"  # the first in report order
+    assert rep["similar_skipped"] == []
+    rows = (write_outputs(result, tmp_path / "out")["similar"]).read_text().splitlines()
+    assert len(rows) == 1 + 200
+
+
+def test_numbered_series_does_not_flood(tmp_path: Path) -> None:
+    """10k names like `Building 00001` used to give 651k warnings (166 MB report)."""
+    names = [f"Building {i:05d}" for i in range(1, 2001)] + ["Bilding 00007"]
+    result = run(_many_names_project(tmp_path, names), [tmp_path / "many.xlsx"])
+    assert result.report["similar_entities_total"] == 1
+    (d,) = result.report["similar_entities"]
+    assert (d["a"], d["b"]) == ("Bilding 00007", "Building 00007")
+
+
+def test_scored_half_skipped_over_the_name_limit(tmp_path: Path, monkeypatch) -> None:
+    import fde_kit.wrangle.apply as apply_mod
+
+    monkeypatch.setattr(apply_mod, "SIMILAR_MAX_SCORED_NAMES", 5)
+    names = ["Lee County", "Lea County", "Le-e County", "Adams", "Clark", "Polk"]
+    result = run(_many_names_project(tmp_path, names), [tmp_path / "many.xlsx"])
+    rep = result.report
+    assert rep["similar_skipped"] == [{"part": "Store", "names": 6}]
+    # The norm_key half still runs; Lee/Lea (a scored pair) is not reported.
+    assert [(d["a"], d["b"], d["reason"]) for d in rep["similar_entities"]] == [
+        ("Le-e County", "Lee County", SAME_BUT_PUNCTUATION)
+    ]
+    monkeypatch.setattr(apply_mod, "SIMILAR_MAX_SCORED_NAMES", 6)
+    again = run(_many_names_project(tmp_path, names), [tmp_path / "many.xlsx"])
+    assert again.report["similar_skipped"] == []
+    assert [(d["a"], d["b"]) for d in again.report["similar_entities"]] == [
+        ("Le-e County", "Lee County"),
+        ("Lea County", "Lee County"),
+    ]
+
+
+def test_scored_half_skipped_per_scope_names_within(tmp_path: Path, monkeypatch) -> None:
+    import fde_kit.wrangle.apply as apply_mod
+
+    monkeypatch.setattr(apply_mod, "SIMILAR_MAX_SCORED_NAMES", 1)
+    result = run(_composite(tmp_path), [tmp_path / "s.xlsx"])
+    assert result.report["similar_skipped"] == [
+        {"part": "Town", "within": ["Northeast"], "names": 2},
+        {"part": "Town", "within": ["Southeast"], "names": 2},
+        {"part": "Line", "within": ["Northeast", "Lee"], "names": 2},
+    ]
+    # The punctuation pair under Northeast is still found.
+    assert [d["reason"] for d in result.report["similar_entities"]] == [SAME_BUT_PUNCTUATION]
+
+
+# --- warning cells name their file when a load has several -----------------------------------
+
+
+def test_cells_carry_the_file_when_a_load_has_several(tmp_path: Path) -> None:
+    east = _workbook(tmp_path / "east.xlsx", {"2024": (2024, [("Lee County", 1, 2)])})
+    west = _workbook(tmp_path / "west.xlsx", {"2024": (2024, [("Lea County", 3, 4)])})
+    spec = _project(tmp_path, '  sheet: "2024"\n  header_rows: [2]')
+    (d,) = run(spec, [east, west]).report["similar_entities"]
+    assert (d["a"], d["b"]) == ("Lea County", "Lee County")
+    assert d["cells"] == ["west.xlsx#2024!A3", "east.xlsx#2024!A3"]
+    # One file: cells stay `Sheet!A1`, as before.
+    both = _workbook(tmp_path / "both.xlsx", {"2024": (2024, [("Lee County", 1, 2),
+                                                               ("Lea County", 3, 4)])})  # fmt: skip
+    (one,) = run(spec, [both]).report["similar_entities"]
+    assert one["cells"] == ["2024!A4", "2024!A3"]
+
+
+def test_cells_use_the_path_when_file_names_repeat(tmp_path: Path) -> None:
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    one = _workbook(tmp_path / "a" / "sales.xlsx", {"2024": (2024, [("Lee County", 1, 2)])})
+    two = _workbook(tmp_path / "b" / "sales.xlsx", {"2024": (2024, [("Lea County", 3, 4)])})
+    spec = _project(tmp_path, '  sheet: "2024"\n  header_rows: [2]')
+    spec.write_text(
+        spec.read_text().replace("source:\n", 'source:\n  document_key: "{spec}/{path}"\n'),
+        encoding="utf-8",
+    )
+    (d,) = run(spec, [one, two]).report["similar_entities"]
+    assert d["cells"] == [f"{two}#2024!A3", f"{one}#2024!A3"]

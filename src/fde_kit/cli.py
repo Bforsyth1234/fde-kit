@@ -944,6 +944,14 @@ def _print_wrangle_result(result) -> None:
             shown = "  ".join(f"{escape(k)!r} {v}" for k, v in nulls.items())
             where = f" ({escape(f['sheet'])})" if len(rep["files"]) > 1 else ""
             console.print(f"placeholders skipped as empty{where}: {shown}")
+        unused = f.get("unused_columns") or []
+        if unused:
+            shown = ", ".join(repr(escape(c)) for c in unused)
+            console.print(
+                f"[yellow]warning[/] {escape(f['sheet'])}: {len(unused)} column(s) with data "
+                f"the spec doesn't read: {shown}",
+                soft_wrap=True,
+            )
     rj = rep["rejects"]
     console.print(
         f"facts {rep['facts']}  rejects {rj['total']} (rate {rj['rate']:.4f})  "
@@ -966,17 +974,26 @@ def _print_wrangle_result(result) -> None:
         more = len(conflicts) - WRANGLE_SHOWN_CONFLICTS
         console.print(f"  ... and {more} more (all of them are in report.json with --out)")
     similar = rep["similar_entities"]
-    console.print(f"possible duplicate entities: {len(similar)}")
+    total = rep.get("similar_entities_total", len(similar))
+    showing = f" (showing {len(similar)})" if total > len(similar) else ""
+    console.print(f"possible duplicate entities: {total}{showing}")
     for d in similar[:WRANGLE_SHOWN_CONFLICTS]:
         console.print(
             f"  [yellow]{d['score']:g}[/] {escape(d['part'])}: {escape(d['a'])!r} ~ "
             f"{escape(d['b'])!r} ({escape(d['reason'])}; {escape(', '.join(d['cells']))})"
         )
-    if len(similar) > WRANGLE_SHOWN_CONFLICTS:
-        more = len(similar) - WRANGLE_SHOWN_CONFLICTS
+    if total > WRANGLE_SHOWN_CONFLICTS:
+        more = total - WRANGLE_SHOWN_CONFLICTS
+        where = "all of them" if total == len(similar) else f"the first {len(similar)}"
         console.print(
-            f"  ... and {more} more (all of them are in similar.csv with --out; "
+            f"  ... and {more} more ({where} in similar.csv with --out; "
             "add reviewed pairs to resolve.not_same)"
+        )
+    for sk in rep.get("similar_skipped", []):
+        within = f" within {escape(' / '.join(sk['within']))}" if sk.get("within") else ""
+        console.print(
+            f"  [yellow]not scored[/] {escape(sk['part'])}{within}: {sk['names']} distinct names "
+            "is over the limit for similar-spelling checks; only punctuation pairs reported"
         )
 
 
