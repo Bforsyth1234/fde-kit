@@ -339,7 +339,8 @@ Limits, all deliberate for now:
   plant-month) aren't supported. Summing needs provenance to a *set* of cells.
 - **Composite entities, not dimensions.** Plant × part is the entity `Detroit Stamping 07/P-1234`.
   "All parts at Plant 7" is a `LIKE` on the canonical name, which works but is only a convention.
-- **`add_facts` is two statements per fact:** measured at about 6 ms a fact on real data (next section).
+- **`add_facts` is one batch per call,** about 0.15-0.2 ms a fact on real data, most of it the
+  foreign-key checks on the INSERT (next section).
 - **Every sheet is embedded as a document** (about 700 chunks for a 10k-row sheet).
 - **Crosswalks own their entities' aliases;** loading one replaces aliases another adapter set.
 
@@ -371,10 +372,35 @@ After the fixes, seven specs over these files load into Postgres with 0 rejects 
 (2,713 facts), and `tests/test_wrangle_real.py` re-checks every fact against an independent read of
 the file on every CI run.
 
-**Measured, not fixed: load speed.** `add_facts` checks for conflicts and inserts one fact at a time.
-The full county file (18,864 facts) took **109 s** into Postgres, about 6 ms a fact. That's fine
-for exports in the thousands, and slow at 100k. The next step is batching the conflict lookup per
-(entity, field).
+**Load speed: measured, then batched.** `add_facts` used to resolve the entity, look up
+conflict candidates and insert one fact at a time, 3-4 round trips a fact, and resolving a name
+scanned every entity's aliases. The full county file (18,864 facts over about 3,100 counties)
+took **99.7 s** in `add_facts`, 5.3 ms a fact; Census retail (25,207 facts, 63 entities) took
+18.3 s, 0.73 ms a fact. `add_facts` now validates the whole batch, resolves every name in one
+statement, fetches every candidate in one, runs the conflict rule in memory in input order, and
+writes with one INSERT and one UPDATE. County: **2.8 s** (0.15 ms a fact); retail: **5.0 s**
+(0.20 ms a fact); the EDGAR offline seed's 90 facts: 0.08 s to 0.03 s
+(`python -m evals.bench_load`). The results are the same rows and the same conflict groups:
+`tests/test_add_facts_batch.py` keeps the old implementation and compares the two on 200 seeded
+random batch sequences. What's left is mostly the INSERT's foreign-key checks, about 35 µs per
+non-null reference (entity, document, job) because the referenced tables are partitioned;
+dropping them would trade away the cross-tenant guarantee they give.
+
+Fixing `add_facts` exposed the next cost: after the facts, `ingest` counted conflict groups with
+one `facts(entity=…)` per entity, each paying the same alias scan. That was **17.5 s** of the
+county load, invisible to a facts-only timer; it is now one statement
+(`TenantSession.conflict_group_ids`). Wrangle sheets are now stored unindexed by default
+(`source.index: true` to search them): chunking and embedding CSV rows nobody searches was most
+of what was left (county document: about 9 s indexed vs 0.2 s with the hash embedder; a real
+embedding model costs far more). Each workbook is now read once per load, not once per sheet: its bytes are hashed
+and the workbook and its zip opened from that one in-memory copy, so a file replaced mid-load
+can't mix versions. End to end
+(`evals/bench_load.py`, PG 16, hash embedder):
+
+| Load | Before | After |
+| --- | --- | --- |
+| Census retail, 35 sheets, 25,207 facts | 24.5 s | 5.3 s (7.3 s with `index: true`) |
+| Census county, 18,864 facts, ~3,100 entities | 125.9 s | 5.3 s (14.0 s with `index: true`) |
 
 **What real files still can't say:**
 
@@ -420,7 +446,8 @@ for exports in the thousands, and slow at 100k. The next step is batching the co
 - **Many sheets, one layout.** `source.sheets` (a regex plus `exclude`, or a list) loads every
   selected sheet as its own document in one all-or-nothing load, so Census retail's 35 year
   sheets are one spec (25,207 facts, 0 rejects, 0 conflicts, every fact checked against its own
-  sheet, 2.9 s). That worked because the 1992-2026 sheets turned out to share one layout: the
+  sheet, 0.9 s to parse; about 3 s while each sheet re-opened and re-hashed the workbook, which
+  re-parsed its styles, shared strings and all 35 sheets' dimensions every time). That worked because the 1992-2026 sheets turned out to share one layout: the
   same header rows, both tables at the same rows, the same 63 kinds of business. The drift was
   in the cells, and one spec covers it: `(NA)` in 1992-2000 and `(S)` from 2017, lines that
   are all placeholder for whole years and so load nothing (floor covering stores from 2018,
@@ -463,6 +490,29 @@ for exports in the thousands, and slow at 100k. The next step is batching the co
 - Onboarding a tenant is DDL (`create_tenant`), run by an operator connection, not the app.
 - BM25's document frequencies are recomputed from the tenant's chunks on every keyword query.
   Fine at this size; a large tenant would want a maintained term-stats table.
+- Adapter loads into one tenant are serialized: `ingest` takes a transaction-scoped advisory
+  lock on the tenant (`lock_tenant_writes`) before it writes anything, because two concurrent
+  loads could otherwise each miss the other's facts and record no conflict. It has to be the
+  first thing the load does. The first version took the lock inside `add_facts`, after the
+  batch's entity upserts and document inserts, and two loads sharing an entity or a document
+  deadlocked: load 2 locked entity Y's row and queued for the lock, which load 1 held while
+  it queued for Y (`test_ingests_sharing_an_entity_and_a_document_do_not_deadlock`). The lock
+  is held until the session's transaction ends, so a long load blocks another load into the
+  same tenant (not other tenants, and not readers). Direct `add_facts` callers outside `ingest`
+  take no lock and are not serialized, as before batching; one that needs the guarantee calls
+  `lock_tenant_writes` first in its transaction. Entity resolution costs one pass over the
+  tenant's entities per call: 23 ms at 3,100 entities, 274 ms at 50,000. A name that matches
+  several entities (one canonical name under two kinds, or a shared alias) resolves by a fixed
+  order: canonical match, then canonical_name, kind, entity_id, the same in `resolve_entity`
+  and the batch path. Before that rule the pick was whatever row the plan returned first, so
+  it could differ between a 1-name and a 3-name `add_facts`.
+- A float with more than 15 significant digits disagrees with its own stored value.
+  `values_agree` compares a float by its shortest repr (0.1 + 0.2 is 0.30000000000000004),
+  while Postgres's float8 → numeric cast stores 15 significant digits (0.3). So the same float
+  reported twice for one key, 1/3 say, forms a conflict group of two facts whose stored values
+  are equal. Pre-existing (the row-at-a-time `add_facts` did the same) and kept as is; wrangle
+  passes Decimals, which are stored exactly. `test_same_float_reported_twice_conflicts_as_before`
+  pins it.
 
 ### What's not covered
 

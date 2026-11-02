@@ -26,6 +26,10 @@ class RawDocument:
     text: str
     """Already extracted plain text."""
     metadata: dict[str, str] = field(default_factory=dict)
+    index: bool = True
+    """False: stored (so `fetch_document` shows it) but not chunked or embedded, so search
+    never returns it (`TenantSession.ingest_versioned(index=False)`). Changing it for the same
+    text writes a new version, as a change of text does."""
 
 
 @dataclass(frozen=True)
@@ -84,7 +88,8 @@ def ingest(
     max_chars: int = 900,
     on_new_version: Literal["keep", "replace"] = "keep",
 ) -> IngestReport:
-    """For each batch: upsert entities, ingest_versioned every document (idempotent by hash),
+    """For each batch: upsert entities, ingest_versioned every document (idempotent by hash
+    and index setting; a `RawDocument` with `index=False` is stored without search chunks),
     one extraction job per call, add_facts with doc_id filled from document_source,
     set_dictionary. A fact whose document_source was not in the batch is an error. Re-running
     on unchanged input writes no documents; facts are only added for documents whose ingest
@@ -100,9 +105,22 @@ def ingest(
     differ; EDGAR wants that, since a filing is immutable and a restatement is another
     document. "replace" deletes them before the batch's facts are added, so a re-export
     replaces its own facts (they still conflict with other sources); the count is
-    `facts_replaced`."""
+    `facts_replaced`.
+
+    Concurrency: before writing anything, `ingest` calls `session.lock_tenant_writes()`, a
+    transaction-scoped advisory lock on the tenant, so loads into one tenant run one at a time:
+    a second load (any `ingest` into the same tenant) waits for the first's transaction to end,
+    then sees its entities, documents and facts, so the conflict rule spans both. The lock is
+    taken first, before any entity upsert, document insert or fact write (including
+    `delete_facts_for_document`), because a load that held it while waiting on a row another
+    load had already locked would deadlock. Loads into other tenants, readers, and direct
+    `add_facts` callers outside `ingest` are not serialized (the latter as before).
+    A long load blocks other loads into the same tenant until its transaction ends."""
     if on_new_version not in ("keep", "replace"):
         raise ValueError(f"on_new_version must be 'keep' or 'replace', got {on_new_version!r}")
+    lock = getattr(session, "lock_tenant_writes", None)
+    if lock is not None:  # sessions without it (test fakes) have no other writer to wait on
+        lock()
     job_kind = getattr(adapter, "job_kind", f"adapter:{adapter.name}")
     job_model = getattr(adapter, "job_model", "")
     job_prompt_sha256 = getattr(adapter, "job_prompt_sha256", "")
@@ -123,7 +141,12 @@ def ingest(
         changed: dict[str, str] = {}
         for d in batch.documents:
             outcome = session.ingest_versioned(
-                d.source, d.text, title=d.title, metadata=dict(d.metadata), max_chars=max_chars
+                d.source,
+                d.text,
+                title=d.title,
+                metadata=dict(d.metadata),
+                max_chars=max_chars,
+                index=d.index,
             )
             n_docs += 1
             if outcome.changed:
@@ -144,12 +167,15 @@ def ingest(
             n_facts += len(session.add_facts(rows, extraction_job_id=job_id))
         if batch.dictionary:
             session.set_dictionary(batch.dictionary)
-    groups = {
-        f.conflict_group_id
-        for name in entity_names
-        for f in session.facts(entity=name)
-        if f.conflict_group_id
-    }
+    if hasattr(session, "conflict_group_ids"):
+        groups = session.conflict_group_ids(entity_names)
+    else:  # sessions without the batch query (test fakes): the same answer, one name at a time
+        groups = {
+            f.conflict_group_id
+            for name in entity_names
+            for f in session.facts(entity=name)
+            if f.conflict_group_id
+        }
     return IngestReport(
         documents=n_docs,
         documents_changed=n_changed,

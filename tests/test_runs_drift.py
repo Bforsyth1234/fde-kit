@@ -191,6 +191,31 @@ def test_reingested_document_is_superseded_with_both_hashes(store, run):
     assert grace.status == "superseded" and "still points at v1" in grace.detail
 
 
+def test_same_text_stored_unindexed_is_a_new_version_to_drift(store, run):
+    """Re-ingesting a cited document's unchanged text with index=False writes a new version
+    (identity is hash + index setting): drift reports the fetched slice and its passages as
+    superseded, with the same hash then and now, not as unchanged or silently gone."""
+    lease = _doc_id(store, FIRST_LEASE)
+    with store.session(TID) as s:
+        body = s.fetch(lease, 0, 10**6).text
+        out = s.ingest_versioned(FIRST_LEASE, body, title="Lease", index=False)
+    assert out.changed and out.previous_doc_id == lease and out.version == 2
+
+    report = check_drift(run, store)
+    assert report.drifted
+    (sl,) = _by_tool(report, "fetch_document")
+    assert sl.status == "superseded"
+    assert sl.then_hash == sl.now_hash and (sl.then_version, sl.now_version) == (1, 2)
+    assert sl.now_doc_id == out.doc_id
+    chunks = [i for i in _by_tool(report, "search_documents") if i.doc_id == lease]
+    assert chunks and all(i.status == "superseded" and i.now_doc_id == out.doc_id for i in chunks)
+    # The new version is fetchable like any other; search no longer returns the lease.
+    with store.session(TID) as s:
+        assert s.fetch(out.doc_id, 0, 10**6).text == body
+        assert lease not in {h.doc_id for h in s.search("Dana Whitfield late fee", k=20)}
+        assert out.doc_id not in {h.doc_id for h in s.search("Dana Whitfield late fee", k=20)}
+
+
 def test_deleted_fact_and_document_are_gone(store, run):
     lease = _doc_id(store, FIRST_LEASE)
     report = check_drift(run, store)

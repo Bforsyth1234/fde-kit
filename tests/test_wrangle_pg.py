@@ -34,6 +34,7 @@ from fde_kit.rag import (
     migrate,
     tenant_search_registry,
 )
+from fde_kit.rag.store import FactRow, content_hash
 from fde_kit.rag.tool import reported_line_item
 from fde_kit.wrangle.adapter import apply_to_tenant, job_kind_for
 from fde_kit.wrangle.apply import ApplyResult, SpecMismatch, gate, run
@@ -602,3 +603,240 @@ def test_float_noise_values_round_trip_exactly(make_tenant, store, tmp_path):
         ("1100.0000000000002", True),
         ("1100.0000000000002", True),
     ]
+
+
+# ------------------------------------------------------------------ documents stored unindexed
+
+
+def _chunks(s, doc_id: str) -> int:
+    return s.conn.execute(
+        "SELECT count(*) FROM rag_chunks WHERE doc_id = %s", (doc_id,)
+    ).fetchone()[0]
+
+
+def _meta(s, doc_id: str) -> dict:
+    return s.conn.execute(
+        "SELECT metadata FROM rag_documents WHERE doc_id = %s", (doc_id,)
+    ).fetchone()[0]
+
+
+def _indexed(s, doc_id: str) -> bool:
+    return s.conn.execute(
+        "SELECT indexed FROM rag_documents WHERE doc_id = %s", (doc_id,)
+    ).fetchone()[0]
+
+
+def _searched_docs(s, query: str) -> set[str]:
+    modes = ("keyword", "vector", "hybrid")
+    return {h.doc_id for mode in modes for h in s.search(query, k=20, mode=mode)}
+
+
+INDEXED = "Indexed lease notes. The zebrafish clause covers the aquarium.\n" * 3
+UNINDEXED = "row,A,B\n1,zebrafish,quokka\n2,quokka,42\n" * 40
+
+
+def test_unindexed_document_is_stored_fetchable_and_never_searched(make_tenant, store):
+    tid = make_tenant("unindexed-store")
+    with store.session(tid) as s:
+        idx = s.ingest_versioned("notes.md", INDEXED, title="Notes")
+        raw = s.ingest_versioned(
+            "sheet.csv", UNINDEXED, title="Sheet", metadata={"spec": "x"}, index=False
+        )
+        assert raw.changed and raw.version == 1 and raw.previous_doc_id is None
+        assert _chunks(s, idx.doc_id) > 0 and _chunks(s, raw.doc_id) == 0
+        assert _indexed(s, raw.doc_id) is False and _indexed(s, idx.doc_id) is True
+        assert _meta(s, raw.doc_id) == {"spec": "x"}  # metadata as given, nothing added
+        body, digest = s.conn.execute(
+            "SELECT body, content_hash FROM rag_documents WHERE doc_id = %s", (raw.doc_id,)
+        ).fetchone()
+        assert body == UNINDEXED and digest == content_hash(UNINDEXED) == raw.content_hash
+
+        # fetch reads the stored body, so char offsets work as for any document.
+        sl = s.fetch(raw.doc_id, char_start=8, char_end=40)
+        assert sl.text == UNINDEXED[8:40] and sl.total_chars == len(UNINDEXED)
+        assert sl.next == 40 and sl.superseded_by is None and sl.content_hash == digest
+
+        # search returns only the indexed document, in every mode and through the cache.
+        assert _searched_docs(s, "zebrafish") == {idx.doc_id}
+        assert raw.doc_id not in _searched_docs(s, "quokka")
+        assert raw.doc_id not in {h.doc_id for h in s.cached_search("quokka zebrafish").hits}
+        assert s.search("quokka", filters={"spec": "x"}) == []
+
+        # Re-ingesting the same text unindexed is a no-op.
+        again = s.ingest_versioned("sheet.csv", UNINDEXED, title="Sheet", index=False)
+        assert (again.doc_id, again.changed) == (raw.doc_id, False)
+        # "indexed" is an ordinary metadata key: stored as given, and it doesn't decide
+        # anything (the column does).
+        own = s.ingest_versioned("own.csv", "own", metadata={"indexed": "false"})
+        assert _indexed(s, own.doc_id) is True and _chunks(s, own.doc_id) > 0
+        assert _meta(s, own.doc_id) == {"indexed": "false"}
+        mine = s.ingest_versioned("mine.csv", "mine", metadata={"indexed": "yes"}, index=False)
+        assert _indexed(s, mine.doc_id) is False and _meta(s, mine.doc_id) == {"indexed": "yes"}
+
+    out = tenant_search_registry(store, tid, tools=("fetch_document",)).execute(
+        "fetch_document", {"doc_id": raw.doc_id, "char_start": 0, "char_end": 30}
+    )
+    assert not out.is_error and UNINDEXED[:30] in out.content
+    assert out.sources[0].content_hash == raw.content_hash
+
+
+def test_unindexed_versions_supersede_like_any_other(make_tenant, store):
+    """indexed v1 -> unindexed v2 -> indexed v3: each new text is a version, the superseded
+    version's chunks are deleted, the cache is cleared, and search follows the current one."""
+    tid = make_tenant("unindexed-versions")
+    src = "plan.csv"
+    v1_text, v2_text, v3_text = (f"month,amount\nzebrafish,{n}\n" for n in (100, 110, 120))
+    with store.session(tid) as s:
+        v1 = s.ingest_versioned(src, v1_text)
+        assert _chunks(s, v1.doc_id) > 0 and _searched_docs(s, "zebrafish") == {v1.doc_id}
+        s.cached_search("zebrafish")
+        assert s.conn.execute("SELECT count(*) FROM rag_cache").fetchone()[0] == 1
+
+        v2 = s.ingest_versioned(src, v2_text, index=False)
+        assert v2.changed and v2.version == 2 and v2.previous_doc_id == v1.doc_id
+        assert _chunks(s, v1.doc_id) == 0 and _chunks(s, v2.doc_id) == 0
+        assert s.conn.execute("SELECT count(*) FROM rag_cache").fetchone()[0] == 0
+        assert _searched_docs(s, "zebrafish") == set()
+        assert s.fetch(v1.doc_id).superseded_by == v2.doc_id  # provenance kept
+        assert s.fetch(v1.doc_id).text == v1_text and s.fetch(v2.doc_id).text == v2_text
+
+        v3 = s.ingest_versioned(src, v3_text)
+        assert v3.version == 3 and v3.previous_doc_id == v2.doc_id
+        assert s.fetch(v2.doc_id).superseded_by == v3.doc_id
+        assert _chunks(s, v3.doc_id) > 0 and _indexed(s, v3.doc_id) is True
+        assert [_indexed(s, v.doc_id) for v in (v1, v2)] == [True, False]
+        assert _searched_docs(s, "zebrafish") == {v3.doc_id}
+
+
+def test_same_text_with_the_other_index_setting_is_a_new_version(make_tenant, store):
+    """A version is its hash and its index setting. The same text with the other setting is a
+    new version like any content change: `changed=True`, `previous_doc_id` set, the old
+    version superseded (its chunks deleted, its row kept for provenance), the cache cleared,
+    and this call's title. Facts cited to the old version stay on it."""
+    tid = make_tenant("unindexed-flip")
+    with store.session(tid) as s:
+        raw = s.ingest_versioned("sheet.csv", UNINDEXED, title="Sheet", index=False)
+        s.upsert_entity("thing", "Quokka")
+        (fact_id,) = s.add_facts([FactRow("Quokka", "count", 42, doc_id=raw.doc_id)])
+        s.cached_search("quokka")
+
+        on = s.ingest_versioned("sheet.csv", UNINDEXED, title="Sheet, indexed")
+        assert on.changed and (on.version, on.previous_doc_id) == (2, raw.doc_id)
+        assert on.doc_id != raw.doc_id and on.content_hash == raw.content_hash
+        assert _indexed(s, on.doc_id) is True and _chunks(s, on.doc_id) > 0
+        assert s.fetch(raw.doc_id).superseded_by == on.doc_id
+        assert s.conn.execute("SELECT count(*) FROM rag_cache").fetchone()[0] == 0
+        assert {h.doc_id for h in s.search("quokka", k=5)} == {on.doc_id}
+        assert {h.title for h in s.search("quokka", k=5)} == {"Sheet, indexed"}
+        n = _chunks(s, on.doc_id)
+        assert s.ingest_versioned("sheet.csv", UNINDEXED, title="Sheet").changed is False
+        assert _chunks(s, on.doc_id) == n  # same text, same setting: untouched
+
+        chunk_id = s.search("quokka", k=1)[0].chunk_id
+        (cited,) = s.add_facts(
+            [FactRow("Quokka", "count", 42, doc_id=on.doc_id, chunk_id=chunk_id)]
+        )
+        s.cached_search("quokka")
+        off = s.ingest_versioned("sheet.csv", UNINDEXED, title="Sheet", index=False)
+        assert off.changed and (off.version, off.previous_doc_id) == (3, on.doc_id)
+        assert _indexed(s, off.doc_id) is False and _chunks(s, off.doc_id) == 0
+        assert _chunks(s, on.doc_id) == 0  # the superseded version's chunks, as always
+        assert s.conn.execute("SELECT count(*) FROM rag_cache").fetchone()[0] == 0
+        assert _searched_docs(s, "quokka") == set()
+        facts = {f.fact_id: f for f in s.facts(entity="Quokka")}
+        assert facts[fact_id].doc_id == raw.doc_id
+        # Reported as a change, so a caller knows the chunk it cited is gone.
+        assert (facts[cited].doc_id, facts[cited].chunk_id) == (on.doc_id, None)
+        assert s.conn.execute("SELECT count(*) FROM rag_documents").fetchone()[0] == 3
+
+
+def test_index_flip_through_ingest_replaces_facts_like_any_version(make_tenant, store):
+    """`ingest(on_new_version="replace")`: flipping a document's index setting replaces its
+    facts exactly as a new text would (before, the flip was in place and reported no change,
+    so the facts stayed on a version whose chunks had changed under them)."""
+    from fde_kit.rag.adapters.base import AdapterBatch, RawDocument, RawEntity, RawFact, ingest
+
+    class _One:
+        name = "flip"
+
+        def __init__(self, index: bool):
+            self.index = index
+
+        def batches(self):
+            yield AdapterBatch(
+                entities=[RawEntity("thing", "Quokka")],
+                documents=[RawDocument("sheet.csv", "Sheet", UNINDEXED, index=self.index)],
+                facts=[RawFact("sheet.csv", FactRow("Quokka", "count", 42))],
+            )
+
+    tid = make_tenant("unindexed-flip-ingest")
+    with store.session(tid) as s:
+        first = ingest(s, _One(False), on_new_version="replace")
+        same = ingest(s, _One(False), on_new_version="replace")
+        flip = ingest(s, _One(True), on_new_version="replace")
+        back = ingest(s, _One(False), on_new_version="replace")
+        current = s.conn.execute(
+            "SELECT doc_id::text, version FROM rag_documents WHERE superseded_by IS NULL"
+        ).fetchall()
+        facts = s.facts(entity="Quokka")
+    assert (first.documents_changed, first.facts) == (1, 1)
+    assert (same.documents_changed, same.facts, same.facts_replaced) == (0, 0, 0)
+    assert (flip.documents_changed, flip.facts, flip.facts_replaced) == (1, 1, 1)
+    assert (back.documents_changed, back.facts, back.facts_replaced) == (1, 1, 1)
+    assert [c[1] for c in current] == [3]
+    assert [(f.doc_id, f.conflict_group_id) for f in facts] == [(current[0][0], None)]
+
+
+def test_wrangle_default_loads_unindexed_and_index_true_reindexes(
+    make_tenant, store, tmp_path
+):
+    """By default (`source.index: false`) the sheet's document has no chunks, fetch_document
+    still shows a fact's row, search finds nothing. `index: true` changes the bundle hash (and
+    the version identity), so the next load writes an indexed new version and replaces the
+    facts."""
+    tid = make_tenant("wrangle-pg-unindexed")
+    project = _project(tmp_path)
+    spec = _spec_path(project, "planner_forecast")
+    original = spec.read_text(encoding="utf-8")
+    off = _approved(project, "planner_forecast")
+    result, report = _apply(store, tid, off, [FILES["planner_forecast"]])
+    assert report is not None and report.documents_changed == 1
+    assert report.facts == len(result.facts) == 35
+    with store.session(tid) as s:
+        assert s.count_chunks() == 0
+        doc_id, meta, indexed = s.conn.execute(
+            "SELECT doc_id::text, metadata, indexed FROM rag_documents"
+        ).fetchone()
+        assert indexed is False and meta["bundle_sha256"] == off.bundle_sha256
+        assert "indexed" not in meta
+        assert s.search("Puebla Machining", k=5) == []
+        fact = next(
+            f
+            for f in s.facts(entity="Puebla Machining 33/P-1234", field="demand_forecast_units")
+            if reported_line_item(f.source_ref) == "Plan!D14"
+        )
+    assert fact.doc_id == doc_id
+    out = tenant_search_registry(store, tid, tools=("fetch_document",)).execute(
+        "fetch_document", {"doc_id": doc_id, "char_start": 0, "char_end": 100_000}
+    )
+    assert not out.is_error, out.content
+    assert _fetched_cell(out.content, "Plan!D14") == ("14", "1,012.5")
+
+    # Same bytes, same unindexed spec: nothing changes.
+    _, again = _apply(store, tid, off, [FILES["planner_forecast"]])
+    assert again is not None and (again.documents_changed, again.facts) == (0, 0)
+
+    spec.write_text(original.replace("  data_starts: 6\n", "  data_starts: 6\n  index: true\n"))
+    on = _approved(project, "planner_forecast")
+    assert on.bundle_sha256 != off.bundle_sha256
+    _, back = _apply(store, tid, on, [FILES["planner_forecast"]])
+    assert back is not None and back.documents_changed == 1
+    assert back.facts == 35 and back.facts_replaced == 35
+    with store.session(tid) as s:
+        rows = s.conn.execute(
+            "SELECT doc_id::text, version, superseded_by::text, indexed "
+            "FROM rag_documents ORDER BY version"
+        ).fetchall()
+        assert [(r[1], r[2] is None, r[3]) for r in rows] == [(1, False, False), (2, True, True)]
+        assert _chunks(s, rows[0][0]) == 0 and _chunks(s, rows[1][0]) > 0
+        assert {h.doc_id for h in s.search("Puebla Machining", k=5)} == {rows[1][0]}

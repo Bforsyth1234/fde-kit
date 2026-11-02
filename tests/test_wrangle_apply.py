@@ -595,10 +595,10 @@ class RecordingSession(FakeSession):
         super().__init__()
         self.documents: dict[str, tuple[str, str, dict]] = {}
 
-    def ingest_versioned(self, source, text, *, title="", metadata=None, max_chars=900):
+    def ingest_versioned(self, source, text, *, title="", metadata=None, max_chars=900, index=True):
         self.documents[source] = (title, text, dict(metadata or {}))
         return super().ingest_versioned(
-            source, text, title=title, metadata=metadata, max_chars=max_chars
+            source, text, title=title, metadata=metadata, max_chars=max_chars, index=index
         )
 
 
@@ -633,6 +633,39 @@ def test_adapter_from_spec_and_files_one_batch_per_file(project: Path) -> None:
     assert len(batches) == 2
     assert [len(b.documents) for b in batches] == [1, 1]
     assert [len(b.facts) for b in batches] == [59, 59]
+
+
+def test_source_index_true_reaches_the_document_and_ingest(
+    project: Path, results: dict[str, ApplyResult]
+) -> None:
+    """`source.index: true`: the same document (title, metadata, body after the first line)
+    and the same facts, flagged `index=True` for `ingest`; the bundle hash differs, so the
+    first line does too. The default is `index=False`: sheets are stored, not searchable."""
+    default = results["planner_forecast"]
+    assert [d.index for d in default.documents] == [False]
+    spec = project / "specs" / "planner_forecast.yaml"
+    _edit(spec, "  data_starts: 6\n", "  data_starts: 6\n  index: true\n")
+    loaded = approve(spec, by="tester")
+    result = run(loaded, [project.parent / "planner_forecast.xlsx"])
+    (doc,) = result.documents
+    (before,) = default.documents
+    assert doc.index is True
+    assert loaded.bundle_sha256 != default.loaded.bundle_sha256
+    first = f"# wrangle spec=planner_forecast bundle={loaded.bundle_sha256}"
+    assert doc.text.split("\n", 1)[0] == first
+    assert doc.text.split("\n", 1)[1] == before.text.split("\n", 1)[1]
+    assert (doc.source, doc.title) == (before.source, before.title)
+    assert {k: v for k, v in doc.metadata.items() if k != "bundle_sha256"} == {
+        k: v for k, v in before.metadata.items() if k != "bundle_sha256"
+    }
+    assert [(f.row.value, f.row.source_ref.split("@")[0]) for f in result.facts] == [
+        (f.row.value, f.row.source_ref.split("@")[0]) for f in default.facts
+    ]
+
+    s = RecordingSession()
+    _, report = apply_to_tenant(s, loaded, [project.parent / "planner_forecast.xlsx"])
+    assert report is not None and report.facts == 35
+    assert s.indexed == {doc.source: True}
 
 
 def test_apply_to_tenant_approved(project: Path) -> None:

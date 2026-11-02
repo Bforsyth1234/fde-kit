@@ -869,3 +869,17 @@ def test_delete_facts_for_document_dissolves_conflicts_it_leaves_behind(
         assert all(after[f].conflict_group_id is None for f in agree)
         groups = {after[f].conflict_group_id for f in still}
         assert len(groups) == 1 and None not in groups
+
+
+def test_conflict_group_ids_matches_facts_per_entity(store: TenantStore, company: str):
+    """The one-statement group lookup `ingest` uses gives the per-entity answer."""
+    may = {"period_start": date(2026, 5, 1), "period_end": date(2026, 5, 31)}
+    with store.session("harbor") as s:
+        s.add_facts([FactRow(company, "batch_groups", 1, **may)])
+        s.add_facts([FactRow(company, "batch_groups", 2, **may)])
+        names = [company, company.upper(), "no such entity"]
+        want = {
+            f.conflict_group_id for n in names for f in s.facts(entity=n) if f.conflict_group_id
+        }
+        assert want and s.conflict_group_ids(names) == want
+        assert s.conflict_group_ids(["no such entity"]) == set()

@@ -47,8 +47,9 @@ Every fact's `source_ref` is `<Sheet>!<A1>@wrangle:<spec>/<bundle_sha12>/<file_s
 every sheet becomes one `RawDocument` whose text is a `# wrangle spec=<name> bundle=<sha256>`
 line, then the sheet as CSV with Excel row numbers. The first line makes a corrected spec over
 the same bytes a new document version, so `on_new_version="replace"` retires the old facts.
-Values are `int` or, when not integral, `Decimal` (exact); `write_outputs` writes a Decimal as
-a JSON number when a float reads back as the same value, else as a string.
+With `source.index: false` the document is stored for `fetch_document` but not indexed for
+search. Values are `int` or, when not integral, `Decimal` (exact); `write_outputs` writes a
+Decimal as a JSON number when a float reads back as the same value, else as a string.
 """
 
 from __future__ import annotations
@@ -73,6 +74,7 @@ from .read import (
     XLSX_SUFFIXES,
     Cell,
     Grid,
+    XlsxBook,
     col_letter,
     parse_ref,
     read_failure_reason,
@@ -410,26 +412,33 @@ def _is_xlsx(path: Path | str) -> bool:
     return Path(path).suffix.lower() in XLSX_SUFFIXES
 
 
-def _workbook_sheets(path: Path | str) -> list[str]:
+def _workbook_sheets(path: Path | str, book: XlsxBook | None = None) -> list[str]:
     """The workbook's worksheet names in workbook order (chartsheets left out). Only the
-    workbook part is parsed, no sheet."""
+    workbook part is parsed, no sheet. With `book`, its workbook (opened once for the load)."""
     import openpyxl
 
     try:
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        if book is not None:
+            wb = book.workbook
+        else:
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     except Exception as e:  # zipfile.BadZipFile, KeyError, InvalidFileException, OSError
         raise SpecMismatch(str(path), f"cannot open the workbook: {e}") from e
     try:
         return [ws.title for ws in wb.worksheets]
     finally:
-        wb.close()
+        if book is None:
+            wb.close()
 
 
-def unit_sheets(loaded: LoadedSpec, path: Path | str) -> list[str | None]:
+def unit_sheets(
+    loaded: LoadedSpec, path: Path | str, book: XlsxBook | None = None
+) -> list[str | None]:
     """The sheets the spec reads from one file, in workbook order: `[source.sheet]`, the
     `source.sheets` selection (which opens the workbook to list its sheets), or `[None]` for a
     CSV. `SpecMismatch` for an XLSX with neither, a CSV with either, or a selection that names
-    a missing sheet or matches none."""
+    a missing sheet or matches none. `book`: the file's `XlsxBook`, when the caller reads
+    several sheets of it (as `run` does)."""
     src = loaded.spec.source
     if not _is_xlsx(path):
         if src.sheet is not None or src.sheets is not None:
@@ -440,7 +449,7 @@ def unit_sheets(loaded: LoadedSpec, path: Path | str) -> list[str | None]:
         return [None]
     if src.sheets is not None:
         try:
-            return list(src.select_sheets(_workbook_sheets(path)))
+            return list(src.select_sheets(_workbook_sheets(path, book)))
         except ValueError as e:
             if isinstance(e, SpecMismatch):
                 raise
@@ -498,6 +507,8 @@ class _Run:
         # Per document: (entity, field, start, end) -> [(value, "Sheet!A1")]; values within a
         # key all differ. Reset for each file; `conflicts` collects across them.
         self.seen: dict[tuple[str, str, date, date], list[tuple[Any, str]]] = {}
+        # str(path) -> the XLSX file opened and hashed once for the whole load (`run`).
+        self.books: dict[str, XlsxBook] = {}
         self.conflicts: list[dict[str, Any]] = []
         # Per entity part: is it open, and each new (non-crosswalk) canonical with at least
         # one fact -> the cell it was first read from, keyed by the parts to its left. In a
@@ -594,6 +605,7 @@ class _Run:
                 sheet if _is_xlsx(path) else None,
                 encoding=src.encoding,
                 delimiter=src.delimiter,
+                book=self.books.get(str(path)),
             )
         except ValueError as e:
             raise SpecMismatch(shown, str(e), msheet) from e
@@ -663,6 +675,7 @@ class _Run:
                 "bundle_sha256": self.loaded.bundle_sha256,
                 "header_rows": json.dumps(list(src.header_rows)),
             },
+            index=src.index,
         )
         fr = FileResult(
             path=shown,
@@ -986,28 +999,37 @@ def run(
     a missing column or sheet) and `SpecError` for a spec whose ops can't run."""
     loaded = spec if isinstance(spec, LoadedSpec) else load_project_spec(spec)
     files = list(files)
-    units: list[tuple[str | Path, str | None]] = [
-        (f, sheet) for f in files for sheet in unit_sheets(loaded, f)
-    ]
-    keys: dict[str, str] = {}
-    for f, sheet in units:
-        key = document_key(loaded, f, sheet)
-        shown = (
-            str(f) if sheet is None or loaded.spec.source.sheets is None else f"{f} sheet {sheet!r}"
-        )
-        if key in keys:
-            raise SpecMismatch(
-                str(f),
-                f"document_key {loaded.spec.source.document_key!r} renders {key!r} for this "
-                f"{'sheet' if loaded.spec.source.sheets is not None else 'file'} and for "
-                f"{keys[key]}: in one load they would supersede each other "
-                "(load them separately, or use a document_key that tells them apart)",
-                sheet if loaded.spec.source.sheets is not None else None,
+    # Each XLSX is hashed and opened once for the load, however many of its sheets it reads.
+    books = {str(f): XlsxBook(f) for f in files if _is_xlsx(f)}
+    try:
+        units: list[tuple[str | Path, str | None]] = [
+            (f, sheet) for f in files for sheet in unit_sheets(loaded, f, books.get(str(f)))
+        ]
+        keys: dict[str, str] = {}
+        for f, sheet in units:
+            key = document_key(loaded, f, sheet)
+            shown = (
+                str(f)
+                if sheet is None or loaded.spec.source.sheets is None
+                else f"{f} sheet {sheet!r}"
             )
-        keys[key] = shown
-    state = _Run(loaded, force)
-    state.cell_prefix = _cell_prefixes(files)
-    results = [state.file(f, sheet) for f, sheet in units]
+            if key in keys:
+                raise SpecMismatch(
+                    str(f),
+                    f"document_key {loaded.spec.source.document_key!r} renders {key!r} for this "
+                    f"{'sheet' if loaded.spec.source.sheets is not None else 'file'} and for "
+                    f"{keys[key]}: in one load they would supersede each other "
+                    "(load them separately, or use a document_key that tells them apart)",
+                    sheet if loaded.spec.source.sheets is not None else None,
+                )
+            keys[key] = shown
+        state = _Run(loaded, force)
+        state.books = books
+        state.cell_prefix = _cell_prefixes(files)
+        results = [state.file(f, sheet) for f, sheet in units]
+    finally:
+        for book in books.values():
+            book.close()
     similar, similar_total, similar_skipped = state.similar_entities()
 
     crosswalk_entities = [
