@@ -531,26 +531,25 @@ def test_new_settings_enter_the_bundle_hash_only_when_set(tmp_path):
     assert one.bundle_sha256 != two.bundle_sha256
 
 
-def test_source_index_defaults_true_and_validates():
-    assert MappingSpec.model_validate(SPEC).source.index is True
-    assert MappingSpec.model_validate(spec_with(source__index=False)).source.index is False
+def test_source_index_defaults_false_and_validates():
+    assert MappingSpec.model_validate(SPEC).source.index is False
+    assert MappingSpec.model_validate(spec_with(source__index=True)).source.index is True
     for bad in ("maybe", [False], {"x": 1}):
         with pytest.raises(ValidationError, match="index"):
             MappingSpec.model_validate(spec_with(source__index=bad))
 
 
-def test_source_index_enters_the_bundle_hash_only_when_false(tmp_path):
-    """No `index`, or `index: true`, hashes as before the setting existed (approvals stay
-    valid); `index: false` is an edit. Turning it back on returns to the original hash, so the
-    document text changes again and the next load re-indexes (a new version)."""
+def test_source_index_enters_the_bundle_hash_only_when_true(tmp_path):
+    """No `index`, or `index: false` (the default), hashes as before the setting existed, so
+    approvals stay valid; `index: true` is an edit."""
     assert "index" not in MappingSpec.model_validate(SPEC).hash_payload()["source"]
-    explicit = MappingSpec.model_validate(spec_with(source__index=True))
+    explicit = MappingSpec.model_validate(spec_with(source__index=False))
     assert "index" not in explicit.hash_payload()["source"]
-    off = MappingSpec.model_validate(spec_with(source__index=False)).hash_payload()
-    assert off["source"]["index"] is False
+    on = MappingSpec.model_validate(spec_with(source__index=True)).hash_payload()
+    assert on["source"]["index"] is True
 
     base = load_project_spec(write_project(tmp_path / "a")).bundle_sha256
-    on = load_project_spec(write_project(tmp_path / "b", spec_with(source__index=True)))
-    unindexed = load_project_spec(write_project(tmp_path / "c", spec_with(source__index=False)))
-    assert on.bundle_sha256 == base
-    assert unindexed.bundle_sha256 != base
+    off = load_project_spec(write_project(tmp_path / "b", spec_with(source__index=False)))
+    indexed = load_project_spec(write_project(tmp_path / "c", spec_with(source__index=True)))
+    assert off.bundle_sha256 == base
+    assert indexed.bundle_sha256 != base

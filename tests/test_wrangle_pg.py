@@ -787,17 +787,17 @@ def test_index_flip_through_ingest_replaces_facts_like_any_version(make_tenant, 
     assert [(f.doc_id, f.conflict_group_id) for f in facts] == [(current[0][0], None)]
 
 
-def test_wrangle_index_false_loads_unindexed_and_flipping_back_reindexes(
+def test_wrangle_default_loads_unindexed_and_index_true_reindexes(
     make_tenant, store, tmp_path
 ):
-    """`source.index: false`: the sheet's document has no chunks, fetch_document still shows
-    a fact's row, search finds nothing. Turning it back on changes the bundle hash, so the
-    document text, so the next load writes an indexed new version and replaces the facts."""
+    """By default (`source.index: false`) the sheet's document has no chunks, fetch_document
+    still shows a fact's row, search finds nothing. `index: true` changes the bundle hash (and
+    the version identity), so the next load writes an indexed new version and replaces the
+    facts."""
     tid = make_tenant("wrangle-pg-unindexed")
     project = _project(tmp_path)
     spec = _spec_path(project, "planner_forecast")
     original = spec.read_text(encoding="utf-8")
-    spec.write_text(original.replace("  data_starts: 6\n", "  data_starts: 6\n  index: false\n"))
     off = _approved(project, "planner_forecast")
     result, report = _apply(store, tid, off, [FILES["planner_forecast"]])
     assert report is not None and report.documents_changed == 1
@@ -826,7 +826,7 @@ def test_wrangle_index_false_loads_unindexed_and_flipping_back_reindexes(
     _, again = _apply(store, tid, off, [FILES["planner_forecast"]])
     assert again is not None and (again.documents_changed, again.facts) == (0, 0)
 
-    spec.write_text(original, encoding="utf-8")
+    spec.write_text(original.replace("  data_starts: 6\n", "  data_starts: 6\n  index: true\n"))
     on = _approved(project, "planner_forecast")
     assert on.bundle_sha256 != off.bundle_sha256
     _, back = _apply(store, tid, on, [FILES["planner_forecast"]])

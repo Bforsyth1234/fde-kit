@@ -635,21 +635,21 @@ def test_adapter_from_spec_and_files_one_batch_per_file(project: Path) -> None:
     assert [len(b.facts) for b in batches] == [59, 59]
 
 
-def test_source_index_false_reaches_the_document_and_ingest(
+def test_source_index_true_reaches_the_document_and_ingest(
     project: Path, results: dict[str, ApplyResult]
 ) -> None:
-    """`source.index: false`: the same document (title, metadata, body after the first line)
-    and the same facts, flagged `index=False` for `ingest`; the bundle hash differs, so the
-    first line does too. The default is `index=True`."""
+    """`source.index: true`: the same document (title, metadata, body after the first line)
+    and the same facts, flagged `index=True` for `ingest`; the bundle hash differs, so the
+    first line does too. The default is `index=False`: sheets are stored, not searchable."""
     default = results["planner_forecast"]
-    assert [d.index for d in default.documents] == [True]
+    assert [d.index for d in default.documents] == [False]
     spec = project / "specs" / "planner_forecast.yaml"
-    _edit(spec, "  data_starts: 6\n", "  data_starts: 6\n  index: false\n")
+    _edit(spec, "  data_starts: 6\n", "  data_starts: 6\n  index: true\n")
     loaded = approve(spec, by="tester")
     result = run(loaded, [project.parent / "planner_forecast.xlsx"])
     (doc,) = result.documents
     (before,) = default.documents
-    assert doc.index is False
+    assert doc.index is True
     assert loaded.bundle_sha256 != default.loaded.bundle_sha256
     first = f"# wrangle spec=planner_forecast bundle={loaded.bundle_sha256}"
     assert doc.text.split("\n", 1)[0] == first
@@ -665,7 +665,7 @@ def test_source_index_false_reaches_the_document_and_ingest(
     s = RecordingSession()
     _, report = apply_to_tenant(s, loaded, [project.parent / "planner_forecast.xlsx"])
     assert report is not None and report.facts == 35
-    assert s.indexed == {doc.source: False}
+    assert s.indexed == {doc.source: True}
 
 
 def test_apply_to_tenant_approved(project: Path) -> None:

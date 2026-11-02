@@ -250,9 +250,11 @@ class Source(_Model):
     stop_before: SectionBound | None = None
     """Data ends before the first row after the start that matches. Not found ->
     `SpecMismatch`. Together they pick one table out of a sheet that stacks several."""
-    index: bool = True
-    """False: each sheet's document is stored (so `fetch_document` shows a row) but not chunked
-    or embedded for search (`RawDocument.index`). Enters the bundle hash only when false."""
+    index: bool = False
+    """Whether each sheet's document is also chunked and embedded for search. By default it is
+    not: the sheet is stored (so `fetch_document` shows a person the row a fact came from) but
+    searching CSV chunks rarely helps and embedding them was most of a load's time. `true`
+    makes the sheet searchable (`RawDocument.index`). Enters the bundle hash only when true."""
 
     @field_validator("header_rows")
     @classmethod
@@ -619,11 +621,11 @@ class MappingSpec(_Model):
         """The spec as it enters the bundle hash: JSON-mode, aliases, no approval.
 
         Settings added after the first release (`source.start_after`, `source.stop_before`,
-        `source.sheets`, `measures[].nulls`, and `source.index` when false) enter only when set,
+        `source.sheets`, `measures[].nulls`, and `source.index` when true) enter only when set,
         so a spec that doesn't use them hashes as it did before they existed and its approval
-        stays valid. `source.index: false` does enter: it changes the documents a load writes,
-        and putting it in the bundle hash (so in each document's first line) is what makes
-        turning it back on re-index them (see `ingest_versioned`).
+        stays valid. `source.index: true` does enter, because it changes the documents a load
+        writes. (Re-indexing doesn't depend on the hash: a document's version identity is its
+        content hash *and* its `indexed` flag, so flipping either way writes a new version.)
 
         `resolve.similar_warn` and `resolve.not_same` never enter (`WARNING_ONLY_RESOLVE_KEYS`):
         they only decide which possible-duplicate warnings are reported and cannot change a
@@ -634,7 +636,7 @@ class MappingSpec(_Model):
         for key in _LATER_SOURCE_KEYS:
             if out["source"].get(key) is None:
                 out["source"].pop(key, None)
-        if out["source"].get("index") is True:
+        if out["source"].get("index") is False:
             out["source"].pop("index")
         for m in out["measures"]:
             if not m.get("nulls"):

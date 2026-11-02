@@ -146,7 +146,7 @@ source:
     - {blank: [Site]}
   start_after: {column: Site, matches: "^FORECAST$"}   # optional; data begins after this row
   stop_before: {column: Site, matches: "^ACTUALS"}     # optional; data ends before this row
-  index: false                        # optional, default true; false: documents not searchable (§7.4)
+  index: true                         # optional, default false: documents stored but not searchable (§7.4)
 
 entity:
   kind: plant_part                    # single-column: kind of that column's entities
@@ -536,14 +536,15 @@ the sheet as CSV with a leading `row` column holding the Excel row number, title
 That way `fetch_document` shows a person row 42 as row 42, and a corrected (re-approved) spec
 over the same bytes is a new document version, so `replace` (§3) retires the wrong facts.
 `metadata` holds `file_sha256`, `spec`, `bundle_sha256` and `header_rows`.
-With `source.index: false` the document is `RawDocument(..., index=False)`: stored exactly as
-above (body, hash, versioning), but not chunked or embedded, so `search_documents` never returns
-it while `fetch_document` (which slices the stored body) works as for any document; its row's
-`indexed` column is false (metadata is unchanged). Use it for large sheets: the full 2 MB Census county CSV spends
-8.8-9.3 s in `ingest_versioned` with the hash embedder, chunking and embedding CSV rows nobody
-searches, and 0.1 s unindexed (`evals/bench_load.py`); a real embedding model costs far more. Turning it back on changes the
-bundle hash (it is hashed only when false), so the first line, so the next load writes a new,
-indexed version and replaces the facts. (`ingest_versioned` treats the index setting as part of
+By default (`source.index: false`) the document is `RawDocument(..., index=False)`: stored
+exactly as above (body, hash, versioning), but not chunked or embedded, so `search_documents`
+never returns it while `fetch_document` (which slices the stored body) works as for any
+document; its row's `indexed` column is false (metadata is unchanged). Searching CSV chunks of a
+sheet rarely helps, and embedding them was most of a load's time: the full 2 MB Census county
+CSV spends about 9 s in `ingest_versioned` with the hash embedder indexed and 0.1-0.2 s
+unindexed (`evals/bench_load.py`); a real embedding model costs far more. `source.index: true`
+makes a spec's sheets searchable; it changes the bundle hash (it is hashed only when true), so
+the next load writes a new, indexed version and replaces the facts. (`ingest_versioned` treats the index setting as part of
 a version's identity anyway: the same text with the other setting is a new version too.) controls versioning. Its placeholders are `{spec}` (the spec name), `{file}` (the file's base
 name), `{path}` (the path as passed) and `{sheet}` (CSV: the file stem). With the default
 `{spec}/{file}#{sheet}`, `Forecast_Nov.xlsx` is a different document from `Forecast_Oct.xlsx`,
@@ -814,7 +815,8 @@ extra and Wave 3 only the CI line, so there's no overlap. `cli.py` is touched on
   golden questions in PR 7 get awkward.
 - **`add_facts` was two statements per fact.** Measured on real data and since batched: see
   FINDINGS, "Load speed".
-- **Each sheet is embedded as a document.** A 10k-row sheet is ~700 chunks to embed;
-  `source.index: false` stores the sheet for `fetch_document` without indexing it (§7.4).
+- **Each sheet was embedded as a document.** A 10k-row sheet is ~700 chunks to embed; sheets
+  are now stored for `fetch_document` without indexing by default, `source.index: true` to
+  search them (§7.4).
 - **Crosswalks own their entities' aliases.** Loading a crosswalk replaces aliases another
   adapter set on the same entity. Wrangle and EDGAR entities don't overlap today.

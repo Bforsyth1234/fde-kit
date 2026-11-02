@@ -619,8 +619,9 @@ also leaves on `session.last_ingest`.
   reads the body) works as usual. The row's `indexed` column is false; metadata is stored as
   given. A version is its hash *and* its `index` setting, so re-ingesting the same text with
   the other setting is a new version like a content change (`changed=True`,
-  `previous_doc_id` set), and `on_new_version="replace"` replaces its facts. Wrangle's
-  `source.index: false` uses it for sheets worth showing a person but not worth embedding.
+  `previous_doc_id` set), and `on_new_version="replace"` replaces its facts. Wrangle stores
+  sheets this way by default (worth showing a person, rarely worth embedding);
+  `source.index: true` makes a spec's sheets searchable.
 - `fetch(doc_id)` on a superseded document returns its old body with `superseded_by` set, so a
   reader can see what changed. An unknown `doc_id` raises `KeyError`, and under RLS another
   tenant's `doc_id` is unknown, so the error is identical for "no such document" and "not yours".

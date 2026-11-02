@@ -389,17 +389,18 @@ dropping them would trade away the cross-tenant guarantee they give.
 Fixing `add_facts` exposed the next cost: after the facts, `ingest` counted conflict groups with
 one `facts(entity=…)` per entity, each paying the same alias scan. That was **17.5 s** of the
 county load, invisible to a facts-only timer; it is now one statement
-(`TenantSession.conflict_group_ids`). Sheets stored with `source.index: false` skip chunking and
-embedding (county document: 7.8 s to 0.1 s with the hash embedder; a real embedding model costs
-far more). Each workbook is now read once per load, not once per sheet: its bytes are hashed
+(`TenantSession.conflict_group_ids`). Wrangle sheets are now stored unindexed by default
+(`source.index: true` to search them): chunking and embedding CSV rows nobody searches was most
+of what was left (county document: about 9 s indexed vs 0.2 s with the hash embedder; a real
+embedding model costs far more). Each workbook is now read once per load, not once per sheet: its bytes are hashed
 and the workbook and its zip opened from that one in-memory copy, so a file replaced mid-load
 can't mix versions. End to end
 (`evals/bench_load.py`, PG 16, hash embedder):
 
 | Load | Before | After |
 | --- | --- | --- |
-| Census retail, 35 sheets, 25,207 facts | 24.5 s | 7.6 s |
-| Census county, 18,864 facts, ~3,100 entities | 125.9 s | 12.3 s (5.0 s with `index: false`) |
+| Census retail, 35 sheets, 25,207 facts | 24.5 s | 5.3 s (7.3 s with `index: true`) |
+| Census county, 18,864 facts, ~3,100 entities | 125.9 s | 5.3 s (14.0 s with `index: true`) |
 
 **What real files still can't say:**
 
