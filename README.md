@@ -954,8 +954,10 @@ Everything is an environment variable with an `FDE_` prefix (or a line in `.env`
 
 ## What's not here yet
 
-LLM extraction jobs (the table exists; `fde rag extract` does not), an agent that proposes
-wrangle specs (PR 7 in [the plan](docs/wrangle-plan.md)), summing line-level rows into one fact, pairwise/A-B eval mode, a
+LLM extraction jobs (the table exists; `fde rag extract` does not), entity hierarchies
+(next, so sums stop double-counting regions with their states), an agent that proposes wrangle
+specs, summing line-level rows into one fact (order and backlog in
+[the plan](docs/wrangle-plan.md#0-status-and-next-steps-updated-2026-11-03)), pairwise/A-B eval mode, a
 customers/ onboarding directory, a one-command cloud deploy, and PDF ingestion in `local_files`
 (PDFs are skipped with a warning; there is no PDF dependency).
 
