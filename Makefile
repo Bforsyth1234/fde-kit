@@ -1,5 +1,5 @@
 .PHONY: install test lint eval eval-mock trace up down worker crash-demo upgrade-demo replay-check \
-	rag-demo rag-eval rag-test rag-agent-eval edgar-eval
+	rag-demo rag-eval rag-test rag-agent-eval edgar-eval wrangle-bench
 
 worker:          ## Temporal worker for durable runs (needs `make up`)
 	fde worker
@@ -27,6 +27,10 @@ edgar-eval:      ## the SEC EDGAR agent eval: seeds pharma-a/pharma-b offline, s
 
 rag-test:        ## the tenant-isolation attack suite (needs `make up`)
 	FDE_TEST_PG_URL=postgresql://fde:fde@localhost:5432/fde pytest tests/test_rag_isolation.py -v
+
+wrangle-bench:   ## score the no-LLM baseline mapper on a generated world, gated on the committed baseline
+	fde wrangle bench --mapper truth
+	fde wrangle bench --gate evals/wrangle/baseline.json
 
 install:
 	pip install -e ".[dev]"

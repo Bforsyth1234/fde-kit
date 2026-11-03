@@ -871,8 +871,13 @@ every loaded fact against an independent read of the file. What that turned up i
 [FINDINGS](docs/FINDINGS.md#wrangling-real-government-files).
 
 There's no LLM in this path yet. A person writes the spec, helped by `profile`. The plan for an
-agent that proposes specs, measured against a benchmark with known answers, is in
-[docs/wrangle-plan.md](docs/wrangle-plan.md).
+agent that proposes specs is in [docs/wrangle-plan.md](docs/wrangle-plan.md).
+
+`fde wrangle bench` is what that agent will be measured with: it generates a messy four-source world
+from a seed, loads what a mapper proposes, and scores it against known answers, by metric and by
+mess type. `--mapper truth` is the 100% self-check, the default `heuristic` mapper is the no-LLM
+floor, and `--gate evals/wrangle/baseline.json` fails if the floor drops (CI runs both). Scores are in
+[FINDINGS](docs/FINDINGS.md#the-wrangle-benchmark-a-floor-with-known-answers).
 
 ## Baseline results
 

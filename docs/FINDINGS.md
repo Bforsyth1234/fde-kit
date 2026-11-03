@@ -14,6 +14,7 @@ the kit; this is what happened when it ran.
 - [Durable runs: what a crash does at each point](#durable-runs-what-a-crash-does-at-each-point)
 - [Wrangling messy tables](#wrangling-messy-tables)
 - [Wrangling real government files](#wrangling-real-government-files)
+- [The wrangle benchmark: a floor with known answers](#the-wrangle-benchmark-a-floor-with-known-answers)
 - [Costs and limits](#costs-and-limits)
 
 ## Live eval results
@@ -477,6 +478,58 @@ can't mix versions. End to end
   that, but other tools may; the XML pass now refuses such a sheet with an error naming the
   cell. All 41 fixture sheets read byte-identically before and after, and the 25k-row EIA sheet
   takes the same time and memory.
+
+## The wrangle benchmark: a floor with known answers
+
+`fde wrangle bench` generates a world from a seed (20 plants, 300 parts, 24 months, four messy
+"systems", about 10,700 facts), asks a mapper for specs and crosswalks, loads them with `apply.run`
+and scores the result against the truth. No database and no LLM; a run takes about 1 s. The correct
+project is scored too (`--mapper truth`) and must get 100% on every metric, at every seed tested;
+CI runs that first, so a bug in the generator or a scorer can't pass as a mapper's score.
+
+The baseline is `HeuristicMapper`: header synonyms, fuzzy matching and the profile's own findings.
+It sets the floor the PR 7 agent has to beat. Its scores, at three seeds (11 is the CI gate):
+
+| Metric | Seed 7 | Seed 11 | Seed 13 |
+| --- | --- | --- | --- |
+| Column mapping precision / recall | 1.00 / 0.44 | 1.00 / 0.56 | 1.00 / 0.44 |
+| Entity precision (false merges ×5) / recall | 0.85 / 0.95 | 0.85 / 0.94 | 0.85 / 0.94 |
+| False merges / misses | 3 / 2 | 3 / 2 | 3 / 2 |
+| Chart-of-accounts accuracy | 0.36 | 0.36 | 0.36 |
+| Value accuracy / precision | 0.77 / 0.99 | 0.78 / 0.99 | 0.77 / 0.99 |
+| Provenance accuracy | 0.99 | 0.99 | 0.99 |
+| Conflict precision / recall | 0 / 0 | 0.13 / 0.32 | 0 / 0 |
+| Reject precision / recall | 0.06 / 1.00 | 0.03 / 0.80 | 0.05 / 1.00 |
+
+What the floor shows:
+
+- **The profile does the layout work.** Title rows, the merged header, `(000s)`, subtotals and the
+  wide layout all score 1.0 on the planner workbook, with no LLM. An agent earns nothing there.
+- **Words are where it fails.** Headers are drawn per seed from a list, and a synonym table misses
+  `SLS_AMT`, `QOH` and `TURNOVER_AMT`. Precision is 1.0 and recall about 0.5: it rarely maps a column
+  wrongly, it leaves columns unmapped. At seeds 7 and 13 it finds no balance column, so its trial
+  balance spec doesn't validate, and it never maps both sides of a planted conflict, so it finds none.
+- **Reading a plant out of its code gives the false merges.** Three ERP codes end in another plant's
+  number, so `2104` becomes `Windsor Stamping 04` when it is `Detroit Stamping 29`. Those facts load
+  cleanly under the wrong plant, and they cause every conflict it invents: at seed 11 it flags 79,
+  of which 10 are real and the other 69 all involve a fact under the wrong plant.
+- **One spec can't read two number formats.** The legacy report writes `1.234,56` for EU rows and
+  `1,234.56` for the rest. The baseline writes one spec per file, so some EU values reject, and
+  `(1.204)` parses cleanly as -1.204. The correct project uses two specs, each skipping the other
+  region. A clean parse of a wrong number is the failure to watch in PR 7.
+
+Limits of the benchmark:
+
+- **The synonyms and the generator share an author,** so these scores flatter the baseline's
+  coverage of the wordings it was given. That's fine for a floor, but they aren't a claim about
+  real customer files.
+- **Source A is plant-month, not plant-part-month as first planned.** One cell makes one fact, so a
+  part-level ERP extract couldn't disagree with the plant-level legacy report without summing. Part
+  level is tested on the forecast workbook instead.
+- **Conflicts are computed, not stored.** The scorer applies `values_agree` pairwise to the load, the
+  same rule as `add_facts`, without a database.
+- **Human edit distance isn't scored yet.** It compares a proposed spec with the truth, which starts
+  to mean something with PR 7. Tokens and LLM calls are reported, and are 0 here.
 
 ## Costs and limits
 

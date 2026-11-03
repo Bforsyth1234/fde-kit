@@ -1,7 +1,7 @@
 # Wrangle — messy tabular sources into facts with cell-level provenance
 
 Plan for PRs 5–8. Status: §9 decided (as proposed); PR 5 specced in
-[pr5-wrangle-core.md](pr5-wrangle-core.md); nothing built yet. Each PR is shippable on its own and leaves
+[pr5-wrangle-core.md](pr5-wrangle-core.md) and built; PR 6 built (§5); PRs 7 and 8 not started. Each PR is shippable on its own and leaves
 `main` green; sections marked FROZEN are the contracts the later PRs build against.
 
 ## 1. Why
@@ -267,6 +267,24 @@ type, that goes in FINDINGS too.
 `fde wrangle bench [--seed N] [--mapper heuristic|agent] [--provider mock|live]` prints the
 table and writes JSON, like `fde eval`. CI runs the heuristic baseline at a fixed seed and gates
 on its scores not regressing.
+
+### 5.4 As built
+
+Differences from the above, all in `evals/wrangle/`:
+
+- **Source A is plant-month.** The plan's plant-part-month rows couldn't disagree with source C's
+  plant-month values, since one cell makes one fact and nothing sums. Part level is covered by B.
+- **Source C takes two specs,** one per region, each skipping the other's rows, because one column
+  holds two number formats. It's the mess a one-spec-per-file mapper can't get right.
+- **Header wording varies by seed** (`HEADER_VARIANTS`). It shows in column mapping recall, not in
+  the by-mess table. With fixed headers the baseline scored 1.0 on column mapping, leaving PR 7 nothing to beat.
+- **`--mapper truth`** is added: the correct project must score 100%. CI runs it before the gate.
+- **Provenance is stricter than read-back alone:** a fact the truth knows must also be from the
+  truth's cell, so a clean read-back under the wrong plant still counts against it.
+- **Human edit distance isn't built;** it needs PR 7's proposed specs. `--provider` and
+  `--mapper agent` are accepted, and the agent exits 2 until PR 7.
+- **The mapper contract** (`mapper.py`): write a project with crosswalks named `plants` and `coa`,
+  return a `Proposal` per spec, and don't read `truth/`. The agent keeps the same one.
 
 ## 6. PR 7 — the agent proposer
 
