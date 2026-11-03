@@ -60,6 +60,26 @@ def test_gate_exit_codes(monkeypatch, tmp_path: Path):
     assert main(["--provider", "mock", "--golden", str(broken), "--threshold", "0.9"]) == 0
 
 
+def test_rejected_api_key_exits_2_with_a_clear_annotation(monkeypatch, capsys):
+    """A revoked or wrong key must read as a credentials problem, not as an eval regression."""
+    import anthropic
+    import httpx2
+
+    import evals.run_evals as run_evals
+
+    def refuse(*_a, **_k):
+        req = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+        resp = httpx2.Response(401, request=req)
+        raise anthropic.AuthenticationError("invalid x-api-key", response=resp, body=None)
+
+    monkeypatch.setenv("FDE_OTEL_ENABLED", "false")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setattr(run_evals, "run_case", refuse)
+    assert main(["--provider", "mock", "--limit", "1"]) == 2
+    out = capsys.readouterr().out
+    assert "::error title=Eval did not run: API key rejected::" in out
+    assert "ANTHROPIC_API_KEY" in out
+
 def test_case_without_mock_or_replay_rejected(tmp_path: Path):
     bad = tmp_path / "bad.jsonl"
     bad.write_text(json.dumps({"id": "x", "prompt": "p", "checks": []}))

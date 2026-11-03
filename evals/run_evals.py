@@ -6,7 +6,8 @@
     python -m evals.run_evals --set rag --provider mock   # the lease-corpus set, tools for real
     python -m evals.run_evals --set edgar --seed --provider mock   # SEC filings, seeded offline
 
-Exit code is 0 when pass rate >= threshold, 1 otherwise. That exit code is the CI gate.
+Exit code is 0 when pass rate >= threshold, 1 otherwise. That exit code is the CI gate. Exit code 2
+means the run never started because the API key was rejected (a credentials problem, not a score).
 
 Three sets. `--set golden` (the default, evals/golden.jsonl) runs against the builtin tools and
 needs nothing but Python. `--set rag` (evals/golden_rag.jsonl) runs over the seeded demo lease
@@ -40,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from collections import defaultdict
@@ -346,6 +348,31 @@ def print_report(
         )
 
 
+def _is_auth_error(e: BaseException) -> bool:
+    try:
+        from anthropic import AuthenticationError
+    except ImportError:  # pragma: no cover - anthropic is a hard dependency
+        return False
+    return isinstance(e, AuthenticationError)
+
+
+def _report_auth_error(e: BaseException) -> None:
+    """Say plainly that the key was refused, instead of a traceback that reads like a regression.
+
+    Exit code 2 (not 1) keeps "the model scored below threshold" and "the run never started"
+    apart. Under GitHub Actions an ::error annotation puts the cause on the run's summary page.
+    """
+    msg = (
+        "The Anthropic API rejected ANTHROPIC_API_KEY (401 authentication_error), so no case "
+        "ran. This is a credentials problem, not an eval regression: set a valid key "
+        "(in CI, the repository secret ANTHROPIC_API_KEY) and re-run."
+    )
+    console.print(f"[red bold]eval did not run:[/] {msg}")
+    console.print(f"[dim]{e}[/]")
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::error title=Eval did not run: API key rejected::{msg}")
+
+
 def main(argv: list[str] | None = None) -> int:
     settings = get_settings()
     p = argparse.ArgumentParser(description="fde-kit eval runner")
@@ -406,6 +433,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         results = [run_case(c, args.provider, judge) for c in cases]
+    except Exception as e:
+        if not _is_auth_error(e):
+            raise
+        _report_auth_error(e)
+        return 2
     finally:
         close_rag_store()
     summary = summarise(results)
