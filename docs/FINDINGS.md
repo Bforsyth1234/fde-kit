@@ -531,6 +531,51 @@ Limits of the benchmark:
 - **Human edit distance isn't scored yet.** It compares a proposed spec with the truth, which starts
   to mean something with PR 7. Tokens and LLM calls are reported, and are 0 here.
 
+### Bugs found while building it
+
+**Open in the kit, not fixed by this PR:**
+
+- **Two values within precision can read as a conflict.** `values_agree` rounds each value to the
+  coarser precision and compares, so a rounding boundary between them is a disagreement: 12,450 and
+  12,500 at precision 1000 round to 12 and 13, and 12,499 against 12,500 does the same. Both are real
+  results from `values_agree`. A source in thousands with one decimal, compared with an exact source,
+  can create a false conflict this way. The generator avoids it by writing the legacy report in whole
+  thousands, rounded half up, so the benchmark doesn't measure this.
+- **A wrong scale can go unnoticed on small values.** At precision 1000, 100 and 0.1 agree, and so do
+  400 and 0.4, because both round to 0. Values 1000 times apart then raise no conflict. `precision`
+  defaults to `scale`, so a `(000s)` column gets 1000 even when it's reported to one decimal, meaning
+  to the nearest 100. The default isn't changed. The benchmark's own forecast spec and truth declare
+  100.
+- **Three docs are out of date.** Line 345 of this file still says every sheet is embedded, but sheets
+  are now stored unindexed by default. `docs/wrangle-plan.md` §4.4 gives an old `source_ref` form; the
+  frozen form is in `docs/pr5-wrangle-core.md` §7.4. That same section of the PR 5 doc has a garbled
+  sentence, where the start of the `document_key` paragraph is missing ("...) controls versioning").
+
+**In the benchmark, fixed before it was committed:**
+
+- **The mess log could list one id twice.** It only checked the last three entries for a repeat. It now
+  tracks every id, and a test checks they are unique.
+- **A spec that failed validation stopped the whole bench.** With no column matching a measure, the
+  baseline wrote `measures: []`, and pydantic's `ValidationError` wasn't caught. The kit behaves as
+  documented here: `fde wrangle check`, `dry-run` and `approve` all report it and exit 1. The bench now
+  records the error and scores that spec as loading nothing.
+- **A failed spec would have zeroed its crosswalk score.** Crosswalks were read from loaded specs, so
+  when the trial balance spec failed, chart-of-accounts accuracy would have been 0 although the mapper
+  had proposed one. They are now read from the project directory.
+- **Proposing nothing scored a perfect precision.** A load that flagged no conflicts got precision 1.0,
+  which would have made a later mapper that finds some look like a regression. Proposing nothing now
+  scores 0.
+- **The truth was too loose on forecasts.** With truth precision 1000, a forecast loaded with the wrong
+  scale still partly matched, for the small-value reason above. A planted-error test caught it. Forecast
+  truth is now precision 100, and that test now sees 0% on the source.
+- **Fixed headers let the baseline score 1.0 on column mapping,** which would have left PR 7 nothing to
+  beat. Headers now vary by seed.
+- **The baseline's column reader used an attribute that doesn't exist** (`Grid.cells`; it's
+  `Grid.rows`), and crashed on its first run.
+
+The baseline's false merges, misread numbers and invented conflicts above aren't listed here. They are
+its measured scores, left in on purpose.
+
 ## Costs and limits
 
 ### Costs of this design
