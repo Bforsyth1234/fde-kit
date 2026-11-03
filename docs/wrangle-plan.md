@@ -1,8 +1,70 @@
 # Wrangle — messy tabular sources into facts with cell-level provenance
 
-Plan for PRs 5–8. Status: §9 decided (as proposed); PR 5 specced in
-[pr5-wrangle-core.md](pr5-wrangle-core.md); nothing built yet. Each PR is shippable on its own and leaves
-`main` green; sections marked FROZEN are the contracts the later PRs build against.
+Plan for PRs 5–8, plus the work real data added. Status and what's next are in §0. Each PR is
+shippable on its own and leaves `main` green; sections marked FROZEN are the contracts the later
+PRs build against.
+
+## 0. Status and next steps (updated 2026-11-03)
+
+### Shipped
+
+| Plan item | GitHub | What landed |
+| --- | --- | --- |
+| PR 5, wrangle core ([pr5-wrangle-core.md](pr5-wrangle-core.md)) | #23 | read, profile, spec, approve, dry-run, apply; cell-level provenance; reject gate; re-export replace; tested on 5 real Census/EIA files (`tests/fixtures/wrangle/real/`); multi-sheet specs; placeholder `nulls`; section bounds; possible-duplicate warnings; two independent reviews |
+| (not in the original plan) batch loading | #24 | batched `add_facts` with an equivalence test against the old code; one-statement conflict-group count; per-tenant write lock taken by `ingest()`; `source.index` (sheets unindexed by default); one read per workbook. Census county load 125.9 s to 5.3 s |
+
+Measured numbers and everything the real files broke are in [FINDINGS](FINDINGS.md).
+
+### Next, in order
+
+1. **Hierarchy (next PR).** Regions beside states, divisions beside states and NAICS parents
+   beside children load as flat entities, so summing a column double-counts. Agreed design:
+   - **Record it.** An edges table (tenant, child entity, parent entity, hierarchy name) under
+     the same RLS and partitioning as the other fact tables, plus an `aggregate` flag on
+     entities for rows that are totals of some kind.
+   - **Real data isn't a tree.** Census retail has overlapping aggregates ("Retail sales, total
+     (excl. motor vehicle and parts dealers)"): a slice, not a parent. So `aggregate` is needed
+     alongside parent links, meaning "don't add this to its siblings".
+   - **Derive it from the spec.** One rule per hierarchy: code prefix (NAICS `441` is the
+     parent of `4411`), a marker (`.Alabama` under an unmarked region), rows after a section
+     row (an EIA division row above its states), or an explicit parent column or crosswalk.
+   - **Use it.** `query_table` guidance and a leaf-only view so the model sums leaves; a load
+     check that each parent equals the sum of its children, reported, not gated (suppressed
+     `(S)` children legitimately break the sum, and that report is itself useful).
+   - **Prove it on the committed real files:** Census state population (regions/states), EIA
+     5.6.A (divisions/states) and Census retail (NAICS codes and overlapping totals).
+2. **PR 6, benchmark first** (§5). The seeded synthetic world as planned, plus the committed
+   real files as a second set: their specs are hand-written ground truth for column mapping,
+   and they're where the heuristic baseline will fall over first.
+3. **PR 7, agent proposer** (§6), measured against that baseline.
+4. **PR 8, mapping library and reuse** (§7).
+
+### Backlog (each recorded in FINDINGS; not scheduled)
+
+- **Per-fact status.** `Aug. 2026(p)` (preliminary) is stripped by a regex, and EIA's `NM`
+  (not meaningful) vs `--` (not applicable) are counted per load but not stored on the fact.
+- **Instant periods from labels.** "Population as of July 1" can only load as the year; no op
+  builds `YYYY-07-01` from a year label.
+- **Layout that varies by sheet.** A spec covers sheets that share one layout; a workbook whose
+  old sheets differ needs one spec per layout, split with `exclude`.
+- **Summing line-level rows into one fact.** One cell, one fact today; a sum needs provenance to
+  a set of cells.
+- **Cross-load name variants.** Open entities merge by case within one load only; a variant
+  spelled differently in a later load becomes a second entity (the warnings only see one load).
+- **The same float reported twice conflicts with itself.** Postgres keeps 15 significant
+  digits, so `1/3` stored twice compares raw against stored and forms a group of two equal
+  values. Pre-existing; wrangle passes `Decimal`s, so it mostly affects direct `add_facts`
+  callers.
+- **Insert cost floor.** About 35 µs per foreign-key reference per fact, because the referenced
+  tables are partitioned. Removing it would trade away the cross-tenant guarantee.
+- **Loads into one tenant are serialized** by the write lock in `ingest()`. That's correct for
+  conflict detection; heavy concurrent loading into one tenant would want a finer lock.
+
+### Open decision
+
+- **Whitespace between digits in `norm_key`.** It's kept, so `Unit 1 2` doesn't match `Unit 12`
+  (no false merge), but a code typed with a stray space (`12 345` vs `12345`) needs a crosswalk
+  entry. Dropping whitespace-only runs between digits is a one-line change.
 
 ## 1. Why
 
