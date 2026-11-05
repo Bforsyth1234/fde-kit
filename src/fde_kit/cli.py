@@ -1115,6 +1115,32 @@ def cmd_wrangle_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def _wrangle_bench(argv: list[str]) -> int:
+    """Hand `argv` to `evals/wrangle/bench.py` as is: it owns the options, so they can't drift."""
+    # `evals/` lives in the repo root, not inside the installed package (see `cmd_eval`).
+    repo_root = Path(__file__).resolve().parents[2]
+    for candidate in (Path.cwd(), repo_root):
+        marker = candidate / "evals" / "wrangle" / "bench.py"
+        if marker.exists() and str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
+    try:
+        from evals.wrangle.bench import main as bench_main
+    except ModuleNotFoundError as e:
+        if e.name and e.name.startswith("evals"):
+            console.print(
+                "[red]could not find evals/wrangle/bench.py[/]. Run from the repo root, or use "
+                "`python -m evals.wrangle.bench`."
+            )
+            return 2
+        console.print(WRANGLE_MISSING.format(name=e.name))
+        return 1
+    return bench_main(argv)
+
+
+def cmd_wrangle_bench(args: argparse.Namespace) -> int:
+    return _wrangle_bench(args.bench_args)
+
+
 def _add_wrangle_parsers(sub) -> None:
     wg = sub.add_parser("wrangle", help="messy CSV/XLSX tables -> cited facts, via a mapping spec")
     wsub = wg.add_subparsers(dest="wrangle_cmd", required=True)
@@ -1151,6 +1177,12 @@ def _add_wrangle_parsers(sub) -> None:
     al.add_argument("--url")
     al.add_argument("--embedder")
     al.set_defaults(fn=cmd_wrangle_apply)
+    # Options are bench.py's own (`fde wrangle bench --help`); `main` forwards them untouched.
+    be = wsub.add_parser(
+        "bench", help="score a mapper on a generated world with known answers", add_help=False
+    )
+    be.add_argument("bench_args", nargs=argparse.REMAINDER)
+    be.set_defaults(fn=cmd_wrangle_bench)
 
 
 # --- end wrangle (PR 5)
@@ -1635,6 +1667,9 @@ def main(argv: list[str] | None = None) -> int:
     _add_wrangle_parsers(sub)
     # --- end wrangle (PR 5)
 
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:2] == ["wrangle", "bench"]:  # argparse would eat the leading `--seed` etc.
+        return _wrangle_bench(argv[2:])
     args = p.parse_args(argv)
     return args.fn(args)
 

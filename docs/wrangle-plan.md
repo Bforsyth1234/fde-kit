@@ -12,6 +12,7 @@ PRs build against.
 | --- | --- | --- |
 | PR 5, wrangle core ([pr5-wrangle-core.md](pr5-wrangle-core.md)) | #23 | read, profile, spec, approve, dry-run, apply; cell-level provenance; reject gate; re-export replace; tested on 5 real Census/EIA files (`tests/fixtures/wrangle/real/`); multi-sheet specs; placeholder `nulls`; section bounds; possible-duplicate warnings; two independent reviews |
 | (not in the original plan) batch loading | #24 | batched `add_facts` with an equivalence test against the old code; one-statement conflict-group count; per-tenant write lock taken by `ingest()`; `source.index` (sheets unindexed by default); one read per workbook. Census county load 125.9 s to 5.3 s |
+| PR 6, benchmark (§5) | #27 | seeded synthetic world with known answers; no-LLM baseline mapper; `--mapper truth` must score 100%; CI gate on the baseline's scores. As built in §5.4 |
 
 Measured numbers and everything the real files broke are in [FINDINGS](FINDINGS.md).
 
@@ -33,9 +34,9 @@ Measured numbers and everything the real files broke are in [FINDINGS](FINDINGS.
      `(S)` children legitimately break the sum, and that report is itself useful).
    - **Prove it on the committed real files:** Census state population (regions/states), EIA
      5.6.A (divisions/states) and Census retail (NAICS codes and overlapping totals).
-2. **PR 6, benchmark first** (§5). The seeded synthetic world as planned, plus the committed
-   real files as a second set: their specs are hand-written ground truth for column mapping,
-   and they're where the heuristic baseline will fall over first.
+2. **Real files as a second benchmark set.** PR 6 built the synthetic world only. The committed
+   real files' specs are hand-written ground truth for column mapping, and they're where the
+   heuristic baseline will fall over first.
 3. **PR 7, agent proposer** (§6), measured against that baseline.
 4. **PR 8, mapping library and reuse** (§7).
 
@@ -327,8 +328,30 @@ No LLM. It sets the floor the agent has to beat. If it scores close to the agent
 type, that goes in FINDINGS too.
 
 `fde wrangle bench [--seed N] [--mapper heuristic|agent] [--provider mock|live]` prints the
-table and writes JSON, like `fde eval`. CI runs the heuristic baseline at a fixed seed and gates
+table and writes JSON, like `fde eval`. CI runs the heuristic baseline at fixed seeds and gates
 on its scores not regressing.
+
+### 5.4 As built
+
+Differences from the above, all in `evals/wrangle/`:
+
+- **Source A is plant-month.** The plan's plant-part-month rows couldn't disagree with source C's
+  plant-month values, since one cell makes one fact and nothing sums. Part level is covered by B.
+- **Source C takes two specs,** one per region, each skipping the other's rows, because one column
+  holds two number formats. It's the mess a one-spec-per-file mapper can't get right.
+- **Header wording varies by seed** (`HEADER_VARIANTS`). It shows in column mapping recall, not in
+  the by-mess table. With fixed headers the baseline scored 1.0 on column mapping, leaving PR 7 nothing to beat.
+- **`--mapper truth`** is added: the correct project must score 100%. CI runs it before the gate.
+- **The gate covers seeds 7, 11 and 13,** since header wording varies by seed; `--gate` runs every
+  seed the baseline holds, fails on any regression and prints improvements. `--write-baseline`
+  writes only after every check passed.
+- **Facts are matched on the period's start and end,** so a wrong grain is a wrong fact.
+- **Provenance is stricter than read-back alone:** a fact the truth knows must also be from the
+  truth's cell, so a clean read-back under the wrong plant still counts against it.
+- **Human edit distance isn't built;** it needs PR 7's proposed specs. `--provider` and
+  `--mapper agent` are accepted, and the agent exits 2 until PR 7.
+- **The mapper contract** (`mapper.py`): write a project with crosswalks named `plants` and `coa`,
+  return a `Proposal` per spec, and don't read `truth/`. The agent keeps the same one.
 
 ## 6. PR 7 — the agent proposer
 
@@ -400,7 +423,7 @@ The point of an FDE kit is that the tenth deployment is cheaper than the first.
 | PR | Rough size | Depends on | Done when |
 | --- | --- | --- | --- |
 | 5 | ~1,500 lines + tests | `main` | provenance read-back passes on all fixture files; reject gate holds; CI green |
-| 6 | ~800 | 5 | baseline scores published in FINDINGS; CI gates on them at a fixed seed |
+| 6 | ~800 | 5 | baseline scores published in FINDINGS; CI gates on them at fixed seeds |
 | 7 | ~900 + prompt + fixtures | 5, 6 | agent beats the baseline on column mapping and entity P/R over 3 seeds; golden_wrangle passes live and in replay |
 | 8 | ~600 | 7 | customer-2 experiment written up with numbers |
 

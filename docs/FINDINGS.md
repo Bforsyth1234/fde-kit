@@ -14,6 +14,7 @@ the kit; this is what happened when it ran.
 - [Durable runs: what a crash does at each point](#durable-runs-what-a-crash-does-at-each-point)
 - [Wrangling messy tables](#wrangling-messy-tables)
 - [Wrangling real government files](#wrangling-real-government-files)
+- [The wrangle benchmark: a floor with known answers](#the-wrangle-benchmark-a-floor-with-known-answers)
 - [Costs and limits](#costs-and-limits)
 
 ## Live eval results
@@ -477,6 +478,124 @@ can't mix versions. End to end
   that, but other tools may; the XML pass now refuses such a sheet with an error naming the
   cell. All 41 fixture sheets read byte-identically before and after, and the 25k-row EIA sheet
   takes the same time and memory.
+
+## The wrangle benchmark: a floor with known answers
+
+`fde wrangle bench` generates a world from a seed (20 plants, 300 parts, 24 months, four messy
+"systems", about 10,700 facts), asks a mapper for specs and crosswalks, loads them with `apply.run`
+and scores the result against the truth. No database and no LLM; a run takes about 1 s. The correct
+project is scored too (`--mapper truth`) and must get 100% on every metric, at every seed tested;
+CI runs that first, so a bug in the generator or a scorer can't pass as a mapper's score.
+
+The baseline is `HeuristicMapper`: header synonyms, fuzzy matching and the profile's own findings.
+It sets the floor the PR 7 agent has to beat. Its scores at three seeds, all three gated in CI
+(`evals/wrangle/baseline.json`), so a synonym that only one seed's header wording uses is still covered:
+
+| Metric | Seed 7 | Seed 11 | Seed 13 |
+| --- | --- | --- | --- |
+| Column mapping precision / recall | 1.00 / 0.44 | 1.00 / 0.56 | 1.00 / 0.44 |
+| Entity precision (false merges ×5) / recall | 0.85 / 0.95 | 0.85 / 0.94 | 0.85 / 0.94 |
+| False merges / misses | 3 / 2 | 3 / 2 | 3 / 2 |
+| Chart-of-accounts accuracy | 0.36 | 0.36 | 0.36 |
+| Value accuracy / precision | 0.77 / 0.99 | 0.78 / 0.99 | 0.77 / 0.99 |
+| Provenance accuracy | 0.99 | 0.99 | 0.99 |
+| Conflict precision / recall | 0 / 0 | 0.13 / 0.32 | 0 / 0 |
+| Reject precision / recall | 0.06 / 1.00 | 0.01 / 0.80 | 0.05 / 1.00 |
+
+What the floor shows:
+
+- **The profile does the layout work.** Title rows, the merged header, `(000s)`, subtotals and the
+  wide layout all score 1.0 on the planner workbook, with no LLM. An agent earns nothing there.
+- **Words are where it fails.** Headers are drawn per seed from a list, and a synonym table misses
+  `SLS_AMT`, `QOH` and `TURNOVER_AMT`. Precision is 1.0 and recall about 0.5: it rarely maps a column
+  wrongly, it leaves columns unmapped. At seeds 7 and 13 it finds no balance column, so its trial
+  balance spec doesn't validate, and it never maps both sides of a planted conflict, so it finds none.
+- **Reading a plant out of its code gives the false merges.** Three ERP codes end in another plant's
+  number, so `2104` becomes `Windsor Stamping 04` when it is `Detroit Stamping 29`. Those facts load
+  cleanly under the wrong plant, and they cause every conflict it invents: at seed 11 it flags 79,
+  of which 10 are real and the other 69 all involve a fact under the wrong plant.
+- **One spec can't read two number formats.** The legacy report writes `1.234,56` for EU rows and
+  `1,234.56` for the rest. The baseline writes one spec per file, so some EU values reject, and
+  `(1.204)` parses cleanly as -1.204. The correct project uses two specs, each skipping the other
+  region. A clean parse of a wrong number is the failure to watch in PR 7.
+
+Limits of the benchmark:
+
+- **The synonyms and the generator share an author,** so these scores flatter the baseline's
+  coverage of the wordings it was given. That's fine for a floor, but they aren't a claim about
+  real customer files.
+- **Source A is plant-month, not plant-part-month as first planned.** One cell makes one fact, so a
+  part-level ERP extract couldn't disagree with the plant-level legacy report without summing. Part
+  level is tested on the forecast workbook instead.
+- **Conflicts are computed, not stored.** The scorer applies `values_agree` pairwise to the load, the
+  same rule as `add_facts`, without a database.
+- **Human edit distance isn't scored yet.** It compares a proposed spec with the truth, which starts
+  to mean something with PR 7. Tokens and LLM calls are reported, and are 0 here.
+
+### Bugs found while building it
+
+**Open in the kit, not fixed by this PR:**
+
+- **Two values within precision can read as a conflict.** `values_agree` rounds each value to the
+  coarser precision and compares, so a rounding boundary between them is a disagreement: 12,450 and
+  12,500 at precision 1000 round to 12 and 13, and 12,499 against 12,500 does the same. Both are real
+  results from `values_agree`. A source in thousands with one decimal, compared with an exact source,
+  can create a false conflict this way. The generator avoids it by writing the legacy report in whole
+  thousands, rounded half up, so the benchmark doesn't measure this.
+- **A wrong scale can go unnoticed on small values.** At precision 1000, 100 and 0.1 agree, and so do
+  400 and 0.4, because both round to 0. Values 1000 times apart then raise no conflict. `precision`
+  defaults to `scale`, so a `(000s)` column gets 1000 even when it's reported to one decimal, meaning
+  to the nearest 100. The default isn't changed. The benchmark's own forecast spec and truth declare
+  100.
+- **Three docs are out of date.** Line 345 of this file still says every sheet is embedded, but sheets
+  are now stored unindexed by default. `docs/wrangle-plan.md` §4.4 gives an old `source_ref` form; the
+  frozen form is in `docs/pr5-wrangle-core.md` §7.4. That same section of the PR 5 doc has a garbled
+  sentence, where the start of the `document_key` paragraph is missing ("...) controls versioning").
+
+**In the benchmark, fixed before it was committed:**
+
+- **The mess log could list one id twice.** It only checked the last three entries for a repeat. It now
+  tracks every id, and a test checks they are unique.
+- **A spec that failed validation stopped the whole bench.** With no column matching a measure, the
+  baseline wrote `measures: []`, and pydantic's `ValidationError` wasn't caught. The kit behaves as
+  documented here: `fde wrangle check`, `dry-run` and `approve` all report it and exit 1. The bench now
+  records the error and scores that spec as loading nothing.
+- **A failed spec would have zeroed its crosswalk score.** Crosswalks were read from loaded specs, so
+  when the trial balance spec failed, chart-of-accounts accuracy would have been 0 although the mapper
+  had proposed one. They are now read from the project directory.
+- **Proposing nothing scored a perfect precision.** A load that flagged no conflicts got precision 1.0,
+  which would have made a later mapper that finds some look like a regression. Proposing nothing now
+  scores 0.
+- **The truth was too loose on forecasts.** With truth precision 1000, a forecast loaded with the wrong
+  scale still partly matched, for the small-value reason above. A planted-error test caught it. Forecast
+  truth is now precision 100, and that test now sees 0% on the source.
+- **Fixed headers let the baseline score 1.0 on column mapping,** which would have left PR 7 nothing to
+  beat. Headers now vary by seed.
+- **The baseline's column reader used an attribute that doesn't exist** (`Grid.cells`; it's
+  `Grid.rows`), and crashed on its first run.
+
+**In the benchmark, fixed in review:**
+
+- **Row rejects on different sheets counted as one.** They were keyed by row number alone, so row 5
+  of twenty trial-balance sheets was one reject. At seed 11 the baseline makes 282 rejects, not the
+  158 first recorded, and its reject precision is 0.01, not 0.03. Rejects are now keyed by sheet.
+- **A right number on the wrong period grain scored as right.** Facts were matched on the period's
+  start only; a forecast loaded as one-day periods scored 100%. The truth now records each period's
+  end, and facts and conflicts are matched on both, as `add_facts` does.
+- **A text measure crashed the scorer,** which multiplied the read-back string by the scale. The
+  read-back now follows apply: text as is, numbers scaled.
+- **Two measures for one field were read back through the first one's ops.** A correct fact from the
+  second failed provenance. The read-back now passes if any of that field's measures gives the value.
+- **`--write-baseline` wrote before the checks,** so a regressed run could become the floor. It now
+  writes only after the self-check and the gate pass, and refuses the gate's own file.
+- **The gate was one seed, and its test required exact scores,** so an improvement failed CI and a
+  rapidfuzz release could too. The gate is now a ratchet over seeds 7, 11 and 13 that prints what
+  improved; the baseline records the rapidfuzz and openpyxl versions, and the gate says when the
+  installed ones differ.
+- **`ambiguous_date` tagged dates like `05/05/2024`,** which read the same either way round.
+
+The baseline's false merges, misread numbers and invented conflicts above aren't listed here. They are
+its measured scores, left in on purpose.
 
 ## Costs and limits
 

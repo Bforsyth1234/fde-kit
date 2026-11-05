@@ -31,6 +31,10 @@ jobs:
       - run: pytest --cov=fde_kit --cov-report=term-missing
         env:
           FDE_TEST_PG_URL: postgresql://fde:fde@localhost:5432/fde
+      - name: wrangle benchmark (self-check at 100%, then the no-LLM baseline must not regress)
+        run: |
+          fde wrangle bench --mapper truth --seed 7 11 13
+          fde wrangle bench --gate evals/wrangle/baseline.json
       - name: retrieval eval (hash embedder, offline) and tenant-leak gate
         run: python -m evals.rag_eval --embedder hash --threshold 0.8
         env:

@@ -1,0 +1,69 @@
+{
+  "mapper": "heuristic",
+  "versions": {
+    "rapidfuzz": "3.14.6",
+    "openpyxl": "3.1.5"
+  },
+  "seeds": {
+    "7": {
+      "column_mapping_precision": 1.0,
+      "column_mapping_recall": 0.444444,
+      "entity_precision": 0.854369,
+      "entity_recall": 0.946237,
+      "false_merges": 3,
+      "entity_misses": 2,
+      "coa_accuracy": 0.361111,
+      "value_accuracy": 0.774163,
+      "value_precision": 0.988339,
+      "facts_loaded": 8404,
+      "phantom_facts": 0,
+      "provenance_accuracy": 0.991433,
+      "conflict_precision": 0.0,
+      "conflict_recall": 0.0,
+      "conflicts_flagged": 0,
+      "reject_precision": 0.055556,
+      "reject_recall": 1.0,
+      "rejects_total": 126
+    },
+    "11": {
+      "column_mapping_precision": 1.0,
+      "column_mapping_recall": 0.555556,
+      "entity_precision": 0.85,
+      "entity_recall": 0.944444,
+      "false_merges": 3,
+      "entity_misses": 2,
+      "coa_accuracy": 0.361111,
+      "value_accuracy": 0.78433,
+      "value_precision": 0.99152,
+      "facts_loaded": 8491,
+      "phantom_facts": 0,
+      "provenance_accuracy": 0.99152,
+      "conflict_precision": 0.126582,
+      "conflict_recall": 0.322581,
+      "conflicts_flagged": 79,
+      "reject_precision": 0.014184,
+      "reject_recall": 0.8,
+      "rejects_total": 282
+    },
+    "13": {
+      "column_mapping_precision": 1.0,
+      "column_mapping_recall": 0.444444,
+      "entity_precision": 0.85,
+      "entity_recall": 0.944444,
+      "false_merges": 3,
+      "entity_misses": 2,
+      "coa_accuracy": 0.361111,
+      "value_accuracy": 0.771557,
+      "value_precision": 0.988522,
+      "facts_loaded": 8364,
+      "phantom_facts": 0,
+      "provenance_accuracy": 0.991392,
+      "conflict_precision": 0.0,
+      "conflict_recall": 0.0,
+      "conflicts_flagged": 0,
+      "reject_precision": 0.046358,
+      "reject_recall": 1.0,
+      "rejects_total": 151
+    }
+  }
+}
