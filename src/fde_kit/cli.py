@@ -1115,7 +1115,8 @@ def cmd_wrangle_apply(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_wrangle_bench(args: argparse.Namespace) -> int:
+def _wrangle_bench(argv: list[str]) -> int:
+    """Hand `argv` to `evals/wrangle/bench.py` as is: it owns the options, so they can't drift."""
     # `evals/` lives in the repo root, not inside the installed package (see `cmd_eval`).
     repo_root = Path(__file__).resolve().parents[2]
     for candidate in (Path.cwd(), repo_root):
@@ -1133,18 +1134,11 @@ def cmd_wrangle_bench(args: argparse.Namespace) -> int:
             return 2
         console.print(WRANGLE_MISSING.format(name=e.name))
         return 1
-
-    argv = ["--seed", str(args.seed), "--mapper", args.mapper]
-    for flag, value in (
-        ("--provider", args.provider),
-        ("--json", args.json),
-        ("--write-baseline", args.write_baseline),
-    ):
-        if value:
-            argv += [flag, value]
-    if args.gate:
-        argv += ["--gate", args.gate]
     return bench_main(argv)
+
+
+def cmd_wrangle_bench(args: argparse.Namespace) -> int:
+    return _wrangle_bench(args.bench_args)
 
 
 def _add_wrangle_parsers(sub) -> None:
@@ -1183,13 +1177,11 @@ def _add_wrangle_parsers(sub) -> None:
     al.add_argument("--url")
     al.add_argument("--embedder")
     al.set_defaults(fn=cmd_wrangle_apply)
-    be = wsub.add_parser("bench", help="score a mapper on a generated world with known answers")
-    be.add_argument("--seed", type=int, default=11)
-    be.add_argument("--mapper", choices=["heuristic", "truth", "agent"], default="heuristic")
-    be.add_argument("--provider", choices=["mock", "live"], help="for --mapper agent (PR 7)")
-    be.add_argument("--json", help="write the full result here")
-    be.add_argument("--gate", help="baseline JSON: exit 1 if any metric is worse")
-    be.add_argument("--write-baseline", help="write this run's metrics as a baseline file")
+    # Options are bench.py's own (`fde wrangle bench --help`); `main` forwards them untouched.
+    be = wsub.add_parser(
+        "bench", help="score a mapper on a generated world with known answers", add_help=False
+    )
+    be.add_argument("bench_args", nargs=argparse.REMAINDER)
     be.set_defaults(fn=cmd_wrangle_bench)
 
 
@@ -1675,6 +1667,9 @@ def main(argv: list[str] | None = None) -> int:
     _add_wrangle_parsers(sub)
     # --- end wrangle (PR 5)
 
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:2] == ["wrangle", "bench"]:  # argparse would eat the leading `--seed` etc.
+        return _wrangle_bench(argv[2:])
     args = p.parse_args(argv)
     return args.fn(args)
 

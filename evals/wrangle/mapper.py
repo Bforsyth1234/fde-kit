@@ -23,7 +23,8 @@ import yaml
 from rapidfuzz import fuzz
 
 from fde_kit.wrangle.profile import ColumnProfile, Profile, profile_file
-from fde_kit.wrangle.read import read_grid
+from fde_kit.wrangle.profile import profile as profile_grid
+from fde_kit.wrangle.read import Grid, XlsxBook, read_grid
 from fde_kit.wrangle.resolve import fuzzy_accepts, norm_key
 
 from .generator import SOURCE_FILES, SPEC_SOURCE
@@ -142,10 +143,9 @@ def match_account(name: str, standard: list[str]) -> str | None:
     return None
 
 
-def _column_values(path: Path, sheet: str | None, profile: Profile, column: ColumnProfile):
+def _column_values(grid: Grid, prof: Profile, column: ColumnProfile):
     """Each cleaned value of a column's data rows, with the row number."""
-    grid = read_grid(path, sheet) if path.suffix == ".xlsx" else read_grid(path)
-    for row in range(profile.header_rows[-1] + 1, len(grid.rows) + 1):
+    for row in range(prof.header_rows[-1] + 1, len(grid.rows) + 1):
         yield row, grid.cell(row, column.col).raw.strip()
 
 
@@ -175,11 +175,17 @@ class HeuristicMapper:
         self.standard = self._reference(world / "reference" / "standard_coa.csv")
         self.plant_aliases: dict[str, str] = {}
         self.account_aliases: dict[str, str] = {}
+        self._sheets: dict[tuple[Path, str | None], tuple[Grid, Profile]] = {}
 
         proposals = []
         by_file = {name: source for source, name in SOURCE_FILES.items()}
         for path in sorted((world / "sources").iterdir()):
-            spec = self._spec_for(path)
+            book = XlsxBook(path) if path.suffix == ".xlsx" else None
+            try:
+                spec = self._spec_for(path, book)
+            finally:
+                if book is not None:
+                    book.close()
             spec_path = project_dir / "specs" / f"{spec['spec']}.yaml"
             spec_path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
             proposals.append(Proposal(spec_path, by_file[path.name], path))
@@ -202,16 +208,23 @@ class HeuristicMapper:
             w.writerow(["alias", "canonical"])
             w.writerows(rows)
 
-    def _spec_for(self, path: Path) -> dict:
-        sheets: list[str] = []
-        if path.suffix == ".xlsx":
-            import openpyxl
+    def _sheet(self, path: Path, sheet: str | None, book: XlsxBook | None) -> tuple[Grid, Profile]:
+        """Each sheet read and profiled once per run, a workbook's sheets through one open book."""
+        key = (path, sheet)
+        if key not in self._sheets:
+            if book is not None:
+                grid = read_grid(path, sheet, book=book)
+                self._sheets[key] = (grid, profile_grid(grid))
+            else:
+                prof = profile_file(path)  # it picks the encoding; read again with that one
+                grid = read_grid(path, encoding=prof.encoding) if prof.encoding else read_grid(path)
+                self._sheets[key] = (grid, prof)
+        return self._sheets[key]
 
-            wb = openpyxl.load_workbook(path, read_only=True)
-            sheets = list(wb.sheetnames)
-            wb.close()
+    def _spec_for(self, path: Path, book: XlsxBook | None) -> dict:
+        sheets: list[str] = list(book.workbook.sheetnames) if book is not None else []
         sheet = sheets[0] if sheets else None
-        profile = profile_file(path, sheet)
+        _, profile = self._sheet(path, sheet, book)
         columns = profile.columns
 
         crosswalks: dict = {}
@@ -227,8 +240,7 @@ class HeuristicMapper:
                 }
             )
             for name in sheets or [None]:
-                prof = profile if name == sheet else profile_file(path, name)
-                for _, raw in _column_values(path, name, prof, plant):
+                for _, raw in _column_values(*self._sheet(path, name, book), plant):
                     if raw and raw not in self.plant_aliases:
                         hit = match_plant(raw, self.plants)
                         if hit is not None:
@@ -255,7 +267,7 @@ class HeuristicMapper:
                     "resolve": {"crosswalk": "coa", "policy": "closed"},
                 }
             )
-            self._learn_accounts(path, sheets, columns, account)
+            self._learn_accounts(path, book, sheets, columns, account)
 
         source: dict = {"header_rows": list(profile.header_rows)}
         source["data_starts"] = profile.data.start
@@ -282,14 +294,14 @@ class HeuristicMapper:
             spec["entity"]["template"] = "{0}/{1}"
         return spec
 
-    def _learn_accounts(self, path, sheets, columns, account) -> None:
+    def _learn_accounts(self, path, book, sheets, columns, account) -> None:
         name_col = next((c for c in columns if "name" in c.label.casefold()), None)
         if name_col is None:
             return
         for sheet in sheets or [None]:
-            prof = profile_file(path, sheet)
-            codes = dict(_column_values(path, sheet, prof, account))
-            names = dict(_column_values(path, sheet, prof, name_col))
+            grid, prof = self._sheet(path, sheet, book)
+            codes = dict(_column_values(grid, prof, account))
+            names = dict(_column_values(grid, prof, name_col))
             for row, code in codes.items():
                 hit = match_account(names.get(row, ""), self.standard) if code else None
                 if hit is not None:

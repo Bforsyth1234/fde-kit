@@ -31,6 +31,8 @@ PARTS_PER_PLANT = 15  # 20 x 15 = the plan's ~300 parts
 FIRST_MONTH = date(2024, 1, 1)
 N_MONTHS = 24
 TB_PERIOD = date(2025, 12, 1)
+C_SHEET = "legacy_report"
+"""A CSV's sheet name in apply's cells and rejects: the file's stem."""
 CLOSED_PLANT_CODE = "GRR-03"
 """A real plant in the legacy report that closed: in no crosswalk, so its rows must be rejects."""
 
@@ -145,7 +147,7 @@ HEADER_VARIANTS = {
 """Each seed's systems name their columns differently, so column mapping is measured on labels
 the baseline's synonyms weren't all written for."""
 UNPIVOT = "*unpivot*"
-"""`truth/columns.json`'s column name for a measure read from unpivoted cells."""
+"""`truth/columns.jsonl`'s column name for a measure read from unpivoted cells."""
 
 
 @dataclass
@@ -193,6 +195,7 @@ class Truth:
                 "entity": entity,
                 "field": fld,
                 "period_start": month.isoformat(),
+                "period_end": month_end(month).isoformat(),
                 "value": str(value),
                 "precision": kw.get("precision"),
                 "cell": cell,
@@ -204,6 +207,11 @@ class Truth:
         if (source, raw) not in self.seen_entities:
             self.seen_entities.add((source, raw))
             self.entities.append({"source": source, "raw": raw, "canonical": canonical})
+
+
+def month_end(month: date) -> date:
+    """Every fact here has month grain: it runs from the 1st to the last day, as apply stores it."""
+    return month.replace(day=calendar.monthrange(month.year, month.month)[1])
 
 
 def _months() -> list[date]:
@@ -475,7 +483,7 @@ def render_c(
                 t.entity("C", p.typo_name, p.canonical)
                 base_ids.append(t.mess("typo_plant_name", "C", p.typo_name, f"{row_no:04d}"))
             day = rng.randint(1, 28)
-            if day <= 12:
+            if day <= 12 and day != m.month:  # 05/05 reads the same either way round
                 base_ids.append(t.mess("ambiguous_date", "C", f"row {row_no}", f"{row_no:04d}"))
             shipped_k = int((Decimal(n["shipped"]) / 1000).quantize(Decimal(1), ROUND_HALF_UP))
             revenue = n["revenue"]
@@ -483,7 +491,12 @@ def render_c(
                 shipped_k += rng.choice([-1, 1]) * rng.randint(3, 6)
                 mess = t.mess("value_conflict", "C", f"row {row_no} shipped", f"{row_no:04d}s")
                 t.conflicts.append(
-                    {"entity": p.canonical, "field": "shipped_units", "period": m.isoformat()}
+                    {
+                        "entity": p.canonical,
+                        "field": "shipped_units",
+                        "period": m.isoformat(),
+                        "period_end": month_end(m).isoformat(),
+                    }
                 )
                 shipped_ids = [*base_ids, mess]
             else:
@@ -492,7 +505,12 @@ def render_c(
                 revenue = int(revenue * rng.uniform(1.02, 1.1))
                 mess = t.mess("value_conflict", "C", f"row {row_no} revenue", f"{row_no:04d}r")
                 t.conflicts.append(
-                    {"entity": p.canonical, "field": "revenue_usd", "period": m.isoformat()}
+                    {
+                        "entity": p.canonical,
+                        "field": "revenue_usd",
+                        "period": m.isoformat(),
+                        "period_end": month_end(m).isoformat(),
+                    }
                 )
                 revenue_ids = [*base_ids, mess]
             else:
@@ -504,7 +522,9 @@ def render_c(
                 returns_ids = [*base_ids, t.mess("parens_negative", "C", "returns in parentheses")]
             if rng.random() < 0.004:
                 returns_cell = "n/a"
-                t.rejects.append({"source": "C", "cell": f"E{row_no}", "why": "not a number"})
+                t.rejects.append(
+                    {"source": "C", "sheet": C_SHEET, "cell": f"E{row_no}", "why": "not a number"}
+                )
             else:
                 t.fact(
                     "C",
@@ -551,7 +571,15 @@ def render_c(
         rows.append(
             ["NA", CLOSED_PLANT_CODE, f"28/{m.month:02d}/{m.year}", "9", "0", "1,000.00"],
         )
-        t.rejects.append({"source": "C", "row": row_no, "why": "unknown entity", "mess": closed})
+        t.rejects.append(
+            {
+                "source": "C",
+                "sheet": C_SHEET,
+                "row": row_no,
+                "why": "unknown entity",
+                "mess": closed,
+            }
+        )
     _write_csv(out / SOURCE_FILES["C"], rows, delimiter=";")
 
 

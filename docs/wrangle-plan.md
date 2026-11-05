@@ -328,7 +328,7 @@ No LLM. It sets the floor the agent has to beat. If it scores close to the agent
 type, that goes in FINDINGS too.
 
 `fde wrangle bench [--seed N] [--mapper heuristic|agent] [--provider mock|live]` prints the
-table and writes JSON, like `fde eval`. CI runs the heuristic baseline at a fixed seed and gates
+table and writes JSON, like `fde eval`. CI runs the heuristic baseline at fixed seeds and gates
 on its scores not regressing.
 
 ### 5.4 As built
@@ -342,6 +342,10 @@ Differences from the above, all in `evals/wrangle/`:
 - **Header wording varies by seed** (`HEADER_VARIANTS`). It shows in column mapping recall, not in
   the by-mess table. With fixed headers the baseline scored 1.0 on column mapping, leaving PR 7 nothing to beat.
 - **`--mapper truth`** is added: the correct project must score 100%. CI runs it before the gate.
+- **The gate covers seeds 7, 11 and 13,** since header wording varies by seed; `--gate` runs every
+  seed the baseline holds, fails on any regression and prints improvements. `--write-baseline`
+  writes only after every check passed.
+- **Facts are matched on the period's start and end,** so a wrong grain is a wrong fact.
 - **Provenance is stricter than read-back alone:** a fact the truth knows must also be from the
   truth's cell, so a clean read-back under the wrong plant still counts against it.
 - **Human edit distance isn't built;** it needs PR 7's proposed specs. `--provider` and
@@ -419,7 +423,7 @@ The point of an FDE kit is that the tenth deployment is cheaper than the first.
 | PR | Rough size | Depends on | Done when |
 | --- | --- | --- | --- |
 | 5 | ~1,500 lines + tests | `main` | provenance read-back passes on all fixture files; reject gate holds; CI green |
-| 6 | ~800 | 5 | baseline scores published in FINDINGS; CI gates on them at a fixed seed |
+| 6 | ~800 | 5 | baseline scores published in FINDINGS; CI gates on them at fixed seeds |
 | 7 | ~900 + prompt + fixtures | 5, 6 | agent beats the baseline on column mapping and entity P/R over 3 seeds; golden_wrangle passes live and in replay |
 | 8 | ~600 | 7 | customer-2 experiment written up with numbers |
 

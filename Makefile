@@ -29,7 +29,7 @@ rag-test:        ## the tenant-isolation attack suite (needs `make up`)
 	FDE_TEST_PG_URL=postgresql://fde:fde@localhost:5432/fde pytest tests/test_rag_isolation.py -v
 
 wrangle-bench:   ## score the no-LLM baseline mapper on a generated world, gated on the committed baseline
-	fde wrangle bench --mapper truth
+	fde wrangle bench --mapper truth --seed 7 11 13
 	fde wrangle bench --gate evals/wrangle/baseline.json
 
 install:

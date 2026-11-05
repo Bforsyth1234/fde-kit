@@ -21,6 +21,7 @@ from evals.wrangle.bench import (  # noqa: E402
     DEFAULT_SEED,
     bench,
     check_gate,
+    improvements,
     main,
     run_mapper,
     self_check,
@@ -32,7 +33,7 @@ from evals.wrangle.mapper import (  # noqa: E402
     match_account,
     match_plant,
 )
-from evals.wrangle.scorers import score_all  # noqa: E402
+from evals.wrangle.scorers import load_truth, score_all, score_rejects  # noqa: E402
 from fde_kit import cli  # noqa: E402
 from fde_kit.wrangle.read import read_grid  # noqa: E402
 
@@ -239,6 +240,70 @@ def test_changed_source_cell_fails_the_provenance_read_back(tmp_path: Path) -> N
     assert score_all(world, loads, project)["metrics"]["provenance_accuracy"] < 1.0
 
 
+def test_wrong_period_grain_is_not_a_right_fact(tmp_path: Path) -> None:
+    """A forecast loaded as one-day periods has the right number on the wrong period."""
+
+    def day_grain(spec: dict) -> None:
+        spec["period"]["unpivot"]["ops"][-1]["grain"] = "day"
+
+    m = _score(tmp_path, EditedTruth(lambda p: _edit_spec(p, "planner_forecast", day_grain)))
+    assert m["by_source"]["B"] == 0
+    assert m["by_source"]["A"] == 1.0
+    assert m["metrics"]["phantom_facts"] > 0
+
+
+def test_text_measure_is_read_back_as_text(tmp_path: Path) -> None:
+    """A text measure loads as a string; the read-back must not try to scale it."""
+
+    def add_text(spec: dict) -> None:
+        spec["measures"].append(
+            {"field": "onhand_units", "column": "Region", "ops": [{"op": "text", "strip": True}]}
+        )
+
+    m = _score(tmp_path, EditedTruth(lambda p: _edit_spec(p, "legacy_report_na", add_text)))
+    assert m["metrics"]["provenance_accuracy"] == 1.0
+    assert m["metrics"]["phantom_facts"] > 0
+
+
+def test_two_measures_for_one_field_read_back_through_their_own_ops(tmp_path: Path) -> None:
+    """The same cell under a second, unscaled measure: each fact must be read back through the
+    measure that made it, not the first one with its field."""
+
+    def second_column(spec: dict) -> None:
+        shipped = next(x for x in spec["measures"] if x["field"] == "shipped_units")
+        unscaled = {k: v for k, v in shipped.items() if k not in ("scale", "precision")}
+        spec["measures"].insert(0, unscaled)
+
+    m = _score(tmp_path, EditedTruth(lambda p: _edit_spec(p, "legacy_report_na", second_column)))
+    assert m["metrics"]["provenance_accuracy"] == 1.0
+
+
+def test_row_rejects_on_different_sheets_are_counted_apart(tmp_path: Path) -> None:
+    """With no chart-of-accounts aliases every trial-balance row rejects: 12 rows x 20 sheets."""
+
+    def no_accounts(project: Path) -> None:
+        path = project / "crosswalks" / "coa.csv"
+        path.write_text(path.read_text().splitlines()[0] + "\n")
+
+    world = generate(DEFAULT_SEED, tmp_path / "world")
+    loads, _ = run_mapper(EditedTruth(no_accounts), world, tmp_path / "proposed")
+    real = sum(len(x.result.rejects) for x in loads if x.result is not None)
+    m = score_rejects(load_truth(world), loads)
+    assert m["rejects_total"] == real
+    assert m["reject_precision"] < 0.05
+
+
+def test_ambiguous_date_skips_a_day_that_equals_its_month(tmp_path: Path) -> None:
+    world = generate(DEFAULT_SEED, tmp_path)
+    log = [json.loads(x) for x in (world / "truth" / "messes.jsonl").read_text().splitlines()]
+    rows = {int(m["detail"].split()[1]) for m in log if m["type"] == "ambiguous_date"}
+    lines = (world / "sources" / SOURCE_FILES["C"]).read_text().splitlines()
+    for n, line in enumerate(lines[1:], start=2):
+        day, month, _ = line.split(";")[2].split("/")
+        ambiguous = int(day) <= 12 and day != month
+        assert (n in rows) == ambiguous, line
+
+
 # --- the baseline mapper ----------------------------------------------------------------------
 
 
@@ -285,20 +350,20 @@ def test_baseline_is_a_floor_with_room_above_it(tmp_path: Path) -> None:
 
 
 def test_committed_baseline_holds(tmp_path: Path) -> None:
-    result = bench(DEFAULT_SEED, HeuristicMapper(), tmp_path)
+    """The gate is a ratchet: no seed may regress; an improvement passes and is reported."""
     baseline = json.loads(DEFAULT_BASELINE.read_text())
-    assert check_gate(result, baseline) == []
-    assert result["metrics"] == baseline["metrics"], (
-        "scores changed: if better, re-run with --write-baseline and update docs/FINDINGS.md"
-    )
+    assert len(baseline["seeds"]) >= 3, "gate on several header wordings, not one"
+    for seed in baseline["seeds"]:
+        result = bench(int(seed), HeuristicMapper(), tmp_path / seed)
+        assert check_gate(result, baseline) == [], seed
+
+
+def _gate_baseline(**metrics) -> dict:
+    return {"mapper": "heuristic", "seeds": {"1": metrics}}
 
 
 def test_gate_catches_each_direction_of_regression() -> None:
-    baseline = {
-        "seed": 1,
-        "mapper": "heuristic",
-        "metrics": {"value_accuracy": 0.9, "false_merges": 3, "facts_loaded": 100},
-    }
+    baseline = _gate_baseline(value_accuracy=0.9, false_merges=3, facts_loaded=100)
 
     def result(**metrics) -> dict:
         return {"seed": 1, "mapper": "heuristic", "metrics": metrics}
@@ -308,7 +373,9 @@ def test_gate_catches_each_direction_of_regression() -> None:
     assert check_gate(result(value_accuracy=0.89, false_merges=3), baseline)
     assert check_gate(result(value_accuracy=0.9, false_merges=4), baseline)
     assert check_gate(result(false_merges=3), baseline), "a missing metric is a regression"
-    assert check_gate({**result(), "seed": 2}, baseline), "another seed can't pass the gate"
+    assert check_gate({**result(), "seed": 2}, baseline), "a seed the baseline lacks can't pass"
+    better = improvements(result(value_accuracy=0.95, false_merges=3, facts_loaded=1), baseline)
+    assert better == ["value_accuracy: 0.95 (baseline 0.9)"]
 
 
 def test_self_check_fails_below_100_percent() -> None:
@@ -328,11 +395,42 @@ def test_cli_truth_passes_and_writes_json(tmp_path: Path, capsys) -> None:
 
 def test_cli_gate_fails_on_a_regression(tmp_path: Path, capsys) -> None:
     baseline = json.loads(DEFAULT_BASELINE.read_text())
-    baseline["metrics"]["value_accuracy"] = 1.0
+    seed = str(DEFAULT_SEED)
+    baseline["seeds"] = {seed: {**baseline["seeds"][seed], "value_accuracy": 1.0}}
     path = tmp_path / "baseline.json"
     path.write_text(json.dumps(baseline))
     assert cli.main(["wrangle", "bench", "--gate", str(path)]) == 1
     assert "value_accuracy" in capsys.readouterr().out
+
+
+def test_cli_forwards_options_to_the_bench(monkeypatch) -> None:
+    """`fde wrangle bench` takes bench.py's own options, `--gate` with no path included."""
+    seen = []
+    monkeypatch.setattr("evals.wrangle.bench.main", lambda argv: seen.append(argv) or 0)
+    assert cli.main(["wrangle", "bench", "--seed", "7", "13", "--gate"]) == 0
+    assert seen == [["--seed", "7", "13", "--gate"]]
+
+
+def test_failed_run_does_not_write_a_baseline(tmp_path: Path, capsys) -> None:
+    baseline = json.loads(DEFAULT_BASELINE.read_text())
+    seed = str(DEFAULT_SEED)
+    baseline["seeds"] = {seed: {**baseline["seeds"][seed], "value_accuracy": 1.0}}
+    gate = tmp_path / "gate.json"
+    gate.write_text(json.dumps(baseline))
+    out = tmp_path / "new.json"
+    assert main(["--gate", str(gate), "--write-baseline", str(out)]) == 1
+    assert not out.exists(), "a regressed run must not become the floor"
+    assert main(["--gate", str(gate), "--write-baseline", str(gate)]) == 2
+    assert "same file" in capsys.readouterr().err
+
+
+def test_write_baseline_keeps_other_seeds(tmp_path: Path) -> None:
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps({"mapper": "heuristic", "seeds": {"99": {"value_accuracy": 0.5}}}))
+    assert main(["--seed", str(DEFAULT_SEED), "--write-baseline", str(path)]) == 0
+    written = json.loads(path.read_text())
+    assert set(written["seeds"]) == {str(DEFAULT_SEED), "99"}
+    assert "rapidfuzz" in written["versions"]
 
 
 def test_agent_mapper_is_not_built_yet(capsys) -> None:

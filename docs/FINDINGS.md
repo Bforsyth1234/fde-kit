@@ -488,7 +488,8 @@ project is scored too (`--mapper truth`) and must get 100% on every metric, at e
 CI runs that first, so a bug in the generator or a scorer can't pass as a mapper's score.
 
 The baseline is `HeuristicMapper`: header synonyms, fuzzy matching and the profile's own findings.
-It sets the floor the PR 7 agent has to beat. Its scores, at three seeds (11 is the CI gate):
+It sets the floor the PR 7 agent has to beat. Its scores at three seeds, all three gated in CI
+(`evals/wrangle/baseline.json`), so a synonym that only one seed's header wording uses is still covered:
 
 | Metric | Seed 7 | Seed 11 | Seed 13 |
 | --- | --- | --- | --- |
@@ -499,7 +500,7 @@ It sets the floor the PR 7 agent has to beat. Its scores, at three seeds (11 is 
 | Value accuracy / precision | 0.77 / 0.99 | 0.78 / 0.99 | 0.77 / 0.99 |
 | Provenance accuracy | 0.99 | 0.99 | 0.99 |
 | Conflict precision / recall | 0 / 0 | 0.13 / 0.32 | 0 / 0 |
-| Reject precision / recall | 0.06 / 1.00 | 0.03 / 0.80 | 0.05 / 1.00 |
+| Reject precision / recall | 0.06 / 1.00 | 0.01 / 0.80 | 0.05 / 1.00 |
 
 What the floor shows:
 
@@ -572,6 +573,26 @@ Limits of the benchmark:
   beat. Headers now vary by seed.
 - **The baseline's column reader used an attribute that doesn't exist** (`Grid.cells`; it's
   `Grid.rows`), and crashed on its first run.
+
+**In the benchmark, fixed in review:**
+
+- **Row rejects on different sheets counted as one.** They were keyed by row number alone, so row 5
+  of twenty trial-balance sheets was one reject. At seed 11 the baseline makes 282 rejects, not the
+  158 first recorded, and its reject precision is 0.01, not 0.03. Rejects are now keyed by sheet.
+- **A right number on the wrong period grain scored as right.** Facts were matched on the period's
+  start only; a forecast loaded as one-day periods scored 100%. The truth now records each period's
+  end, and facts and conflicts are matched on both, as `add_facts` does.
+- **A text measure crashed the scorer,** which multiplied the read-back string by the scale. The
+  read-back now follows apply: text as is, numbers scaled.
+- **Two measures for one field were read back through the first one's ops.** A correct fact from the
+  second failed provenance. The read-back now passes if any of that field's measures gives the value.
+- **`--write-baseline` wrote before the checks,** so a regressed run could become the floor. It now
+  writes only after the self-check and the gate pass, and refuses the gate's own file.
+- **The gate was one seed, and its test required exact scores,** so an improvement failed CI and a
+  rapidfuzz release could too. The gate is now a ratchet over seeds 7, 11 and 13 that prints what
+  improved; the baseline records the rapidfuzz and openpyxl versions, and the gate says when the
+  installed ones differ.
+- **`ambiguous_date` tagged dates like `05/05/2024`,** which read the same either way round.
 
 The baseline's false merges, misread numbers and invented conflicts above aren't listed here. They are
 its measured scores, left in on purpose.

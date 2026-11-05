@@ -1,7 +1,8 @@
 """Score a mapper's load against a world's truth (docs/wrangle-plan.md §5.2).
 
 Everything here reads `truth/` and the `ApplyResult`s; nothing is written anywhere. A truth fact
-is keyed by (source, entity, field, period_start). Values are compared with `values_agree` at the
+is keyed by (source, entity, field, period_start, period_end), as `add_facts` keys a conflict, so a
+right number on the wrong period grain doesn't count. Values are compared with `values_agree` at the
 truth's precision, not the mapper's, so a mapper can't pass by declaring a coarser one.
 """
 
@@ -15,7 +16,7 @@ from pathlib import Path
 
 from fde_kit.rag.store import values_agree
 from fde_kit.wrangle.apply import ApplyResult, FactRecord, cell_pipeline, parse_source_ref
-from fde_kit.wrangle.parse import to_fact_value
+from fde_kit.wrangle.parse import ParseError, to_fact_value
 from fde_kit.wrangle.read import parse_ref, read_grid
 from fde_kit.wrangle.resolve import Resolver
 from fde_kit.wrangle.spec import Crosswalk, _load_crosswalk
@@ -83,9 +84,17 @@ def _records(loads: list[Loaded]):
                 yield load, rec
 
 
-def _key(source: str, rec: FactRecord) -> tuple[str, str, str, str]:
+def _period(rec: FactRecord) -> tuple[str, str | None]:
     row = rec.fact.row
-    return (source, row.entity, row.field, row.period_start.isoformat())
+    return row.period_start.isoformat(), row.period_end.isoformat() if row.period_end else None
+
+
+def _truth_key(f: dict) -> tuple:
+    return (f["source"], f["entity"], f["field"], f["period_start"], f["period_end"])
+
+
+def _key(source: str, rec: FactRecord) -> tuple:
+    return (source, rec.fact.row.entity, rec.fact.row.field, *_period(rec))
 
 
 def score_columns(truth: TruthWorld, loads: list[Loaded]) -> dict:
@@ -157,7 +166,7 @@ def score_facts(truth: TruthWorld, loads: list[Loaded]) -> tuple[dict, dict]:
     per_mess: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     truth_keys = set()
     for f in truth.facts:
-        key = (f["source"], f["entity"], f["field"], f["period_start"])
+        key = _truth_key(f)
         truth_keys.add(key)
         recs = loaded.get(key, [])
         ok = any(
@@ -187,9 +196,7 @@ def score_facts(truth: TruthWorld, loads: list[Loaded]) -> tuple[dict, dict]:
 def score_provenance(truth: TruthWorld, loads: list[Loaded]) -> dict:
     """§4.7 over the whole world: each loaded fact's `source_ref`, read back through the spec's
     own ops, gives that fact; and when the truth knows the fact, it is the truth's cell."""
-    cells = {
-        (f["source"], f["entity"], f["field"], f["period_start"]): f["cell"] for f in truth.facts
-    }
+    cells = {_truth_key(f): f["cell"] for f in truth.facts}
     grids: dict[tuple, object] = {}
     good = total = 0
     for load, rec in _records(loads):
@@ -197,7 +204,9 @@ def score_provenance(truth: TruthWorld, loads: list[Loaded]) -> dict:
         loaded = load.result.loaded
         row = rec.fact.row
         ref = parse_source_ref(row.source_ref)
-        measure = next(m for m in loaded.spec.measures if m.field == row.field)
+        # Several measures can feed one field (two columns, two scales); the fact doesn't record
+        # which, so the read-back passes if the cell gives the value through any of them.
+        measures = [m for m in loaded.spec.measures if m.field == row.field]
         grid_key = (str(load.file), ref["sheet"], loaded.spec.source.delimiter)
         if grid_key not in grids:
             sheet = ref["sheet"] if load.file.suffix == ".xlsx" else None
@@ -208,10 +217,22 @@ def score_provenance(truth: TruthWorld, loads: list[Loaded]) -> dict:
                 delimiter=loaded.spec.source.delimiter,
             )
         cell = grids[grid_key].cell(*parse_ref(ref["cell"]))
-        value = to_fact_value(cell_pipeline(measure.ops)(cell) * measure.scale_decimal)
         expected_cell = cells.get(_key(load.source, rec))
-        good += value == row.value and expected_cell in (None, rec.cell)
+        reads_back = any(_read_back(m, cell) == row.value for m in measures)
+        good += reads_back and expected_cell in (None, rec.cell)
     return {"provenance_accuracy": _ratio(good, total, empty=0.0)}
+
+
+def _read_back(measure, cell) -> object:
+    """The value a measure's own ops give for this cell, as apply stores it: text as is, numbers
+    scaled. A cell that no longer parses reads back as None, which matches no fact."""
+    try:
+        out = cell_pipeline(measure.ops)(cell) if measure.ops else cell.raw
+    except ParseError:
+        return None
+    if measure.is_text:
+        return str(out)
+    return to_fact_value(out * measure.scale_decimal)
 
 
 def score_conflicts(truth: TruthWorld, loads: list[Loaded]) -> dict:
@@ -220,7 +241,7 @@ def score_conflicts(truth: TruthWorld, loads: list[Loaded]) -> dict:
     groups: dict[tuple, list] = defaultdict(list)
     for _, rec in _records(loads):
         row = rec.fact.row
-        groups[row.entity, row.field, row.period_start.isoformat()].append(row)
+        groups[row.entity, row.field, *_period(rec)].append(row)
     flagged = set()
     for key, rows in groups.items():
         if any(
@@ -229,16 +250,18 @@ def score_conflicts(truth: TruthWorld, loads: list[Loaded]) -> dict:
             for b in rows[i + 1 :]
         ):
             flagged.add(key)
-    wanted = {(c["entity"], c["field"], c["period"]) for c in truth.conflicts}
+    wanted = {(c["entity"], c["field"], c["period"], c["period_end"]) for c in truth.conflicts}
     p, r = _f1_parts(len(flagged & wanted), len(flagged), len(wanted))
     return {"conflict_precision": p, "conflict_recall": r, "conflicts_flagged": len(flagged)}
 
 
 def score_rejects(truth: TruthWorld, loads: list[Loaded]) -> dict:
-    """Rejects are the cells that really can't load, and those cells are rejected."""
+    """Rejects are the cells that really can't load, and those cells are rejected. Each is keyed
+    by its sheet, so row 5 of twenty trial-balance sheets is twenty rejects, not one."""
 
     def key(source: str, r: dict) -> tuple:
-        return (source, r["cell"]) if r.get("cell") else (source, f"row {r['row']}")
+        where = r["cell"].rsplit("!", 1)[-1] if r.get("cell") else f"row {r['row']}"
+        return (source, r.get("sheet") or "", where)
 
     wanted = {key(r["source"], r) for r in truth.rejects}
     got = set()
