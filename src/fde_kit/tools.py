@@ -172,3 +172,52 @@ def _stringify(value: Any) -> str:
         return json.dumps(value, default=str)
     except Exception:
         return str(value)
+
+
+def load_registry(spec: str) -> ToolRegistry:
+    """Load a customer's tools from `module:attr` or `path/to/file.py:attr`.
+
+    `attr` is a `ToolRegistry`, or a callable taking no arguments that returns one. A module
+    name is imported with the current directory on `sys.path`, so `fde ... --tools
+    acme_agent:tools` works from the project folder without installing it. This is how the CLI
+    (`fde run`, `fde rag ask`, `fde eval`) takes tools it doesn't ship with; for a tenant run the
+    retrieval tools are added on top (`tenant_search_registry` copies, never mutates, the base).
+    """
+    import importlib
+    import importlib.util
+    import os
+    import sys
+    from pathlib import Path
+
+    target, sep, attr = spec.rpartition(":")
+    if not sep or not target or not attr:
+        raise ValueError(f"--tools {spec!r}: expected module:attr or path/to/file.py:attr")
+    if target.endswith(".py"):
+        path = Path(target).resolve()
+        if not path.is_file():
+            raise ValueError(f"--tools {spec!r}: no such file {path}")
+        mod_name = f"_fde_tools_{path.stem}"
+        loader_spec = importlib.util.spec_from_file_location(mod_name, path)
+        if loader_spec is None or loader_spec.loader is None:  # pragma: no cover - .py always loads
+            raise ValueError(f"--tools {spec!r}: cannot load {path}")
+        module = importlib.util.module_from_spec(loader_spec)
+        # The file's own folder first, so it can import its siblings.
+        sys.path.insert(0, str(path.parent))
+        sys.modules[mod_name] = module
+        loader_spec.loader.exec_module(module)
+    else:
+        if os.getcwd() not in sys.path:
+            sys.path.insert(0, os.getcwd())
+        module = importlib.import_module(target)
+    try:
+        obj = getattr(module, attr)
+    except AttributeError:
+        raise ValueError(f"--tools {spec!r}: {target} has no attribute {attr!r}") from None
+    if callable(obj) and not isinstance(obj, ToolRegistry):
+        obj = obj()
+    if not isinstance(obj, ToolRegistry):
+        raise ValueError(
+            f"--tools {spec!r}: expected a ToolRegistry (or a function returning one), "
+            f"got {type(obj).__name__}"
+        )
+    return obj

@@ -1,0 +1,5 @@
+{"document": "returns.md", "entity": "Acme Supply", "field": "restocking_fee_pct", "value": 15, "unit": "percent", "period_start": "2026-01-01", "period_end": "2026-12-31"}
+{"document": "returns-memo-2026-03.md", "entity": "Acme Supply", "field": "restocking_fee_pct", "value": 20, "unit": "percent", "period_start": "2026-01-01", "period_end": "2026-12-31"}
+{"document": "returns.md", "entity": "Acme Supply", "field": "return_window_days", "value": 45, "unit": "days", "period_start": "2026-01-01", "period_end": "2026-12-31"}
+{"document": "returns-memo-2026-03.md", "entity": "Acme Supply", "field": "return_window_days", "value": 45, "unit": "days", "period_start": "2026-01-01", "period_end": "2026-12-31"}
+{"document": "shipping.md", "entity": "Acme Supply", "field": "free_delivery_min_order_usd", "value": 750, "unit": "USD", "period_start": "2026-01-01", "period_end": "2026-12-31"}

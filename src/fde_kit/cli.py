@@ -31,14 +31,35 @@ from .tracing import init_tracing
 console = Console()
 
 
+TOOLS_HELP = (
+    "your tools: a ToolRegistry or a function returning one, as module:attr or "
+    "path/to/file.py:attr (module names resolve from the current directory)"
+)
+
+
+def _tools_registry(args: argparse.Namespace):
+    """`--tools` when given, else None. A bad spec exits 2 with the reason, not a traceback."""
+    spec = getattr(args, "tools", None)
+    if not spec:
+        return None
+    from .tools import load_registry
+
+    try:
+        return load_registry(spec)
+    except (ValueError, ImportError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise SystemExit(2) from None
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     _check_run_flags(args)
     settings = get_settings()
     init_tracing(settings)
+    reg = _tools_registry(args) or registry
     if args.replay or args.fork:
-        return _cmd_run_from_record(args, settings)
+        return _cmd_run_from_record(args, settings, reg)
 
-    agent = Agent(registry, settings=settings)
+    agent = Agent(reg, settings=settings)
     if args.record:
         result = agent.run(args.prompt, record=Path(args.record))
     else:
@@ -148,7 +169,7 @@ def _first_difference(recorded: str, replayed: str) -> str:
     return f"differs at line {n}:\n  only in {which}: {longer[n - 1]}"
 
 
-def _cmd_run_from_record(args: argparse.Namespace, settings) -> int:
+def _cmd_run_from_record(args: argparse.Namespace, settings, registry) -> int:
     from rich.markup import escape
 
     from .record import (
@@ -206,42 +227,16 @@ def _cmd_run_from_record(args: argparse.Namespace, settings) -> int:
 # --- end run/replay flags (2-D)
 
 
-def cmd_tools(_: argparse.Namespace) -> int:
-    for schema in registry.api_schemas():
+def cmd_tools(args: argparse.Namespace) -> int:
+    for schema in (_tools_registry(args) or registry).api_schemas():
         console.print(json.dumps(schema, indent=2))
     return 0
 
 
-def cmd_eval(args: argparse.Namespace) -> int:
-    # `evals/` lives in the repo root, not inside the installed package. Make it importable
-    # whether we're run from the repo root or anywhere else with an editable install.
-    from pathlib import Path
+def cmd_eval(_: argparse.Namespace) -> int:  # pragma: no cover - main() forwards first
+    from .evals.runner import main as eval_main
 
-    repo_root = Path(__file__).resolve().parents[2]
-    for candidate in (Path.cwd(), repo_root):
-        if (candidate / "evals" / "run_evals.py").exists() and str(candidate) not in sys.path:
-            sys.path.insert(0, str(candidate))
-    try:
-        from evals.run_evals import main as eval_main
-    except ModuleNotFoundError:
-        console.print(
-            "[red]could not find evals/run_evals.py[/]. Run from the repo root, or use "
-            "`python -m evals.run_evals`."
-        )
-        return 2
-
-    argv = []
-    if args.provider:
-        argv += ["--provider", args.provider]
-    if args.threshold is not None:
-        argv += ["--threshold", str(args.threshold)]
-    if args.limit:
-        argv += ["--limit", str(args.limit)]
-    if args.ids:
-        argv += ["--ids", args.ids]
-    if args.json:
-        argv += ["--json", args.json]
-    return eval_main(argv)
+    return eval_main([])
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
@@ -463,7 +458,7 @@ def cmd_rag(args: argparse.Namespace) -> int:
             return 0
         if args.rag_cmd == "ask":
             init_tracing(settings)
-            reg = rag.tenant_search_registry(store, args.tenant)
+            reg = rag.tenant_search_registry(store, args.tenant, registry=_tools_registry(args))
             agent = Agent(reg, settings=settings)
             _attach_recorder(agent, args.question, settings)  # always records (design doc)
             result = agent.run(args.question)
@@ -1518,6 +1513,12 @@ def _describe_row(row: dict) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["eval"]:
+        # Every runner flag (--golden, --set, --tools, --seed, ...) without a second copy here.
+        from .evals.runner import main as eval_main
+
+        return eval_main(argv[1:])
     p = argparse.ArgumentParser(prog="fde", description="fde-kit command line")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -1574,18 +1575,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     r.add_argument("--fork", metavar="PATH", help="fork a recorded run after turn --at")
     r.add_argument("--at", type=int, metavar="N", help="with --fork: replay turns 1..N exactly")
+    r.add_argument("--tools", metavar="MODULE:ATTR", help=TOOLS_HELP)
     r.set_defaults(fn=cmd_run, parser=r)
     # --- end run/replay flags (2-D)
 
-    t = sub.add_parser("tools", help="list registered tools")
+    t = sub.add_parser("tools", help="list registered tools (the builtin ones, or --tools)")
+    t.add_argument("--tools", metavar="MODULE:ATTR", help=TOOLS_HELP)
     t.set_defaults(fn=cmd_tools)
 
-    e = sub.add_parser("eval", help="run the golden eval set")
-    e.add_argument("--provider", choices=["anthropic", "mock"])
-    e.add_argument("--threshold", type=float)
-    e.add_argument("--limit", type=int)
-    e.add_argument("--ids", help="comma-separated case ids to run")
-    e.add_argument("--json", help="write full per-case results to this file")
+    # Listed for `fde --help`; main() hands `fde eval ...` straight to the runner's parser.
+    e = sub.add_parser("eval", help="run an eval set (fde eval --help for every flag)")
     e.set_defaults(fn=cmd_eval)
 
     rg = sub.add_parser("rag", help="multi-tenant retrieval")
@@ -1613,6 +1612,7 @@ def main(argv: list[str] | None = None) -> int:
     ra = rsub.add_parser("ask", help="run the agent with search bound to one tenant")
     ra.add_argument("question")
     ra.add_argument("--tenant", required=True)
+    ra.add_argument("--tools", metavar="MODULE:ATTR", help=TOOLS_HELP + "; retrieval tools added")
     ra.add_argument("--url")
     ra.add_argument("--embedder")
     # --- rag facts (2-D)

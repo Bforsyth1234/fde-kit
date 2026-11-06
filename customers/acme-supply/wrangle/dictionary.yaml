@@ -1,0 +1,6 @@
+- field: net_sales_usd
+  definition: Net sales for the branch in the month, after returns and discounts, in US dollars.
+  unit: USD
+- field: orders
+  definition: Number of invoiced orders at the branch in the month.
+  unit: orders

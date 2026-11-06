@@ -133,13 +133,81 @@ def test_unknown_check_type_rejected(tmp_path: Path):
         load_cases(bad)
 
 
-def test_unknown_tenant_rejected(tmp_path: Path):
+def test_malformed_tenant_id_rejected_at_load(tmp_path: Path):
     bad = tmp_path / "bad.jsonl"
     bad.write_text(
-        json.dumps({"id": "x", "prompt": "p", "checks": [], "mock": ["a"], "tenant": "nobody"})
+        json.dumps({"id": "x", "prompt": "p", "checks": [], "mock": ["a"], "tenant": "No Body!"})
     )
-    with pytest.raises(ValueError, match="unknown tenant 'nobody'"):
+    with pytest.raises(ValueError, match="x: bad tenant 'No Body!'"):
         load_cases(bad)
+
+
+def test_any_well_formed_tenant_loads(tmp_path: Path):
+    """Which tenants exist is the store's question (check_tenants), not a list in the harness:
+    a customer's own tenant must load."""
+    ok = tmp_path / "ok.jsonl"
+    ok.write_text(
+        json.dumps({"id": "x", "prompt": "p", "checks": [], "mock": ["a"], "tenant": "acme"})
+    )
+    assert load_cases(ok)[0]["tenant"] == "acme"
+
+
+def test_harness_is_importable_from_the_package_and_the_shims():
+    """An installed fde-kit runs evals without the repo on sys.path, and the old import paths
+    are the same module objects, so monkeypatching either one patches both."""
+    import evals.run_evals
+    import evals.scorers
+    import fde_kit.evals.runner
+    import fde_kit.evals.scorers
+
+    assert evals.run_evals is fde_kit.evals.runner
+    assert evals.scorers is fde_kit.evals.scorers
+    assert GOLDEN.is_file() and GOLDEN.parent.name == "evals"
+
+
+FREIGHT_TOOLS = '''
+from fde_kit import ToolRegistry
+
+tools = ToolRegistry()
+
+
+@tools.tool
+def freight(weight_lb: float) -> str:
+    """Freight in USD."""
+    return f"${35 + 0.27 * weight_lb:.2f}"
+'''
+
+
+def test_custom_golden_file_with_custom_tools(tmp_path: Path, monkeypatch, capsys):
+    """--tools replaces the builtin tools for cases without a tenant."""
+    monkeypatch.setenv("FDE_OTEL_ENABLED", "false")
+    (tmp_path / "shop_tools.py").write_text(FREIGHT_TOOLS)
+    cases = tmp_path / "shop.jsonl"
+    case = {
+        "id": "f-1",
+        "prompt": "200 lb?",
+        "checks": [
+            {"type": "tool_called", "value": "freight"},
+            {"type": "contains", "value": "89.00"},
+        ],
+        "mock": [{"tool_calls": [{"name": "freight", "input": {"weight_lb": 200}}]}, "$89.00."],
+    }
+    cases.write_text(json.dumps(case))
+    argv = ["--provider", "mock", "--golden", str(cases), "--threshold", "1.0"]
+    assert main([*argv, "--tools", f"{tmp_path / 'shop_tools.py'}:tools"]) == 0
+    assert "eval results (shop.jsonl)" in capsys.readouterr().out
+    # Without --tools a case gets the builtin registry, which has no `freight`. (Not asserted
+    # through main(): `tool_called` counts a call to a tool that doesn't exist, and the mock's
+    # scripted answer holds the number, so that run passes anyway.)
+    assert "freight" not in case_registry({"id": "f-1"}).names()
+
+
+def test_missing_builtin_set_is_a_clear_error(monkeypatch, tmp_path: Path, capsys):
+    import fde_kit.evals.runner as runner
+
+    monkeypatch.setitem(runner.SETS, "golden", tmp_path / "nope.jsonl")
+    assert main(["--provider", "mock"]) == 2
+    assert "pass your own with --golden" in " ".join(capsys.readouterr().out.split())
 
 
 # --- the rag set (PR 3) ------------------------------------------------------------------
@@ -352,3 +420,80 @@ def test_edgar_precision_cases_have_no_conflict_in_tool_output(edgar_store):
         content = "\n".join(_tool_outputs(c))
         rows = [line for line in content.splitlines() if line.startswith("[#")]
         assert rows and all(line.endswith("conflict=true") for line in rows), (c["id"], content)
+
+
+CUSTOMER_TOOLS = '''
+from fde_kit import ToolRegistry
+
+
+def tools():
+    reg = ToolRegistry()
+
+    @reg.tool
+    def double(x: float) -> float:
+        """Double a number."""
+        return 2 * x
+
+    return reg
+'''
+
+
+@pytest.mark.skipif(not PG_URL, reason="FDE_TEST_PG_URL not set")
+def test_customer_tenant_with_custom_tools(monkeypatch, tmp_path: Path, capsys):
+    """A tenant the harness has never heard of, created the way a customer would, runs with
+    the retrieval tools and a custom tool; a tenant that doesn't exist fails before any case
+    runs, naming the command that fixes it."""
+    import psycopg
+
+    from fde_kit.rag import HashEmbedder, TenantStore, app_url_from_admin, create_tenant, migrate
+
+    with psycopg.connect(PG_URL) as conn:
+        try:
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        except psycopg.Error as exc:
+            pytest.skip(f"pgvector unavailable: {exc}")
+    migrate(PG_URL)
+    create_tenant(PG_URL, "evalcust", "Eval Customer")
+    with TenantStore(app_url_from_admin(PG_URL), HashEmbedder()) as store:
+        with store.session("evalcust") as s:
+            s.ingest(
+                "returns.md",
+                "Returns policy. Contractors may return stock within 45 days.",
+                title="Returns",
+            )
+    monkeypatch.setenv("FDE_OTEL_ENABLED", "false")
+    monkeypatch.setenv("FDE_RAG_ADMIN_URL", PG_URL)
+    monkeypatch.delenv("FDE_RAG_URL", raising=False)
+    monkeypatch.setenv("FDE_RAG_EMBEDDER", "hash")
+    (tmp_path / "cust_tools.py").write_text(CUSTOMER_TOOLS)
+    case = {
+        "id": "cust-1",
+        "tenant": "evalcust",
+        "prompt": "Return window, doubled?",
+        "checks": [
+            {"type": "tool_called", "value": "search_documents"},
+            {"type": "tool_called", "value": "double"},
+            {"type": "cites", "value": "returns.md"},
+            {"type": "cites_only"},
+        ],
+        "mock": [
+            {"tool_calls": [{"name": "search_documents", "input": {"query": "return days"}}]},
+            {"tool_calls": [{"name": "double", "input": {"x": 45}}]},
+            "45 days [1], doubled is 90.",
+        ],
+    }
+    good = tmp_path / "cust.jsonl"
+    good.write_text(json.dumps(case))
+    tools = f"{tmp_path / 'cust_tools.py'}:tools"
+    try:
+        argv = ["--provider", "mock", "--golden", str(good), "--tools", tools, "--threshold", "1"]
+        assert main(argv) == 0
+        bad = tmp_path / "typo.jsonl"
+        bad.write_text(json.dumps({**case, "tenant": "evalcustt"}))
+        capsys.readouterr()
+        assert main(["--provider", "mock", "--golden", str(bad), "--tools", tools]) == 2
+        out = capsys.readouterr().out
+        assert "unknown tenant 'evalcustt'" in out
+        assert "fde rag create-tenant evalcustt" in out
+    finally:
+        close_rag_store()
