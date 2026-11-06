@@ -1,0 +1,50 @@
+spec: branch_sales
+version: 1
+dictionary: ../dictionary.yaml
+crosswalks:
+  branches: {path: ../crosswalks/branches.csv, kind: branch}
+
+source:
+  header_rows: [4]
+  delimiter: ","
+  document_key: "{spec}#{sheet}"
+  skip_rows:
+    - {column: Branch, matches: "(?i)^total"}
+
+entity:
+  kind: branch
+  parts:
+    - column: Branch
+      ops: [{op: text, strip: true}]
+      resolve: {crosswalk: branches, policy: closed, fuzzy: false}
+
+period:
+  column:
+    name: Month
+    ops: [{op: text, strip: true}, {op: period, format: "%b-%y", grain: month}]
+
+measures:
+  - field: net_sales_usd
+    column: Net Sales ($000s)
+    ops: [{op: text, strip: true}, {op: number, thousands: ",", decimal: "."}]
+    scale: 1000
+    precision: 100
+    unit: USD
+    nulls: ["N/A"]
+    empty: skip
+  - field: orders
+    column: Orders
+    ops: [{op: text, strip: true}, {op: number, thousands: ",", decimal: "."}]
+    unit: orders
+    nulls: ["N/A"]
+    empty: skip
+
+notes: |
+  CounterPoint POS export. Two title rows and a blank row above the header. Net sales are in
+  thousands with one decimal. Branch names are typed by hand: code, name, or "X Branch".
+  TOTAL rows are per-month subtotals and are skipped. Cincinnati Feb-26 is N/A (POS outage
+  Feb 9-28); it must not load as 0.
+approval:
+  by: "brooks"
+  at: 2026-11-06T00:09:19Z
+  bundle_sha256: "00302dbb2d25656c1c94992b1f8521eb0766c5b358a378f8c1a2497580f2de9e"
